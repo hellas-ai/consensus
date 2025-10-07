@@ -396,3 +396,59 @@ Development should proceed in phases, starting with foundational infrastructure 
 Security considerations must be integrated from the beginning rather than added as an afterthought. The threat model assumes up to `f` Byzantine processors with arbitrary behavior under the constraint that `n >= 5f + 1`. All messages must include timestamps and sequence numbers to prevent replay attacks, and the P2P layer must implement rate limiting to defend against denial-of-service attempts. Peer connections should be diversified across network topologies to resist eclipse attacks where an adversary attempts to isolate a processor from honest peers. Key management deserves particular attention in production deployments, with hardware security modules recommended for storing validator private keys and TLS encryption required for all peer-to-peer connections.
 
 The configuration system should expose tunable parameters for network size (`n` and `f`), quorum thresholds (which are deterministic given `n` and `f`), timeout durations with exponential backoff multipliers, target block sizes, and storage options. Performance tuning parameters should control the degree of parallelism for signature verification, cache sizes for validated blocks and votes, and compaction strategies for the underlying database. These parameters allow operators to optimize the system for different deployment scenarios, from small validator sets with high-bandwidth connections to large globally distributed networks.
+
+# Rust Dependencies for Minimmit Protocol Implementation
+
+## Complete Dependencies Table
+
+| Category | Library | Version | Purpose | Priority | Notes |
+|----------|---------|---------|---------|----------|-------|
+| **Async Runtime** | `tokio` | `1.x` | Asynchronous runtime with multi-threaded scheduler | **Required** | Use with `full` feature for complete functionality |
+| | `mio` | `1.x` | Low-level async I/O (alternative to tokio) | Optional | Only if fine-grained control needed |
+| | `futures` | `0.3` | Async trait implementations and utilities | **Required** | Complements tokio ecosystem |
+| **Networking** | `iroh` | `0.x` | P2P networking with simpler interface | **Recommended** | Easier to deploy than libp2p |
+| | `libp2p` | `0.53` | Alternative P2P networking framework | Optional | More mature but complex |
+| | `quinn` | `0.11` | QUIC protocol implementation | Optional | For low-latency transport layer |
+| **Serialization** | `postcard` | `1.x` | Compact binary serialization | **Recommended** | Best balance of speed/size |
+| | `rkyv` | `0.7` | Zero-copy deserialization | Optional | Fastest option, more complex |
+| | `bitcode` | `0.6` | Efficient binary codec | Optional | Alternative to postcard |
+| | `serde` | `1.x` | Serialization framework | **Required** | Foundation for above libraries |
+| | `bincode` | `1.3` | Simple binary encoding | Optional | Fallback option |
+| **Cryptography** | `ark-bls12-381` | `0.4` | BLS signatures over BLS12-381 curve | **Required** | Core cryptographic primitive |
+| | `ark-serialize` | `0.4` | Serialization for arkworks types | **Required** | Needed for ark-bls12-381 |
+| | `ark-ff` | `0.4` | Finite field arithmetic | **Required** | Dependency of ark-bls12-381 |
+| | `ark-ec` | `0.4` | Elliptic curve operations | **Required** | Dependency of ark-bls12-381 |
+| | `ark-std` | `0.4` | Standard library for arkworks | **Required** | Arkworks foundation |
+| | `blake3` | `1.x` | Fast cryptographic hash function | **Recommended** | For block hashing |
+| | `sha3` | `0.10` | SHA-3 hash function | Optional | Alternative to blake3 |
+| | `rand` | `0.8` | Random number generation | **Required** | For cryptographic operations |
+| | `threshold-crypto` | `0.4` | Threshold signatures | Optional | Alternative threshold sig implementation |
+| **Storage** | `rocksdb` | `0.22` | High-performance key-value store | **Recommended** | Battle-tested in production |
+| | `redb` | `2.x` | Pure Rust embedded database | Optional | Simpler deployment |
+| | `sled` | `0.34` | Rust-native embedded database | Optional | Alternative to redb |
+| **Data Structures** | `dashmap` | `6.x` | Concurrent hashmap | **Required** | For thread-safe caching |
+| | `parking_lot` | `0.12` | Faster synchronization primitives | **Recommended** | Better than std::sync |
+| | `crossbeam` | `0.8` | Concurrent programming tools | **Recommended** | Channels and atomic utilities |
+| | `bytes` | `1.x` | Efficient byte buffer management | **Required** | Network buffer handling |
+| **Monitoring** | `tracing` | `0.1` | Structured logging and diagnostics | **Required** | Core observability |
+| | `tracing-subscriber` | `0.3` | Tracing event processing | **Required** | Complements tracing |
+| | `metrics` | `0.23` | Metrics facade | **Required** | Performance monitoring |
+| | `metrics-exporter-prometheus` | `0.15` | Prometheus metrics exporter | **Required** | Production metrics |
+| | `opentelemetry` | `0.24` | Distributed tracing | Optional | For advanced observability |
+| | `console-subscriber` | `0.4` | Tokio console integration | Optional | Runtime debugging |
+| **Error Handling** | `thiserror` | `1.x` | Ergonomic error types | **Recommended** | Define custom errors |
+| | `anyhow` | `1.x` | Flexible error handling | **Recommended** | Application-level errors |
+| | `color-eyre` | `0.6` | Pretty error reports | Optional | Development experience |
+| **Configuration** | `serde_yaml` | `0.9` | YAML configuration | **Recommended** | Config file parsing |
+| | `toml` | `0.8` | TOML configuration | Optional | Alternative config format |
+| | `figment` | `0.10` | Layered configuration | Optional | Complex config scenarios |
+| | `clap` | `4.x` | Command-line argument parsing | **Recommended** | CLI interface |
+| **Testing** | `tokio-test` | `0.4` | Testing utilities for async code | **Required** | Test async functions |
+| | `proptest` | `1.x` | Property-based testing | **Recommended** | Fuzz testing |
+| | `criterion` | `0.5` | Benchmarking framework | **Recommended** | Performance testing |
+| | `mockall` | `0.13` | Mock object generation | Optional | Unit test mocking |
+| **Utilities** | `once_cell` | `1.x` | Lazy static initialization | **Recommended** | Global state |
+| | `lazy_static` | `1.x` | Alternative lazy initialization | Optional | Alternative to once_cell |
+| | `chrono` | `0.4` | Date and time handling | **Recommended** | Timestamps |
+| | `uuid` | `1.x` | UUID generation | Optional | Unique identifiers |
+| | `hex` | `0.4` | Hex encoding/decoding | **Recommended** | Display hashes |
