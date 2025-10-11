@@ -3,3 +3,14 @@ members  = [ "consensus", "crypto", "p2p", "storage", "utils" ]
 resolver = "3"
 
 [workspace.dependencies]
+ark-bls12-381 = "0.5.0"
+ark-ec        = "0.5.0"
+ark-ff        = "0.5.0"
+ark-serialize = "0.5.0"
+blake3        = "1.8.2"
+metrics       = "0.24.2"
+rand          = "0.8.5"
+rand_core     = "0.9.3"
+redb          = "3.1.0"
+rkyv          = "0.8.12"
+tracing       = "0.1.41"
