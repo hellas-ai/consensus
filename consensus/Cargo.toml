@@ -11,7 +11,6 @@ ark-serialize = { workspace = true }
 blake3        = { workspace = true }
 metrics       = { workspace = true }
 rand          = { workspace = true, features = [ "std" ] }
-rand_core     = { workspace = true }
 redb          = { workspace = true }
 rkyv          = { workspace = true }
 tracing       = { workspace = true }
