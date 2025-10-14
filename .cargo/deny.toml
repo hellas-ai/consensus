@@ -1,0 +1,4 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436" }, # paste dependency no longer maintained
+]
