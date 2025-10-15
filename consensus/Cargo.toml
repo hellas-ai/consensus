@@ -4,14 +4,18 @@ name    = "consensus"
 version = "0.1.0"
 
 [dependencies]
+anyhow        = { workspace = true }
 ark-bls12-381 = { workspace = true, features = [ "curve" ] }
 ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
 ark-serialize = { workspace = true }
 blake3        = { workspace = true }
+config        = { workspace = true }
 metrics       = { workspace = true }
 rand          = { workspace = true, features = [ "std" ] }
 rand_core     = { workspace = true }
 redb          = { workspace = true }
 rkyv          = { workspace = true }
+serde         = { workspace = true, features = [ "derive" ] }
 tracing       = { workspace = true }
+validate      = { workspace = true }

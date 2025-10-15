@@ -14,6 +14,7 @@ use crate::state::block::{ArchivedMNotarization, MNotarization};
 pub mod consensus;
 pub mod crypto;
 pub mod state;
+pub mod storage;
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 
