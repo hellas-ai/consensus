@@ -215,7 +215,6 @@ fn main() {
         aggregated_signature: crate::crypto::aggregated::AggregatedSignature::<100> {
             aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),
             public_keys,
-            participant_count: 100,
         },
     };
     let mut arena = Arena::new();

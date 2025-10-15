@@ -1,14 +1,17 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use std::{hash::Hash, hash::Hasher};
 
-use crate::crypto::{
-    aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature},
-    conversions::ArkSerdeWrapper,
+use crate::{
+    crypto::{
+        aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature},
+        conversions::ArkSerdeWrapper,
+    },
+    state::View,
 };
 
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct BlockHeader {
-    pub view: u64,
+    pub view: View,
     pub parent_block_hash: [u8; blake3::OUT_LEN],
     pub timestamp: u64,
 }
@@ -143,3 +146,17 @@ impl Transaction {
         hasher.finalize().into()
     }
 }
+
+impl Hash for Transaction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.compute_hash().hash(state);
+    }
+}
+
+impl PartialEq for Transaction {
+    fn eq(&self, other: &Self) -> bool {
+        self.compute_hash() == other.compute_hash()
+    }
+}
+
+impl Eq for Transaction {}
