@@ -78,6 +78,7 @@ pub struct LNotarization<const N: usize, const F: usize, const L_SIZE: usize> {
     /// The block that has been notarized
     pub block: Block,
     /// The aggregated signature of the block by the peers that have voted for it
+    #[rkyv(with = ArkSerdeWrapper)]
     pub aggregated_signature: AggregatedSignature<L_SIZE>,
 }
 

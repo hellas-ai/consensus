@@ -1,4 +1,4 @@
-use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize, with::Skip};
 
 use crate::crypto::{aggregated::BlsPublicKey, conversions::ArkSerdeWrapper};
 
@@ -14,6 +14,7 @@ pub struct Leader {
     /// Whether the leader is currently active
     pub is_current: bool,
     /// The view number
+    #[rkyv(with = Skip)]
     pub view: u64,
 }
 
