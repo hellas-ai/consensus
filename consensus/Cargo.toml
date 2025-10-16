@@ -18,4 +18,3 @@ redb          = { workspace = true }
 rkyv          = { workspace = true }
 serde         = { workspace = true, features = [ "derive" ] }
 tracing       = { workspace = true }
-validate      = { workspace = true }
