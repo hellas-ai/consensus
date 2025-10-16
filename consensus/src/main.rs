@@ -9,7 +9,7 @@ use rkyv::{
     ser::allocator::Arena, util::AlignedVec,
 };
 
-use crate::state::block::{ArchivedMNotarization, MNotarization};
+use crate::state::notarizations::{ArchivedMNotarization, MNotarization};
 
 pub mod consensus;
 pub mod crypto;
@@ -203,7 +203,7 @@ fn main() {
         public_keys.push(public_key);
     }
     let public_keys = public_keys.try_into().unwrap();
-    let block = crate::state::block::MNotarization::<100, 1, 100> {
+    let block = crate::state::notarizations::MNotarization::<100, 1, 100> {
         block: crate::state::block::Block {
             header: crate::state::block::BlockHeader {
                 view: 1,
@@ -212,6 +212,7 @@ fn main() {
             },
             transactions: vec![],
             hash: None,
+            is_finalized: false,
         },
         aggregated_signature: crate::crypto::aggregated::AggregatedSignature::<100> {
             aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),

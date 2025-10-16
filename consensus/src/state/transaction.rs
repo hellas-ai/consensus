@@ -1,11 +1,6 @@
-use std::hash::{Hash, Hasher};
-
-use crate::{
-    crypto::{
-        aggregated::{BlsPublicKey, BlsSignature},
-        conversions::ArkSerdeWrapper,
-    },
-    state::now,
+use crate::crypto::{
+    aggregated::{BlsPublicKey, BlsSignature},
+    conversions::ArkSerdeWrapper,
 };
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, with::Skip};
 
@@ -29,7 +24,6 @@ pub struct Transaction {
     pub nonce: u64,
     /// The timestamp of the transaction, as measured by the
     /// peer proposing such transaction.
-    #[rkyv(with = Skip)]
     pub timestamp: u64,
     /// The fee of the transaction. This value is used to
     /// prioritize transactions in the mempool.
@@ -43,6 +37,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sender: BlsPublicKey,
         recipient: [u8; 32],
@@ -68,11 +63,9 @@ impl Transaction {
     /// Computes the transaction from its bytes
     pub fn from_tx_bytes(bytes: &[u8]) -> Self {
         let tx_hash = blake3::hash(bytes);
-        let timestamp = now();
         let archived = unsafe { rkyv::access_unchecked::<ArchivedTransaction>(bytes) };
         let mut tx = deserialize::<Transaction, Error>(archived).expect("Failed to deserialize");
         tx.tx_hash = tx_hash.into();
-        tx.timestamp = timestamp;
         tx
     }
 
