@@ -1,9 +1,11 @@
 use anyhow::Result;
+use ark_serialize::CanonicalSerialize;
 use rkyv::{
     Archive, Archived, api::high::to_bytes_with_alloc, ser::allocator::Arena, util::AlignedVec,
 };
 
 use crate::state::{
+    account::Account,
     block::Block,
     leader::Leader,
     notarizations::{LNotarization, MNotarization},
@@ -148,6 +150,21 @@ impl<const N: usize, const F: usize, const L_SIZE: usize> Storable for Nullifica
 
     fn key(&self) -> Self::Key {
         self.view.to_le_bytes()
+    }
+
+    fn value(&self) -> Result<Self::Value> {
+        serialize_for_db(self)
+    }
+}
+
+impl Storable for Account {
+    type Key = Vec<u8>;
+    type Value = AlignedVec;
+
+    fn key(&self) -> Self::Key {
+        let mut writer = Vec::new();
+        self.public_key.serialize_compressed(&mut writer).unwrap();
+        writer
     }
 
     fn value(&self) -> Result<Self::Value> {

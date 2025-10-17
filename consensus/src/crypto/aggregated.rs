@@ -12,12 +12,6 @@ pub struct BlsSignature(pub G1Affine);
 #[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
 pub struct BlsSecretKey(pub Fr);
 
-#[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
-pub struct AggregatedSignature<const N: usize> {
-    pub aggregated_signature: BlsSignature,
-    pub public_keys: [BlsPublicKey; N],
-}
-
 impl BlsSecretKey {
     /// Generate a new random secret key
     pub fn generate<R: rand::Rng>(rng: &mut R) -> Self {
@@ -130,6 +124,12 @@ impl BlsSignature {
         }
         BlsSignature(aggregated.into_affine())
     }
+}
+
+#[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
+pub struct AggregatedSignature<const N: usize> {
+    pub aggregated_signature: BlsSignature,
+    pub public_keys: [BlsPublicKey; N],
 }
 
 impl<const N: usize> AggregatedSignature<N> {

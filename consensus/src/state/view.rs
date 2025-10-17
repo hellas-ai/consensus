@@ -1,4 +1,4 @@
-use rkyv::{Archive, Deserialize, Serialize, with::Skip};
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::crypto::{aggregated::BlsPublicKey, conversions::ArkSerdeWrapper};
 
@@ -11,7 +11,6 @@ use crate::crypto::{aggregated::BlsPublicKey, conversions::ArkSerdeWrapper};
 #[derive(Archive, Deserialize, Serialize)]
 pub struct View {
     /// The view number
-    #[rkyv(with = Skip)]
     pub view: u64,
     /// The leader's BlsPublicKey of the view
     #[rkyv(with = ArkSerdeWrapper)]
