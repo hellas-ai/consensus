@@ -16,7 +16,6 @@ pub struct BlsSecretKey(pub Fr);
 pub struct AggregatedSignature<const N: usize> {
     pub aggregated_signature: BlsSignature,
     pub public_keys: [BlsPublicKey; N],
-    pub participant_count: usize,
 }
 
 impl BlsSecretKey {
@@ -155,7 +154,6 @@ impl<const N: usize> AggregatedSignature<N> {
         Some(AggregatedSignature {
             aggregated_signature,
             public_keys: public_keys.clone(),
-            participant_count: public_keys.len(),
         })
     }
 
