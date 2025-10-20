@@ -15,6 +15,7 @@ pub mod consensus;
 pub mod crypto;
 pub mod state;
 pub mod storage;
+pub mod view_manager;
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 
@@ -213,6 +214,7 @@ fn main() {
             transactions: vec![],
             hash: None,
             is_finalized: false,
+            height: 1,
         },
         aggregated_signature: crate::crypto::aggregated::AggregatedSignature::<100> {
             aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),

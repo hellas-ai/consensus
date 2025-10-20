@@ -33,6 +33,8 @@ pub struct Block {
     /// rejected by the consensus, if peers fail to collect enough
     /// votes to finalize it, within the given view timeout period.
     pub is_finalized: bool,
+    /// The height of the block in the blockchain
+    pub height: u64,
 }
 
 impl Block {
@@ -42,6 +44,7 @@ impl Block {
         transactions: Vec<Transaction>,
         timestamp: u64,
         is_finalized: bool,
+        height: u64,
     ) -> Self {
         let mut block = Self {
             header: BlockHeader {
@@ -52,6 +55,7 @@ impl Block {
             transactions,
             hash: None,
             is_finalized,
+            height,
         };
         block.hash = Some(block.compute_hash());
         block
@@ -147,16 +151,22 @@ mod tests {
         Transaction::new(pk, [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig)
     }
 
-    fn gen_block(view: u64, parent: [u8; blake3::OUT_LEN], tx_bodies: &[&[u8]], ts: u64) -> Block {
+    fn gen_block(
+        view: u64,
+        parent: [u8; blake3::OUT_LEN],
+        tx_bodies: &[&[u8]],
+        ts: u64,
+        height: u64,
+    ) -> Block {
         let txs = tx_bodies.iter().map(|b| gen_tx(b)).collect::<Vec<_>>();
-        Block::new(view, parent, txs, ts, false)
+        Block::new(view, parent, txs, ts, false, height)
     }
 
     #[test]
     fn hash_is_deterministic_for_same_content() {
         let parent = [1u8; blake3::OUT_LEN];
-        let b1 = gen_block(5, parent, &[b"a", b"b"], 123456);
-        let b2 = gen_block(5, parent, &[b"a", b"b"], 123456);
+        let b1 = gen_block(5, parent, &[b"a", b"b"], 123456, 1);
+        let b2 = gen_block(5, parent, &[b"a", b"b"], 123456, 1);
         assert_eq!(b1.get_hash(), b2.get_hash());
         assert_eq!(b1, b2);
     }
@@ -164,8 +174,8 @@ mod tests {
     #[test]
     fn hash_changes_when_transactions_change() {
         let parent = [2u8; blake3::OUT_LEN];
-        let b1 = gen_block(6, parent, &[b"a", b"b"], 999);
-        let b2 = gen_block(6, parent, &[b"a", b"c"], 999);
+        let b1 = gen_block(6, parent, &[b"a", b"b"], 999, 2);
+        let b2 = gen_block(6, parent, &[b"a", b"c"], 999, 2);
         assert_ne!(b1.get_hash(), b2.get_hash());
         assert_ne!(b1, b2);
     }
@@ -173,15 +183,15 @@ mod tests {
     #[test]
     fn hash_changes_with_order_of_transactions() {
         let parent = [3u8; blake3::OUT_LEN];
-        let b1 = gen_block(7, parent, &[b"x", b"y"], 111);
-        let b2 = gen_block(7, parent, &[b"y", b"x"], 111);
+        let b1 = gen_block(7, parent, &[b"x", b"y"], 111, 3);
+        let b2 = gen_block(7, parent, &[b"y", b"x"], 111, 3);
         assert_ne!(b1.get_hash(), b2.get_hash());
     }
 
     #[test]
     fn getters_return_expected_values() {
         let parent = [9u8; blake3::OUT_LEN];
-        let b = gen_block(42, parent, &[b"a"], 777);
+        let b = gen_block(42, parent, &[b"a"], 777, 42);
         assert_eq!(b.view(), 42);
         assert_eq!(b.parent_block_hash(), parent);
         assert!(b.is_view_block(42));
@@ -191,7 +201,7 @@ mod tests {
     #[test]
     fn from_block_bytes_recomputes_when_hash_missing() {
         let parent = [4u8; blake3::OUT_LEN];
-        let mut b = gen_block(8, parent, &[b"z"], 222);
+        let mut b = gen_block(8, parent, &[b"z"], 222, 8);
         // Simulate an archived block with hash = None
         b.hash = None;
         let bytes = serialize_for_db(&b).expect("serialize");
@@ -200,7 +210,7 @@ mod tests {
         let expected = restored.get_hash();
         let recomputed = {
             // Recompute via creating the same content block again
-            let b2 = gen_block(8, parent, &[b"z"], 222);
+            let b2 = gen_block(8, parent, &[b"z"], 222, 8);
             b2.get_hash()
         };
         assert_eq!(expected, recomputed);

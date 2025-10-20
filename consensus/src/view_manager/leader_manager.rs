@@ -1,0 +1,66 @@
+use crate::state::{leader::Leader, peer::Peer};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+/// [`LeaderManager`] trait for managing leader selection.
+///
+/// One essential aspect of any derived implementation is the ability to
+/// select the leader for a given view, in a fully deterministic and reproducible way.
+/// This is crucial for the safety of the consensus protocol, and to make sure
+/// that replicas are always able to agree on the leader for a view, given its past
+/// state.
+pub trait LeaderManager {
+    /// Selects the leader for a given view.
+    fn select_leader(&self, view: u64, previous_state: [u8; blake3::OUT_LEN]) -> Result<Leader>;
+}
+
+/// [`RoundRobinLeaderManager`] implements the round-robin leader selection strategy.
+///
+/// This strategy selects the leader for a given view by using a round-robin approach.
+/// The leader is selected by the index of the replica in the list of replicas.
+pub(crate) struct RoundRobinLeaderManager {
+    /// The number of replicas in the consensus protocol.
+    n: usize,
+
+    /// The vector of all available replicas in the consensus protocol.
+    pub replicas: Vec<Peer>,
+}
+
+impl RoundRobinLeaderManager {
+    pub fn new(n: usize, replicas: Vec<Peer>) -> Self {
+        Self { n, replicas }
+    }
+}
+
+impl LeaderManager for RoundRobinLeaderManager {
+    fn select_leader(&self, view: u64, _previous_state: [u8; blake3::OUT_LEN]) -> Result<Leader> {
+        let leader_index = view as usize % self.n;
+        let leader = self
+            .replicas
+            .get(leader_index)
+            .ok_or(anyhow::anyhow!("Leader index out of bounds"))?;
+        Ok(Leader::new(
+            leader.public_key.clone(),
+            leader.is_current_leader,
+            view,
+        ))
+    }
+}
+
+/// [`LeaderSelectionStrategy`] represents the strategy used to select the leader for a given view.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderSelectionStrategy {
+    /// [`RoundRobin`] selects the leader for a given view by using a round-robin approach.
+    /// The leader is selected by the index of the replica in the (deterministic) list of replicas.
+    RoundRobin,
+
+    /// [`Random`] selects the leader for a given view by using a random approach.
+    /// The leader is selected by a random number generator.
+    Random,
+
+    /// [`ProofOfStake`] selects the leader for a given view by using a proof-of-stake approach.
+    /// The leader is selected by the proof-of-stake mechanism.
+    ProofOfStake,
+}

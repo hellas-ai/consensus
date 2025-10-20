@@ -15,5 +15,6 @@ metrics       = { workspace = true }
 rand          = { workspace = true, features = [ "std" ] }
 redb          = { workspace = true }
 rkyv          = { workspace = true }
+rtrb          = { workspace = true }
 serde         = { workspace = true, features = [ "derive" ] }
 tracing       = { workspace = true }
