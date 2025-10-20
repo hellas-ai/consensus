@@ -86,6 +86,16 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
     BroadcastConsensusMessage {
         /// The consensus message to be broadcasted by the current replica
         /// to its peers on the network.
-        message: ConsensusMessage<N, F, M_SIZE, L_SIZE>,
+        message: Box<ConsensusMessage<N, F, M_SIZE, L_SIZE>>,
     },
+
+    /// No operation is required at the moment, since (most likely) the replica
+    /// already has made its state progress for the current view.
+    NoOp,
+
+    /// The replica still has not been able to make progress on the current view,
+    /// and the view timeout has not been triggered yet, so the replica must await
+    /// until it either receives a block to vote on the current view, or the timeout
+    /// is triggered.
+    Await,
 }

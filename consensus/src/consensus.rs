@@ -6,6 +6,8 @@ use crate::state::{
     nullify::Nullification,
 };
 
+type View = u64;
+
 /// [`ConsensusMessage`] represents a message in the consensus protocol.
 ///
 /// It can either be:
@@ -17,8 +19,9 @@ use crate::state::{
 #[derive(Clone, Debug, Archive, Deserialize, Serialize)]
 pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
 {
-    Proposal(Block),
+    BlockProposal(Block),
     Vote(Vote),
+    Nullify(View),
     MNotarization(MNotarization<N, F, M_SIZE>),
     LNotarization(LNotarization<N, F, L_SIZE>),
     Nullification(Nullification<N, F, M_SIZE>),

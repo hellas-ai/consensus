@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::Result;
 use config::{Config, Environment, File};
@@ -16,6 +16,9 @@ pub struct ConsensusConfig {
     pub n: usize,
     /// The maximum number of faulty replicas in the consensus protocol.
     pub f: usize,
+    /// The maximum timeout duration allowed before a replica proposes a
+    /// [`Nullify`] message to the network.
+    pub view_timeout: Duration,
     /// The leader selection strategy to use.
     pub leader_manager: LeaderSelectionStrategy,
     /// The network in which the replica runs the consensus protocol.
@@ -26,12 +29,14 @@ impl ConsensusConfig {
     pub fn new(
         n: usize,
         f: usize,
+        view_timeout: Duration,
         leader_manager: LeaderSelectionStrategy,
         network: Network,
     ) -> Self {
         Self {
             n,
             f,
+            view_timeout,
             leader_manager,
             network,
         }
