@@ -1,7 +1,11 @@
+use std::str::FromStr;
+
 use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, pairing::Pairing};
 use ark_ff::{PrimeField, UniformRand, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+
+pub type PeerId = u64;
 
 #[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
 pub struct BlsPublicKey(pub G2Affine);
@@ -113,6 +117,28 @@ impl BlsPublicKey {
         }
 
         true
+    }
+
+    /// Convert the public key to a peer ID
+    ///
+    /// The peer ID is the first 8 bytes of the hash of the underlying
+    /// compressed public key serialization.
+    pub fn to_peer_id(&self) -> PeerId {
+        let mut buff = [0u8; blake3::OUT_LEN];
+        let mut hasher = blake3::Hasher::new();
+        self.0.serialize_compressed(&mut buff[..]).unwrap();
+        hasher.update(&buff[..]);
+        let hash = hasher.finalize();
+        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+    }
+}
+
+impl FromStr for BlsPublicKey {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s)?;
+        let g2_affine = G2Affine::deserialize_compressed(&bytes[..]).map_err(anyhow::Error::msg)?;
+        Ok(BlsPublicKey(g2_affine))
     }
 }
 

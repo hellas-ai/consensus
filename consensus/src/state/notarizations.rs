@@ -1,6 +1,6 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature};
+use crate::crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature, PeerId};
 use crate::crypto::conversions::ArkSerdeWrapper;
 use crate::state::block::Block;
 
@@ -9,8 +9,8 @@ use crate::state::block::Block;
 /// A vote corresponds to an authenticated block, from a given peer.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Vote {
-    /// The block that is being voted for
-    pub block: Block,
+    /// The hash of the block that is being voted for
+    pub block_hash: [u8; blake3::OUT_LEN],
     /// The signature of block by the peer that is voting
     /// for the current block
     #[rkyv(with = ArkSerdeWrapper)]
@@ -18,22 +18,27 @@ pub struct Vote {
     /// The public key of the peer that is
     /// voting for the current block
     #[rkyv(with = ArkSerdeWrapper)]
-    pub public_key: BlsPublicKey,
+    pub peer_id: PeerId,
 }
 
 impl Vote {
-    pub fn new(block: Block, signature: BlsSignature, public_key: BlsPublicKey) -> Self {
+    pub fn new(
+        block_hash: [u8; blake3::OUT_LEN],
+        signature: BlsSignature,
+        peer_id: PeerId,
+    ) -> Self {
         Self {
-            block,
+            block_hash,
             signature,
-            public_key,
+            peer_id,
         }
     }
 
     /// Verifies if the block has been successfully signed by its author
-    pub fn verify(&self) -> bool {
-        self.public_key
-            .verify(&self.block.get_hash(), &self.signature)
+    /// Note: this does not verify that the [`PeerId`] matches the public key
+    /// of the peer that signed the block. This should be verified by the caller, beforehand.
+    pub fn verify(&self, peer_public_key: &BlsPublicKey) -> bool {
+        peer_public_key.verify(&self.block_hash, &self.signature)
     }
 }
 
