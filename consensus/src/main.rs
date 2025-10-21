@@ -9,7 +9,10 @@ use rkyv::{
     ser::allocator::Arena, util::AlignedVec,
 };
 
-use crate::state::notarizations::{ArchivedMNotarization, MNotarization};
+use crate::{
+    crypto::aggregated::PeerId,
+    state::notarizations::{ArchivedMNotarization, MNotarization},
+};
 
 pub mod consensus;
 pub mod crypto;
@@ -203,23 +206,16 @@ fn main() {
         let public_key = secret_key.public_key();
         public_keys.push(public_key);
     }
-    let public_keys = public_keys.try_into().unwrap();
+
     let block = crate::state::notarizations::MNotarization::<100, 1, 100> {
-        block: crate::state::block::Block {
-            header: crate::state::block::BlockHeader {
-                view: 1,
-                parent_block_hash: [0; 32],
-                timestamp: 1,
-            },
-            transactions: vec![],
-            hash: None,
-            is_finalized: false,
-            height: 1,
-        },
-        aggregated_signature: crate::crypto::aggregated::AggregatedSignature::<100> {
-            aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),
-            public_keys,
-        },
+        block_hash: [0; 32],
+        aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),
+        peer_ids: public_keys
+            .iter()
+            .map(|pk| pk.to_peer_id())
+            .collect::<Vec<PeerId>>()
+            .try_into()
+            .unwrap(),
     };
     let mut arena = Arena::new();
     let start = std::time::Instant::now();

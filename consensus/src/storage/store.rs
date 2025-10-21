@@ -261,7 +261,10 @@ impl ConsensusStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSecretKey};
+    use crate::{
+        crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSecretKey, PeerId},
+        state::peer::PeerSet,
+    };
     use rand::thread_rng;
 
     fn temp_db_path(suffix: &str) -> String {
@@ -422,8 +425,16 @@ mod tests {
             let pks: [BlsPublicKey; M_SIZE] = pks_vec.try_into().unwrap();
             let sigs = vec![s1, s2, s3];
 
-            let agg = AggregatedSignature::<M_SIZE>::new(pks, &msg, &sigs).expect("agg");
-            let m = MNotarization::<N, F, M_SIZE>::new(block.clone(), agg);
+            let agg = AggregatedSignature::<M_SIZE>::new(pks.clone(), &msg, &sigs).expect("agg");
+            let m = MNotarization::<N, F, M_SIZE>::new(
+                block.get_hash(),
+                agg.aggregated_signature,
+                pks.iter()
+                    .map(|pk| pk.to_peer_id())
+                    .collect::<Vec<PeerId>>()
+                    .try_into()
+                    .unwrap(),
+            );
 
             store.pub_notarization(&m).unwrap();
             let h = block.get_hash();
@@ -432,8 +443,8 @@ mod tests {
                 .unwrap()
                 .expect("get mnotar");
 
-            assert_eq!(fetched.block.get_hash(), block.get_hash());
-            assert!(fetched.verify());
+            assert_eq!(fetched.block_hash, block.get_hash());
+            assert!(fetched.verify(&PeerSet::new(pks.to_vec())));
         }
         std::fs::remove_file(&path).ok();
     }

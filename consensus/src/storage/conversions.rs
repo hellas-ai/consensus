@@ -123,7 +123,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> Storable for MNotariza
     type Value = AlignedVec;
 
     fn key(&self) -> Self::Key {
-        self.block.get_hash()
+        self.block_hash
     }
 
     fn value(&self) -> Result<Self::Value> {
@@ -136,7 +136,7 @@ impl<const N: usize, const F: usize, const L_SIZE: usize> Storable for LNotariza
     type Value = AlignedVec;
 
     fn key(&self) -> Self::Key {
-        self.block.get_hash()
+        self.block_hash
     }
 
     fn value(&self) -> Result<Self::Value> {

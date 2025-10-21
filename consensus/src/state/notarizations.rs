@@ -1,8 +1,8 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature, PeerId};
+use crate::crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId};
 use crate::crypto::conversions::ArkSerdeWrapper;
-use crate::state::block::Block;
+use crate::state::peer::PeerSet;
 
 /// [`Vote`] represents a vote for a given block.
 ///
@@ -53,24 +53,41 @@ impl Vote {
 /// aggregated signature.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct MNotarization<const N: usize, const F: usize, const M_SIZE: usize> {
-    /// The block that has been notarized
-    pub block: Block,
+    /// The hash of the block that has been notarized
+    pub block_hash: [u8; blake3::OUT_LEN],
     /// The aggregated signature of the block by the peers that have notarized it
     #[rkyv(with = ArkSerdeWrapper)]
-    pub aggregated_signature: AggregatedSignature<M_SIZE>,
+    pub aggregated_signature: BlsSignature,
+    /// The peer IDs of the peers that have notarized the block
+    pub peer_ids: [PeerId; M_SIZE],
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_SIZE> {
-    pub fn new(block: Block, aggregated_signature: AggregatedSignature<M_SIZE>) -> Self {
+    pub fn new(
+        block_hash: [u8; blake3::OUT_LEN],
+        aggregated_signature: BlsSignature,
+        peer_ids: [PeerId; M_SIZE],
+    ) -> Self {
         Self {
-            block,
+            block_hash,
             aggregated_signature,
+            peer_ids,
         }
     }
 
     /// Verifies the underlying M-notarization aggregated block signature
-    pub fn verify(&self) -> bool {
-        self.aggregated_signature.verify(&self.block.get_hash())
+    pub fn verify(&self, peer_set: &PeerSet) -> bool {
+        let public_keys = self
+            .peer_ids
+            .iter()
+            .map(|peer_id| {
+                peer_set
+                    .get_public_key(*peer_id)
+                    .expect("Peer ID not found in peer set")
+                    .clone()
+            })
+            .collect::<Vec<BlsPublicKey>>();
+        BlsPublicKey::aggregate(&public_keys).verify(&self.block_hash, &self.aggregated_signature)
     }
 }
 
@@ -81,22 +98,39 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct LNotarization<const N: usize, const F: usize, const L_SIZE: usize> {
     /// The block that has been notarized
-    pub block: Block,
-    /// The aggregated signature of the block by the peers that have voted for it
+    pub block_hash: [u8; blake3::OUT_LEN],
+    /// The aggregated signature of the block by the peers that have notarized it
     #[rkyv(with = ArkSerdeWrapper)]
-    pub aggregated_signature: AggregatedSignature<L_SIZE>,
+    pub aggregated_signature: BlsSignature,
+    /// The peer IDs of the peers that have notarized the block
+    pub peer_ids: [PeerId; L_SIZE],
 }
 
 impl<const N: usize, const F: usize, const L_SIZE: usize> LNotarization<N, F, L_SIZE> {
-    pub fn new(block: Block, aggregated_signature: AggregatedSignature<L_SIZE>) -> Self {
+    pub fn new(
+        block_hash: [u8; blake3::OUT_LEN],
+        aggregated_signature: BlsSignature,
+        peer_ids: [PeerId; L_SIZE],
+    ) -> Self {
         Self {
-            block,
+            block_hash,
             aggregated_signature,
+            peer_ids,
         }
     }
 
-    /// Verifies the underlying M-notarization aggregated block signature
-    pub fn verify(&self) -> bool {
-        self.aggregated_signature.verify(&self.block.get_hash())
+    /// Verifies the underlying L-notarization aggregated block signature
+    pub fn verify(&self, peer_set: &PeerSet) -> bool {
+        let public_keys = self
+            .peer_ids
+            .iter()
+            .map(|peer_id| {
+                peer_set
+                    .get_public_key(*peer_id)
+                    .expect("Peer ID not found in peer set")
+                    .clone()
+            })
+            .collect::<Vec<BlsPublicKey>>();
+        BlsPublicKey::aggregate(&public_keys).verify(&self.block_hash, &self.aggregated_signature)
     }
 }
