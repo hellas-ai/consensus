@@ -43,10 +43,43 @@ impl Eq for Peer {}
 ///
 /// It contains the peers' IDs and public keys.
 #[derive(Clone, Debug)]
-pub struct PeerSet(pub HashMap<PeerId, BlsPublicKey>);
+pub struct PeerSet {
+    /// The map of peer IDs to public keys
+    pub id_to_public_key: HashMap<PeerId, BlsPublicKey>,
+    /// Sorted vector of peer ids
+    pub sorted_peer_ids: Vec<PeerId>,
+}
 
 impl PeerSet {
+    /// Creates a new peer set from a vector of public keys.
+    ///
+    /// The vector of public keys is expected to be sorted by peer ID.
+    ///
+    /// The sorting of the peer IDs is done in order to make sure that the order of the
+    /// peers in the vector is the same as the order of the peer IDs in the sorted vector.
+    /// This is useful for the round-robin leader selection strategy, where the leader is
+    /// selected by the index of the replica in the vector of replicas.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input vector of public keys contains either:
+    /// - Duplicate public keys
+    /// - Distinct public keys with the same peer ID
     pub fn new(peers: Vec<BlsPublicKey>) -> Self {
-        Self(peers.into_iter().map(|p| (p.to_peer_id(), p)).collect())
+        let mut id_to_public_key = HashMap::with_capacity(peers.len());
+        let mut sorted_peer_ids = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let peer_id = peer.to_peer_id();
+            id_to_public_key.insert(peer_id, peer);
+            sorted_peer_ids.push(peer_id);
+        }
+        sorted_peer_ids.sort();
+        sorted_peer_ids.dedup();
+        // Make sure there were no duplicates in the input.
+        assert_eq!(sorted_peer_ids.len(), id_to_public_key.len());
+        Self {
+            id_to_public_key,
+            sorted_peer_ids,
+        }
     }
 }
