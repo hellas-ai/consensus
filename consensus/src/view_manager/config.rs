@@ -23,6 +23,8 @@ pub struct ConsensusConfig {
     pub leader_manager: LeaderSelectionStrategy,
     /// The network in which the replica runs the consensus protocol.
     pub network: Network,
+    /// The set of the (initial) peers in the consensus protocol.
+    pub peers: Vec<String>,
 }
 
 impl ConsensusConfig {
@@ -32,6 +34,7 @@ impl ConsensusConfig {
         view_timeout: Duration,
         leader_manager: LeaderSelectionStrategy,
         network: Network,
+        peers: Vec<String>,
     ) -> Self {
         Self {
             n,
@@ -39,6 +42,7 @@ impl ConsensusConfig {
             view_timeout,
             leader_manager,
             network,
+            peers,
         }
     }
 

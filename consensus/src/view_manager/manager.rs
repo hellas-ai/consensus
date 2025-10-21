@@ -1,14 +1,16 @@
-use std::{collections::HashSet, time::Instant};
+use std::{collections::HashSet, str::FromStr, time::Instant};
 
 use anyhow::Result;
 use tracing::instrument;
 
 use crate::{
     consensus::ConsensusMessage,
+    crypto::aggregated::BlsPublicKey,
     state::{
         block::Block,
         notarizations::{LNotarization, MNotarization, Vote},
         nullify::Nullification,
+        peer::PeerSet,
         transaction::Transaction,
     },
     view_manager::{
@@ -34,6 +36,10 @@ pub struct ViewProgressManager<
     /// The leader manager algorithm to use for leader selection.
     #[allow(unused)]
     leader_manager: Box<dyn LeaderManager>,
+
+    /// The set of peers in the consensus protocol.
+    #[allow(unused)]
+    peers: PeerSet,
 
     /// The current view
     current_view: u64,
@@ -78,6 +84,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
     ViewProgressManager<N, F, M_SIZE, L_SIZE>
 {
     pub fn new(config: ConsensusConfig, leader_manager: Box<dyn LeaderManager>) -> Self {
+        let peers = PeerSet::new(
+            config
+                .peers
+                .iter()
+                .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
+                .collect(),
+        );
         Self {
             config,
             leader_manager,
@@ -87,6 +100,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             voted_block_hash: None,
             has_proposed_in_view: false,
             has_nullified_in_view: false,
+            peers,
             is_leader: todo!(),
             #[allow(unreachable_code)]
             block: None,
@@ -111,6 +125,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             #[allow(unreachable_code)]
             LeaderSelectionStrategy::ProofOfStake => Box::new(todo!()),
         };
+        let peers = PeerSet::new(
+            config
+                .peers
+                .iter()
+                .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
+                .collect(),
+        );
         Self {
             config,
             leader_manager,
@@ -120,6 +141,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             voted_block_hash: None,
             has_proposed_in_view: false,
             has_nullified_in_view: false,
+            peers,
             is_leader: todo!(),
             #[allow(unreachable_code)]
             block: None,
