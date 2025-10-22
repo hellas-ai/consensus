@@ -336,7 +336,7 @@ mod tests {
             let store = ConsensusStore::open(&path).unwrap();
 
             let (_sk, _pk) = gen_keypair();
-            let leader = Leader::new(10, false, 10);
+            let leader = Leader::new(10, true, 10);
 
             store.pub_leader(&leader).unwrap();
             let fetched = store.get_leader(10).unwrap().expect("get leader");
