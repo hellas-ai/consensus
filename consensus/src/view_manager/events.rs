@@ -1,4 +1,6 @@
-use crate::{consensus::ConsensusMessage, crypto::aggregated::BlsPublicKey};
+use crate::{
+    consensus::ConsensusMessage, crypto::aggregated::BlsPublicKey, state::nullify::Nullification,
+};
 
 /// [`ViewProgressEvent`] represents an event that occurs in the view progress manager.
 ///
@@ -39,6 +41,13 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
     ShouldNullify {
         /// Current view number (for which the replica should nullify).
         view: u64,
+    },
+
+    /// If the current replica should broadcast a nullification for the current view.
+    ShouldBroadcastNullification {
+        /// The nullification to be broadcasted by the current replica
+        /// to its peers on the network.
+        nullification: Nullification<N, F, M_SIZE>,
     },
 
     /// If the current replica should M-notarize a block for the current view.

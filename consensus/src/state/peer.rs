@@ -97,6 +97,11 @@ impl PeerSet {
             Err(anyhow::anyhow!("Peer ID {peer_id} not found in peer set"))
         }
     }
+
+    /// Checks if a peer ID is in the peer set.
+    pub fn contains(&self, peer_id: &PeerId) -> bool {
+        self.id_to_public_key.contains_key(peer_id)
+    }
 }
 
 // ... existing code ...
@@ -257,7 +262,7 @@ mod tests {
 
         // Test getting each public key by its peer ID
         for (i, peer_id) in peer_ids.iter().enumerate() {
-            let result = peer_set.get_public_key(&peer_id);
+            let result = peer_set.get_public_key(peer_id);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), &public_keys[i]);
         }

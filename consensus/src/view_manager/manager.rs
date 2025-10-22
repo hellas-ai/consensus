@@ -9,7 +9,7 @@ use crate::{
     state::{
         block::Block,
         notarizations::{LNotarization, MNotarization, Vote},
-        nullify::Nullification,
+        nullify::{Nullification, Nullify},
         peer::PeerSet,
         transaction::Transaction,
     },
@@ -17,7 +17,10 @@ use crate::{
         config::ConsensusConfig,
         events::ViewProgressEvent,
         leader_manager::{LeaderManager, LeaderSelectionStrategy, RoundRobinLeaderManager},
-        utils::{NotarizationData, create_notarization_data},
+        utils::{
+            NotarizationData, NullificationData, create_notarization_data,
+            create_nullification_data,
+        },
     },
 };
 
@@ -75,7 +78,7 @@ pub struct ViewProgressManager<
     /// Nullify messages for the current view, we
     /// just need to store the peer id for each replica.
     #[allow(unused)]
-    nullify_messages: HashSet<u64>,
+    nullify_messages: HashSet<Nullify>,
     /// Nullifications for the current view
     #[allow(unused)]
     nullifications: HashSet<Nullification<N, F, M_SIZE>>,
@@ -180,9 +183,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
         match consensus_message {
             ConsensusMessage::BlockProposal(block) => self.handle_block_proposal(block),
             ConsensusMessage::Vote(vote) => self.handle_new_vote(vote),
-            ConsensusMessage::Nullify(_view) => {
-                todo!()
-            }
+            ConsensusMessage::Nullify(nullify) => self.handle_nullify(nullify),
             ConsensusMessage::MNotarization(_m_notarization) => {
                 todo!()
             }
@@ -322,6 +323,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
+        if self.peers.contains(&vote.peer_id) {
+            return Err(anyhow::anyhow!(
+                "Vote for peer {} is not present in the peers set",
+                vote.peer_id
+            ));
+        }
+
         if self.votes.contains(&vote) {
             return Err(anyhow::anyhow!(
                 "Vote for block hash {} is already present in the votes set",
@@ -381,6 +389,65 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             self.non_verified_votes.insert(vote);
             Ok(ViewProgressEvent::Await)
         }
+    }
+
+    fn handle_nullify(
+        &mut self,
+        nullify: Nullify,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+        if nullify.view != self.current_view {
+            return Err(anyhow::anyhow!(
+                "Nullify for view {} is not the current view: {}",
+                nullify.view,
+                self.current_view
+            ));
+        }
+
+        if self.nullify_messages.contains(&nullify) {
+            return Err(anyhow::anyhow!(
+                "Nullify for view {} and peer {} is already present in the nullify messages set",
+                nullify.view,
+                nullify.peer_id
+            ));
+        }
+
+        if !self.peers.contains(&nullify.peer_id) {
+            return Err(anyhow::anyhow!(
+                "Nullify for peer {} is not present in the peers set",
+                nullify.peer_id
+            ));
+        }
+
+        if !nullify.verify(
+            self.peers
+                .get_public_key(&nullify.peer_id)
+                .expect("Peer not found"),
+        ) {
+            return Err(anyhow::anyhow!(
+                "Nullify signature is not valid for peer {}",
+                nullify.peer_id
+            ));
+        }
+
+        self.nullify_messages.insert(nullify);
+        if self.nullify_messages.len() > 2 * F {
+            let NullificationData {
+                peer_ids,
+                aggregated_signature,
+            } = create_nullification_data::<M_SIZE>(&self.nullify_messages)?;
+            return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                nullification: Nullification::new(
+                    self.current_view,
+                    self.leader_manager
+                        .leader_for_view(self.current_view)?
+                        .peer_id(),
+                    aggregated_signature,
+                    peer_ids,
+                ),
+            });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
     fn try_update_view(&mut self, view: u64) -> Result<()> {

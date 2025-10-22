@@ -3,10 +3,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::state::{
     block::Block,
     notarizations::{LNotarization, MNotarization, Vote},
-    nullify::Nullification,
+    nullify::{Nullification, Nullify},
 };
-
-type View = u64;
 
 /// [`ConsensusMessage`] represents a message in the consensus protocol.
 ///
@@ -21,7 +19,7 @@ pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize, c
 {
     BlockProposal(Block),
     Vote(Vote),
-    Nullify(View),
+    Nullify(Nullify),
     MNotarization(MNotarization<N, F, M_SIZE>),
     LNotarization(LNotarization<N, F, L_SIZE>),
     Nullification(Nullification<N, F, M_SIZE>),

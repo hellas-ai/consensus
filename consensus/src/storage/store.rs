@@ -496,10 +496,19 @@ mod tests {
             let pks_vec = vec![pk1.clone(), pk2.clone(), pk3.clone()];
             let pks: [BlsPublicKey; M_SIZE] = pks_vec.try_into().unwrap();
 
-            let agg = AggregatedSignature::<M_SIZE>::new(pks, &msg, &[s1, s2, s3])
+            let agg = AggregatedSignature::<M_SIZE>::new(pks.clone(), &msg, &[s1, s2, s3])
                 .expect("Failed to create aggregated signature");
 
-            let nullif = Nullification::<N, F, M_SIZE>::new(view, agg);
+            let nullif = Nullification::<N, F, M_SIZE>::new(
+                view,
+                1,
+                agg.aggregated_signature,
+                pks.iter()
+                    .map(|pk| pk.to_peer_id())
+                    .collect::<Vec<PeerId>>()
+                    .try_into()
+                    .unwrap(),
+            );
             store.pub_nullification(&nullif).unwrap();
 
             let fetched = store
@@ -507,7 +516,7 @@ mod tests {
                 .unwrap()
                 .expect("get nullification");
             assert_eq!(fetched.view, view);
-            assert!(fetched.verify());
+            assert!(fetched.verify(&PeerSet::new(pks.to_vec())));
         }
         std::fs::remove_file(&path).ok();
     }
