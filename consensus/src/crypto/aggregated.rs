@@ -264,7 +264,7 @@ mod tests {
         let sk = BlsSecretKey::generate(&mut rng);
         let pk = sk.public_key();
 
-        let messages = vec![b"message 1", b"message 2", b"message 3"];
+        let messages = [b"message 1", b"message 2", b"message 3"];
 
         let signatures: Vec<BlsSignature> = messages.iter().map(|msg| sk.sign(*msg)).collect();
 
@@ -359,7 +359,7 @@ mod tests {
         assert!(aggregated.0.is_on_curve());
 
         // Test aggregating single key (should equal the key itself)
-        let single_aggregated = BlsPublicKey::aggregate(&[pk1.clone()]);
+        let single_aggregated = BlsPublicKey::aggregate(std::slice::from_ref(&pk1));
         assert_eq!(single_aggregated.0, pk1.0);
 
         // Test aggregating empty set (should be zero)
@@ -441,13 +441,13 @@ mod tests {
         let pk2 = sk2.public_key();
         let pk3 = sk3.public_key();
 
-        let messages = vec![b"msg1", b"msg2", b"msg3"];
+        let messages = [b"msg1", b"msg2", b"msg3"];
         let sig1 = sk1.sign(messages[0]);
         let sig2 = sk2.sign(messages[1]);
         let sig3 = sk3.sign(messages[2]);
 
-        let public_keys = vec![pk1.clone(), pk2.clone(), pk3.clone()];
-        let signatures = vec![sig1.clone(), sig2.clone(), sig3.clone()];
+        let public_keys = [pk1.clone(), pk2.clone(), pk3.clone()];
+        let signatures = [sig1.clone(), sig2.clone(), sig3.clone()];
 
         // Test valid batch verification
         assert!(BlsPublicKey::batch_verify(
@@ -472,9 +472,9 @@ mod tests {
 
         // Test single signature batch
         assert!(BlsPublicKey::batch_verify(
-            &[pk1.clone()],
+            std::slice::from_ref(&pk1),
             &[messages[0]],
-            &[sig1.clone()]
+            std::slice::from_ref(&sig1)
         ));
     }
 
@@ -612,7 +612,7 @@ mod tests {
         assert!(aggregated.0.is_on_curve());
 
         // Test aggregating single signature (should equal the signature itself)
-        let single_aggregated = BlsSignature::aggregate(&[sig1.clone()]);
+        let single_aggregated = BlsSignature::aggregate(std::slice::from_ref(&sig1));
         assert_eq!(single_aggregated.0, sig1.0);
 
         // Test aggregating empty set (should be zero)
@@ -747,7 +747,8 @@ mod tests {
         assert!(agg_3.unwrap().verify(message));
 
         // Test AggregatedSignature<1>
-        let agg_1 = AggregatedSignature::<1>::new([pk1.clone()], message, &[sig1.clone()]);
+        let agg_1 =
+            AggregatedSignature::<1>::new([pk1.clone()], message, std::slice::from_ref(&sig1));
         assert!(agg_1.is_some());
         assert!(agg_1.unwrap().verify(message));
     }
