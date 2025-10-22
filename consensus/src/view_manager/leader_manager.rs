@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// state.
 pub trait LeaderManager {
     /// Selects the leader for a given view.
-    fn select_leader(&self, view: u64, previous_state: [u8; blake3::OUT_LEN]) -> Result<Leader>;
+    fn leader_for_view(&self, view: u64) -> Result<Leader>;
 }
 
 /// [`RoundRobinLeaderManager`] implements the round-robin leader selection strategy.
@@ -34,17 +34,10 @@ impl RoundRobinLeaderManager {
 }
 
 impl LeaderManager for RoundRobinLeaderManager {
-    fn select_leader(&self, view: u64, _previous_state: [u8; blake3::OUT_LEN]) -> Result<Leader> {
+    fn leader_for_view(&self, view: u64) -> Result<Leader> {
         let leader_index = view as usize % self.n;
-        let leader = self
-            .replicas
-            .get(leader_index)
-            .ok_or(anyhow::anyhow!("Leader index out of bounds"))?;
-        Ok(Leader::new(
-            leader.public_key.clone(),
-            leader.is_current_leader,
-            view,
-        ))
+        let leader_peer_id = self.replicas[leader_index].peer_id;
+        Ok(Leader::new(leader_peer_id, false, view))
     }
 }
 

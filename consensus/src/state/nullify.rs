@@ -1,7 +1,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::crypto::{
-    aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature},
+    aggregated::{AggregatedSignature, BlsPublicKey, BlsSignature, PeerId},
     conversions::ArkSerdeWrapper,
 };
 
@@ -10,22 +10,28 @@ pub struct Nullify {
     pub view: u64,
     #[rkyv(with = ArkSerdeWrapper)]
     pub signature: BlsSignature,
-    #[rkyv(with = ArkSerdeWrapper)]
-    pub public_key: BlsPublicKey,
+    pub peer_id: PeerId,
 }
 
 impl Nullify {
-    pub fn new(view: u64, signature: BlsSignature, public_key: BlsPublicKey) -> Self {
+    pub fn new(view: u64, signature: BlsSignature, peer_id: PeerId) -> Self {
         Self {
             view,
             signature,
-            public_key,
+            peer_id,
         }
     }
 
-    pub fn verify(&self) -> bool {
-        self.public_key
-            .verify(&self.view.to_le_bytes(), &self.signature)
+    /// Verifies if the nullify message has been successfully signed by the peer with the given public key.
+    /// Note: this does not verify that the [`PeerId`] matches the public key
+    /// of the peer that signed the nullify message. This should be verified by the caller, beforehand.
+    pub fn verify(&self, public_key: &BlsPublicKey) -> bool {
+        let hash = blake3::hash(
+            [self.view.to_le_bytes(), self.peer_id.to_le_bytes()]
+                .concat()
+                .as_slice(),
+        );
+        public_key.verify(hash.as_bytes().as_slice(), &self.signature)
     }
 }
 

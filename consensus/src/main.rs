@@ -208,6 +208,7 @@ fn main() {
     }
 
     let block = crate::state::notarizations::MNotarization::<100, 1, 100> {
+        view: 0,
         block_hash: [0; 32],
         aggregated_signature: crate::crypto::aggregated::BlsSignature(G1Affine::zero()),
         peer_ids: public_keys

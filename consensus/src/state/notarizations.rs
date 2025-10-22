@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId};
@@ -9,6 +11,8 @@ use crate::state::peer::PeerSet;
 /// A vote corresponds to an authenticated block, from a given peer.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Vote {
+    /// The view number for which the vote is being cast
+    pub view: u64,
     /// The hash of the block that is being voted for
     pub block_hash: [u8; blake3::OUT_LEN],
     /// The signature of block by the peer that is voting
@@ -23,11 +27,13 @@ pub struct Vote {
 
 impl Vote {
     pub fn new(
+        view: u64,
         block_hash: [u8; blake3::OUT_LEN],
         signature: BlsSignature,
         peer_id: PeerId,
     ) -> Self {
         Self {
+            view,
             block_hash,
             signature,
             peer_id,
@@ -42,6 +48,21 @@ impl Vote {
     }
 }
 
+impl Hash for Vote {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view.hash(state);
+        self.block_hash.hash(state);
+    }
+}
+
+impl PartialEq for Vote {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view && self.block_hash == other.block_hash
+    }
+}
+
+impl Eq for Vote {}
+
 /// [`MNotarization`] represents a (2f + 1)-signature quorum for a given block (also
 /// referred to as a M-notarization). An M-notarization is required to progress to the next view,
 /// but not to finalize a block. Moreover, a block for view `v` can receive a M-notarization,
@@ -53,6 +74,8 @@ impl Vote {
 /// aggregated signature.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct MNotarization<const N: usize, const F: usize, const M_SIZE: usize> {
+    /// The view number for which the M-notarization is being cast
+    pub view: u64,
     /// The hash of the block that has been notarized
     pub block_hash: [u8; blake3::OUT_LEN],
     /// The aggregated signature of the block by the peers that have notarized it
@@ -64,11 +87,13 @@ pub struct MNotarization<const N: usize, const F: usize, const M_SIZE: usize> {
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_SIZE> {
     pub fn new(
+        view: u64,
         block_hash: [u8; blake3::OUT_LEN],
         aggregated_signature: BlsSignature,
         peer_ids: [PeerId; M_SIZE],
     ) -> Self {
         Self {
+            view,
             block_hash,
             aggregated_signature,
             peer_ids,
@@ -82,7 +107,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_
             .iter()
             .map(|peer_id| {
                 peer_set
-                    .get_public_key(*peer_id)
+                    .get_public_key(peer_id)
                     .expect("Peer ID not found in peer set")
                     .clone()
             })
@@ -91,12 +116,34 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_
     }
 }
 
+impl<const N: usize, const F: usize, const M_SIZE: usize> Hash for MNotarization<N, F, M_SIZE> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view.hash(state);
+        self.block_hash.hash(state);
+        self.peer_ids.hash(state);
+    }
+}
+
+impl<const N: usize, const F: usize, const M_SIZE: usize> PartialEq
+    for MNotarization<N, F, M_SIZE>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.block_hash == other.block_hash
+            && self.peer_ids == other.peer_ids
+    }
+}
+
+impl<const N: usize, const F: usize, const M_SIZE: usize> Eq for MNotarization<N, F, M_SIZE> {}
+
 /// An [`LNotarization`] corresponds to a majority vote of (n-f)-signatures
 /// for a given view block. An L-notarization, once broadcast by a peer,
 /// ensures that a given block has been fully finalized for a given view
 /// `v <= current_view`.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct LNotarization<const N: usize, const F: usize, const L_SIZE: usize> {
+    /// The view number for which the L-notarization is being cast
+    pub view: u64,
     /// The block that has been notarized
     pub block_hash: [u8; blake3::OUT_LEN],
     /// The aggregated signature of the block by the peers that have notarized it
@@ -108,11 +155,13 @@ pub struct LNotarization<const N: usize, const F: usize, const L_SIZE: usize> {
 
 impl<const N: usize, const F: usize, const L_SIZE: usize> LNotarization<N, F, L_SIZE> {
     pub fn new(
+        view: u64,
         block_hash: [u8; blake3::OUT_LEN],
         aggregated_signature: BlsSignature,
         peer_ids: [PeerId; L_SIZE],
     ) -> Self {
         Self {
+            view,
             block_hash,
             aggregated_signature,
             peer_ids,
@@ -126,7 +175,7 @@ impl<const N: usize, const F: usize, const L_SIZE: usize> LNotarization<N, F, L_
             .iter()
             .map(|peer_id| {
                 peer_set
-                    .get_public_key(*peer_id)
+                    .get_public_key(peer_id)
                     .expect("Peer ID not found in peer set")
                     .clone()
             })
@@ -134,3 +183,23 @@ impl<const N: usize, const F: usize, const L_SIZE: usize> LNotarization<N, F, L_
         BlsPublicKey::aggregate(&public_keys).verify(&self.block_hash, &self.aggregated_signature)
     }
 }
+
+impl<const N: usize, const F: usize, const L_SIZE: usize> Hash for LNotarization<N, F, L_SIZE> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view.hash(state);
+        self.block_hash.hash(state);
+        self.peer_ids.hash(state);
+    }
+}
+
+impl<const N: usize, const F: usize, const L_SIZE: usize> PartialEq
+    for LNotarization<N, F, L_SIZE>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.block_hash == other.block_hash
+            && self.peer_ids == other.peer_ids
+    }
+}
+
+impl<const N: usize, const F: usize, const L_SIZE: usize> Eq for LNotarization<N, F, L_SIZE> {}

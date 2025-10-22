@@ -1,6 +1,6 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::crypto::{aggregated::BlsPublicKey, conversions::ArkSerdeWrapper};
+use crate::crypto::aggregated::PeerId;
 
 /// [`Leader`] represents a leader in the consensus protocol, for a given view.
 ///
@@ -9,8 +9,7 @@ use crate::crypto::{aggregated::BlsPublicKey, conversions::ArkSerdeWrapper};
 #[derive(Archive, Deserialize, Serialize)]
 pub struct Leader {
     /// The leader's BlsPublicKey
-    #[rkyv(with = ArkSerdeWrapper)]
-    pub leader: BlsPublicKey,
+    pub peer_id: PeerId,
     /// Whether the leader is currently active
     pub is_current: bool,
     /// The view number
@@ -18,9 +17,9 @@ pub struct Leader {
 }
 
 impl Leader {
-    pub fn new(leader: BlsPublicKey, is_current: bool, view: u64) -> Self {
+    pub fn new(peer_id: PeerId, is_current: bool, view: u64) -> Self {
         Self {
-            leader,
+            peer_id,
             is_current,
             view,
         }
@@ -28,8 +27,8 @@ impl Leader {
 
     /// Returns the leader's BlsPublicKey
     #[inline]
-    pub fn leader(&self) -> &BlsPublicKey {
-        &self.leader
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
     }
 
     /// Returns whether the leader is currently active

@@ -1,7 +1,7 @@
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error};
 use std::{hash::Hash, hash::Hasher};
 
-use crate::state::transaction::Transaction;
+use crate::{crypto::aggregated::PeerId, state::transaction::Transaction};
 
 /// [`BlockHeader`] represents the header of a block.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
@@ -23,6 +23,8 @@ pub struct BlockHeader {
 /// data of the block.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Block {
+    /// The leader that proposed the block
+    pub leader: PeerId,
     /// The header of the block
     pub header: BlockHeader,
     /// The transactions associated with the block
@@ -40,6 +42,7 @@ pub struct Block {
 impl Block {
     pub fn new(
         view: u64,
+        leader: PeerId,
         parent_block_hash: [u8; blake3::OUT_LEN],
         transactions: Vec<Transaction>,
         timestamp: u64,
@@ -47,6 +50,7 @@ impl Block {
         height: u64,
     ) -> Self {
         let mut block = Self {
+            leader,
             header: BlockHeader {
                 view,
                 parent_block_hash,
@@ -59,6 +63,22 @@ impl Block {
         };
         block.hash = Some(block.compute_hash());
         block
+    }
+
+    /// Creates the genesis block for the consensus protocol.
+    pub fn genesis() -> Self {
+        Self {
+            leader: 0,
+            header: BlockHeader {
+                view: 0,
+                parent_block_hash: [0; blake3::OUT_LEN],
+                timestamp: 0,
+            },
+            transactions: vec![],
+            hash: None,
+            is_finalized: false,
+            height: 0,
+        }
     }
 
     /// Computes the hash of the block, as a concatenation of the hash of the parent block,
@@ -153,20 +173,21 @@ mod tests {
 
     fn gen_block(
         view: u64,
+        leader: PeerId,
         parent: [u8; blake3::OUT_LEN],
         tx_bodies: &[&[u8]],
         ts: u64,
         height: u64,
     ) -> Block {
         let txs = tx_bodies.iter().map(|b| gen_tx(b)).collect::<Vec<_>>();
-        Block::new(view, parent, txs, ts, false, height)
+        Block::new(view, leader, parent, txs, ts, false, height)
     }
 
     #[test]
     fn hash_is_deterministic_for_same_content() {
         let parent = [1u8; blake3::OUT_LEN];
-        let b1 = gen_block(5, parent, &[b"a", b"b"], 123456, 1);
-        let b2 = gen_block(5, parent, &[b"a", b"b"], 123456, 1);
+        let b1 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, 1);
+        let b2 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, 1);
         assert_eq!(b1.get_hash(), b2.get_hash());
         assert_eq!(b1, b2);
     }
@@ -174,8 +195,8 @@ mod tests {
     #[test]
     fn hash_changes_when_transactions_change() {
         let parent = [2u8; blake3::OUT_LEN];
-        let b1 = gen_block(6, parent, &[b"a", b"b"], 999, 2);
-        let b2 = gen_block(6, parent, &[b"a", b"c"], 999, 2);
+        let b1 = gen_block(6, 0, parent, &[b"a", b"b"], 999, 2);
+        let b2 = gen_block(6, 0, parent, &[b"a", b"c"], 999, 2);
         assert_ne!(b1.get_hash(), b2.get_hash());
         assert_ne!(b1, b2);
     }
@@ -183,15 +204,15 @@ mod tests {
     #[test]
     fn hash_changes_with_order_of_transactions() {
         let parent = [3u8; blake3::OUT_LEN];
-        let b1 = gen_block(7, parent, &[b"x", b"y"], 111, 3);
-        let b2 = gen_block(7, parent, &[b"y", b"x"], 111, 3);
+        let b1 = gen_block(7, 0, parent, &[b"x", b"y"], 111, 3);
+        let b2 = gen_block(7, 0, parent, &[b"y", b"x"], 111, 3);
         assert_ne!(b1.get_hash(), b2.get_hash());
     }
 
     #[test]
     fn getters_return_expected_values() {
         let parent = [9u8; blake3::OUT_LEN];
-        let b = gen_block(42, parent, &[b"a"], 777, 42);
+        let b = gen_block(42, 0, parent, &[b"a"], 777, 42);
         assert_eq!(b.view(), 42);
         assert_eq!(b.parent_block_hash(), parent);
         assert!(b.is_view_block(42));
@@ -201,7 +222,7 @@ mod tests {
     #[test]
     fn from_block_bytes_recomputes_when_hash_missing() {
         let parent = [4u8; blake3::OUT_LEN];
-        let mut b = gen_block(8, parent, &[b"z"], 222, 8);
+        let mut b = gen_block(8, 0, parent, &[b"z"], 222, 8);
         // Simulate an archived block with hash = None
         b.hash = None;
         let bytes = serialize_for_db(&b).expect("serialize");
@@ -210,7 +231,7 @@ mod tests {
         let expected = restored.get_hash();
         let recomputed = {
             // Recompute via creating the same content block again
-            let b2 = gen_block(8, parent, &[b"z"], 222, 8);
+            let b2 = gen_block(8, 0, parent, &[b"z"], 222, 8);
             b2.get_hash()
         };
         assert_eq!(expected, recomputed);

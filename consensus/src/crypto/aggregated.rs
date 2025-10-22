@@ -143,7 +143,7 @@ impl FromStr for BlsPublicKey {
 }
 
 impl BlsSignature {
-    pub fn aggregate(signatures: &[BlsSignature]) -> BlsSignature {
+    pub fn aggregate<'a>(signatures: impl Iterator<Item = &'a BlsSignature>) -> BlsSignature {
         let mut aggregated = G1Projective::zero();
         for signature in signatures {
             aggregated += signature.0;
@@ -175,7 +175,7 @@ impl<const N: usize> AggregatedSignature<N> {
             }
         }
 
-        let aggregated_signature = BlsSignature::aggregate(signatures);
+        let aggregated_signature = BlsSignature::aggregate(signatures.iter());
 
         Some(AggregatedSignature {
             aggregated_signature,
@@ -392,7 +392,8 @@ mod tests {
         let sig3 = sk3.sign(message);
 
         // Aggregate signatures
-        let aggregated_sig = BlsSignature::aggregate(&[sig1.clone(), sig2.clone(), sig3.clone()]);
+        let aggregated_sig =
+            BlsSignature::aggregate([sig1.clone(), sig2.clone(), sig3.clone()].iter());
 
         // Test verification of aggregated signature
         assert!(BlsPublicKey::verify_aggregate(
@@ -410,7 +411,7 @@ mod tests {
         ));
 
         // Test with wrong aggregated signature (aggregate only subset of signatures)
-        let wrong_aggregated_sig = BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]);
+        let wrong_aggregated_sig = BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter());
         assert!(!BlsPublicKey::verify_aggregate(
             &[pk1.clone(), pk2.clone(), pk3.clone()],
             message,
@@ -553,7 +554,7 @@ mod tests {
         assert!(!aggregated.verify(b"wrong message"));
 
         // Test creating from pre-aggregated signature
-        let manual_aggregated_sig = BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]);
+        let manual_aggregated_sig = BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter());
         let from_manual = AggregatedSignature::new_from_aggregated_signature(
             [pk1.clone(), pk2.clone()],
             manual_aggregated_sig,
@@ -603,7 +604,7 @@ mod tests {
         let sig3 = sk3.sign(message);
 
         // Test aggregating multiple signatures
-        let aggregated = BlsSignature::aggregate(&[sig1.clone(), sig2.clone(), sig3.clone()]);
+        let aggregated = BlsSignature::aggregate([sig1.clone(), sig2.clone(), sig3.clone()].iter());
 
         // Aggregated signature should not be zero
         assert!(!aggregated.0.is_zero());
@@ -612,20 +613,20 @@ mod tests {
         assert!(aggregated.0.is_on_curve());
 
         // Test aggregating single signature (should equal the signature itself)
-        let single_aggregated = BlsSignature::aggregate(std::slice::from_ref(&sig1));
+        let single_aggregated = BlsSignature::aggregate(std::iter::once(&sig1));
         assert_eq!(single_aggregated.0, sig1.0);
 
         // Test aggregating empty set (should be zero)
-        let empty_aggregated = BlsSignature::aggregate(&[]);
+        let empty_aggregated = BlsSignature::aggregate(std::iter::empty());
         assert!(empty_aggregated.0.is_zero());
 
         // Test that different signature sets produce different aggregates
-        let aggregated_different = BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]);
+        let aggregated_different = BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter());
         assert_ne!(aggregated.0, aggregated_different.0);
 
         // Test that aggregating the same signatures in different order produces the same result
         let aggregated_reordered =
-            BlsSignature::aggregate(&[sig2.clone(), sig1.clone(), sig3.clone()]);
+            BlsSignature::aggregate([sig2.clone(), sig1.clone(), sig3.clone()].iter());
         assert_eq!(aggregated.0, aggregated_reordered.0);
     }
 
@@ -647,7 +648,7 @@ mod tests {
         let manual_aggregated = BlsSignature((sig1.0 + sig2.0).into_affine());
 
         // Function aggregation
-        let func_aggregated = BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]);
+        let func_aggregated = BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter());
 
         // Should be the same
         assert_eq!(manual_aggregated.0, func_aggregated.0);
@@ -656,15 +657,21 @@ mod tests {
         let sk3 = BlsSecretKey::generate(&mut rng);
         let sig3 = sk3.sign(message);
 
-        let left_assoc = BlsSignature::aggregate(&[
-            BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]),
-            sig3.clone(),
-        ]);
+        let left_assoc = BlsSignature::aggregate(
+            [
+                BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter()),
+                sig3.clone(),
+            ]
+            .iter(),
+        );
 
-        let right_assoc = BlsSignature::aggregate(&[
-            sig1.clone(),
-            BlsSignature::aggregate(&[sig2.clone(), sig3.clone()]),
-        ]);
+        let right_assoc = BlsSignature::aggregate(
+            [
+                sig1.clone(),
+                BlsSignature::aggregate([sig2.clone(), sig3.clone()].iter()),
+            ]
+            .iter(),
+        );
 
         assert_eq!(left_assoc.0, right_assoc.0);
     }
@@ -685,7 +692,7 @@ mod tests {
         // Create individual signatures and aggregate them manually
         let sig1 = sk1.sign(message);
         let sig2 = sk2.sign(message);
-        let aggregated_sig = BlsSignature::aggregate(&[sig1.clone(), sig2.clone()]);
+        let aggregated_sig = BlsSignature::aggregate([sig1.clone(), sig2.clone()].iter());
 
         // Create AggregatedSignature from pre-aggregated signature (no validation)
         let agg_sig = AggregatedSignature::new_from_aggregated_signature(

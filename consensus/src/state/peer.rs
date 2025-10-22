@@ -90,8 +90,8 @@ impl PeerSet {
     /// # Errors
     ///
     /// Returns an error if the peer ID is not found in the peer set.
-    pub fn get_public_key(&self, peer_id: PeerId) -> Result<&BlsPublicKey> {
-        if let Some(public_key) = self.id_to_public_key.get(&peer_id) {
+    pub fn get_public_key(&self, peer_id: &PeerId) -> Result<&BlsPublicKey> {
+        if let Some(public_key) = self.id_to_public_key.get(peer_id) {
             Ok(public_key)
         } else {
             Err(anyhow::anyhow!("Peer ID {peer_id} not found in peer set"))
@@ -213,7 +213,7 @@ mod tests {
 
         let peer_set = PeerSet::new(vec![public_key.clone()]);
 
-        let result = peer_set.get_public_key(peer_id);
+        let result = peer_set.get_public_key(&peer_id);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &public_key);
     }
@@ -228,7 +228,7 @@ mod tests {
 
         // Use a peer ID that doesn't exist
         let non_existing_peer_id = 999999999999;
-        let result = peer_set.get_public_key(non_existing_peer_id);
+        let result = peer_set.get_public_key(&non_existing_peer_id);
         assert!(result.is_err());
         assert!(
             result
@@ -257,7 +257,7 @@ mod tests {
 
         // Test getting each public key by its peer ID
         for (i, peer_id) in peer_ids.iter().enumerate() {
-            let result = peer_set.get_public_key(*peer_id);
+            let result = peer_set.get_public_key(&peer_id);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), &public_keys[i]);
         }
