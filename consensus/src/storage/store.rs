@@ -486,18 +486,20 @@ mod tests {
 
             // Aggregate signature over view bytes
             let view: u64 = 77;
-            let msg = view.to_le_bytes();
+            let leader_id: PeerId = 1;
+            let msg = blake3::hash(&[view.to_le_bytes(), leader_id.to_le_bytes()].concat());
 
             // Sign with the corresponding secret keys
-            let s1 = sk1.sign(&msg);
-            let s2 = sk2.sign(&msg);
-            let s3 = sk3.sign(&msg);
+            let s1 = sk1.sign(msg.as_bytes());
+            let s2 = sk2.sign(msg.as_bytes());
+            let s3 = sk3.sign(msg.as_bytes());
 
             let pks_vec = vec![pk1.clone(), pk2.clone(), pk3.clone()];
             let pks: [BlsPublicKey; M_SIZE] = pks_vec.try_into().unwrap();
 
-            let agg = AggregatedSignature::<M_SIZE>::new(pks.clone(), &msg, &[s1, s2, s3])
-                .expect("Failed to create aggregated signature");
+            let agg =
+                AggregatedSignature::<M_SIZE>::new(pks.clone(), msg.as_bytes(), &[s1, s2, s3])
+                    .expect("Failed to create aggregated signature");
 
             let nullif = Nullification::<N, F, M_SIZE>::new(
                 view,
@@ -516,6 +518,7 @@ mod tests {
                 .unwrap()
                 .expect("get nullification");
             assert_eq!(fetched.view, view);
+            assert_eq!(fetched.leader_id, 1);
             assert!(fetched.verify(&PeerSet::new(pks.to_vec())));
         }
         std::fs::remove_file(&path).ok();

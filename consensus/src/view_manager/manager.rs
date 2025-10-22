@@ -308,7 +308,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             .get_public_key(&vote.peer_id)
             .expect("Peer not found");
 
-        if vote.verify(peer_public_key) {
+        if !vote.verify(peer_public_key) {
             return Err(anyhow::anyhow!(
                 "Vote signature is not valid for peer {}",
                 vote.peer_id,
@@ -323,7 +323,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
-        if self.peers.contains(&vote.peer_id) {
+        if !self.peers.contains(&vote.peer_id) {
             return Err(anyhow::anyhow!(
                 "Vote for peer {} is not present in the peers set",
                 vote.peer_id
@@ -411,14 +411,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
-        if self.nullify_messages.contains(&nullify) {
-            return Err(anyhow::anyhow!(
-                "Nullify for view {} and peer {} is already present in the nullify messages set",
-                nullify.view,
-                nullify.peer_id
-            ));
-        }
-
         if !self.peers.contains(&nullify.peer_id) {
             return Err(anyhow::anyhow!(
                 "Nullify for peer {} is not present in the peers set",
@@ -433,6 +425,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
         ) {
             return Err(anyhow::anyhow!(
                 "Nullify signature is not valid for peer {}",
+                nullify.peer_id
+            ));
+        }
+
+        if self
+            .nullify_messages
+            .iter()
+            .any(|n| n.peer_id == nullify.peer_id)
+        {
+            return Err(anyhow::anyhow!(
+                "Nullify for peer {} is already present in the nullify messages set",
                 nullify.peer_id
             ));
         }
