@@ -52,12 +52,15 @@ impl Hash for Vote {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.view.hash(state);
         self.block_hash.hash(state);
+        self.peer_id.hash(state);
     }
 }
 
 impl PartialEq for Vote {
     fn eq(&self, other: &Self) -> bool {
-        self.view == other.view && self.block_hash == other.block_hash
+        self.view == other.view
+            && self.block_hash == other.block_hash
+            && self.peer_id == other.peer_id
     }
 }
 

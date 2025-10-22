@@ -330,10 +330,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
-        if self.votes.contains(&vote) {
+        // Check if the vote is already present in the votes set (either verified or non-verified)
+        let has_already_voted_in_view = self.votes.iter().any(|v| v.peer_id == vote.peer_id)
+            || self
+                .non_verified_votes
+                .iter()
+                .any(|v| v.peer_id == vote.peer_id);
+
+        if has_already_voted_in_view {
             return Err(anyhow::anyhow!(
-                "Vote for block hash {} is already present in the votes set",
-                hex::encode(vote.block_hash)
+                "Peer {} has already voted in view {}",
+                vote.peer_id,
+                self.current_view
             ));
         }
 
