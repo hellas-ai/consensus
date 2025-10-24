@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     consensus::ConsensusMessage,
-    crypto::aggregated::BlsPublicKey,
+    crypto::aggregated::{BlsPublicKey, PeerId},
     state::{
         block::Block,
         notarizations::{LNotarization, MNotarization, Vote},
@@ -47,6 +47,8 @@ pub struct ViewProgressManager<
 
     /// The current view
     current_view: u64,
+    /// Whether the previous view has been finalized (either by a L-notarization or a nullification)
+    is_previous_view_finalized: bool,
     /// The start time of the current view (measured in milliseconds by the current replica)
     view_start_time: Instant,
     /// The actual replica has already voted for the current view
@@ -116,6 +118,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             peers,
             view_proposed_block_hash: None,
             non_verified_votes: HashSet::new(),
+            is_previous_view_finalized: false,
             is_leader: todo!(),
             #[allow(unreachable_code)]
             previous_finalized_block_hash: None,
@@ -160,6 +163,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             peers,
             view_proposed_block_hash: None,
             non_verified_votes: HashSet::new(),
+            is_previous_view_finalized: false,
             is_leader: todo!(),
             #[allow(unreachable_code)]
             previous_finalized_block_hash: None,
@@ -184,14 +188,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ConsensusMessage::BlockProposal(block) => self.handle_block_proposal(block),
             ConsensusMessage::Vote(vote) => self.handle_new_vote(vote),
             ConsensusMessage::Nullify(nullify) => self.handle_nullify(nullify),
-            ConsensusMessage::MNotarization(_m_notarization) => {
-                todo!()
+            ConsensusMessage::MNotarization(m_notarization) => {
+                self.handle_m_notarization(m_notarization)
             }
-            ConsensusMessage::LNotarization(_l_notarization) => {
-                todo!()
+            ConsensusMessage::LNotarization(l_notarization) => {
+                self.handle_l_notarization(l_notarization)
             }
-            ConsensusMessage::Nullification(_nullification) => {
-                todo!()
+            ConsensusMessage::Nullification(nullification) => {
+                self.handle_nullification(nullification)
             }
         }
     }
@@ -345,6 +349,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
+        // TODO: Refactor the order of the conditions in this block, as it might always be preferable
         if let Some(view_proposed_block_hash) = self.view_proposed_block_hash {
             let block_hash = vote.block_hash;
             if block_hash != view_proposed_block_hash {
@@ -373,6 +378,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
                     view: self.current_view,
                     block_hash,
                 })
+            } else if !(self.m_notarizations.is_empty()) && self.l_notarizations.is_empty() {
+                // TODO:
+                todo!(
+                    "Handle the case where votes + the current set of m-notarizations is enough to propose a new l-notarization"
+                )
             } else if self.votes.len() > N - F && self.l_notarizations.is_empty() {
                 let NotarizationData {
                     peer_ids,
@@ -459,6 +469,135 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
         }
 
         Ok(ViewProgressEvent::NoOp)
+    }
+
+    fn handle_m_notarization(
+        &mut self,
+        m_notarization: MNotarization<N, F, M_SIZE>,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+        if self.is_previous_view_finalized && m_notarization.view != self.current_view {
+            // If the previous view has been finalized, any m-notarization for a later view should be rejected.
+            return Err(anyhow::anyhow!(
+                "M-notarization for view {} is not the current view: {}",
+                m_notarization.view,
+                self.current_view
+            ));
+        }
+
+        if !self.is_previous_view_finalized && m_notarization.view < self.current_view - 1 {
+            return Err(anyhow::anyhow!(
+                "M-notarization for view {} is not the previous view: {}",
+                m_notarization.view,
+                self.current_view
+            ));
+        }
+
+        if m_notarization.view > self.current_view {
+            // TODO: Handle the case where a m-notarization for a future view is received.
+            // In this case, the replica should try to either sync up for the future view, or
+            // ignore it altogether. Ideally, the replica would try to sync up for the future view,
+            // but that involves more work, as it would require a supra-majority of replicas providing
+            // more blocks to the current replica. We will implement this in a future PR. For now,
+            // we will simply error out.
+            return Err(anyhow::anyhow!(
+                "M-notarization for view {} is for a future view (current view is {}), ignoring it for now.",
+                m_notarization.view,
+                self.current_view,
+            ));
+        }
+
+        if self.view_proposed_block_hash.is_none() {
+            // Check if the m-notarization contains a vote by the current view leader.
+            return Err(anyhow::anyhow!(
+                "View proposed block hash not found for the current view",
+            ));
+        }
+
+        let view_proposed_block_hash = self
+            .view_proposed_block_hash
+            .expect("View proposed block hash not found");
+
+        if m_notarization.block_hash != view_proposed_block_hash {
+            return Err(anyhow::anyhow!(
+                "Received M-notarization for block hash {} has a different block hash than the view proposed block hash: {}",
+                hex::encode(m_notarization.block_hash),
+                hex::encode(view_proposed_block_hash)
+            ));
+        }
+
+        // TODO: The verification of the M-notarization should be ported to the p2p layer.
+        if !m_notarization.verify(&self.peers) {
+            return Err(anyhow::anyhow!(
+                "M-notarization signature is not valid for the current view",
+            ));
+        }
+
+        // if !self.m_notarizations.is_empty() && self.l_notarizations.is_empty() {
+        //     // Verify if we can propose a new l-notarization for the current view.
+        //     let voting_peers_received = self
+        //         .votes
+        //         .iter()
+        //         .map(|v| v.peer_id)
+        //         .chain(self.m_notarizations.iter().flat_map(|m| m.peer_ids))
+        //         .collect::<HashSet<PeerId>>();
+        //     if voting_peers_received.len() < N - F {
+        //         self.m_notarizations.insert(m_notarization);
+        //         return Ok(ViewProgressEvent::NoOp);
+        //     }
+        //     // In this case, we have enough voting peers to propose a new l-notarization.
+        //     let voting_peers_received = voting_peers_received
+        //         .iter()
+        //         .take(N - F)
+        //         .collect::<Vec<&PeerId>>();
+        //     let NotarizationData {
+        //         peer_ids,
+        //         aggregated_signature,
+        //     } = create_notarization_data::<L_SIZE>(&voting_peers_received)?;
+        //     for vote in self.votes.iter() {
+        //         if vote.view == self.current_view {
+        //             votes.insert(vote.clone());
+        //         }
+        //     }
+        //     self.l_notarizations.insert(LNotarization::new(
+        //         self.current_view,
+        //         m_notarization.block_hash,
+        //         aggregated_signature,
+        //         peer_ids,
+        //     ));
+        //     return Ok(ViewProgressEvent::ShouldLNotarize {
+        //         view: self.current_view,
+        //         block_hash: m_notarization.block_hash,
+        //     });
+        // }
+
+        if self
+            .m_notarizations
+            .iter()
+            .any(|m| m.block_hash == m_notarization.block_hash)
+        {
+            tracing::info!(
+                "M-notarization for block hash {} is already present in the m-notarizations set",
+                hex::encode(m_notarization.block_hash)
+            );
+
+            return Ok(ViewProgressEvent::NoOp);
+        }
+
+        todo!()
+    }
+
+    fn handle_l_notarization(
+        &mut self,
+        l_notarization: LNotarization<N, F, L_SIZE>,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+        todo!()
+    }
+
+    fn handle_nullification(
+        &mut self,
+        nullification: Nullification<N, F, M_SIZE>,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+        todo!()
     }
 
     fn try_update_view(&mut self, view: u64) -> Result<()> {

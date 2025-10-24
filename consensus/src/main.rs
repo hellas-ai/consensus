@@ -225,13 +225,13 @@ fn main() {
     let end = std::time::Instant::now();
     println!("Serialize time: {:?}", end - start);
     let start = std::time::Instant::now();
-    let archived = rkyv::access::<ArchivedMNotarization<5, 1, 3>, Error>(&serialized[..])
+    let archived = rkyv::access::<ArchivedMNotarization<100, 1, 100>, Error>(&serialized[..])
         .expect("Failed to access");
     let end = std::time::Instant::now();
     println!("Access time: {:?}", end - start);
     let start = std::time::Instant::now();
     let _deserialized =
-        deserialize::<MNotarization<5, 1, 3>, Error>(archived).expect("Failed to deserialize");
+        deserialize::<MNotarization<100, 1, 100>, Error>(archived).expect("Failed to deserialize");
     let end = std::time::Instant::now();
     println!("Deserialize time: {:?}", end - start);
 
@@ -262,8 +262,11 @@ fn main() {
         public_keys.push(public_key.clone());
         signatures.push(signature.clone());
     }
+    let start = std::time::Instant::now();
     let aggregated_signature = AggregatedSignature::new(&public_keys, message, &signatures)
         .expect("Failed to aggregate signature");
+    let end = std::time::Instant::now();
+    println!("Aggregate signature time: {:?}", end - start);
     println!("Aggregated signature: {:?}", aggregated_signature);
 
     // Time for canonical serialization and deserialization
