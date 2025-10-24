@@ -1,6 +1,8 @@
-use crate::bls::ThresholdBLS;
+use crate::threshold::ThresholdBLS;
 
-pub mod bls;
+pub mod polynomial;
+pub mod scalar;
+pub mod threshold;
 
 fn main() {
     println!("╔════════════════════════════════════════════════════════════╗");
@@ -33,7 +35,7 @@ fn main() {
     let message = b"Important financial transaction: $1,000,000";
     println!("Message: \"{}\"", String::from_utf8_lossy(message));
 
-    let signing_parties = vec![0, 2, 4]; // Parties 1, 3, 5
+    let signing_parties = [0, 2, 4];
     let start = std::time::Instant::now();
     let partial_sigs: Vec<_> = signing_parties
         .iter()
@@ -71,7 +73,7 @@ fn main() {
     println!("Creating signature from different party combination (2, 4, 5)...");
 
     let start = std::time::Instant::now();
-    let alt_parties = vec![1, 3, 4];
+    let alt_parties = [1, 3, 4];
     let alt_sigs: Vec<_> = alt_parties
         .iter()
         .map(|&idx| {
