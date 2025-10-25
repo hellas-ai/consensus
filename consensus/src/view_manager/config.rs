@@ -1,8 +1,12 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::Result;
-use config::{Config, Environment, File};
+use figment::{
+    Figment,
+    providers::{Env, Format, Toml, Yaml},
+};
 use serde::{Deserialize, Serialize};
+use validator::Validate;
 
 use crate::view_manager::leader_manager::LeaderSelectionStrategy;
 
@@ -10,11 +14,13 @@ use crate::view_manager::leader_manager::LeaderSelectionStrategy;
 ///
 /// It contains the number of replicas in the consensus protocol, the number of faulty replicas,
 /// and the leader selection strategy.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ConsensusConfig {
     /// The total number of replicas in the consensus protocol.
+    #[validate(range(min = 6))]
     pub n: usize,
     /// The maximum number of faulty replicas in the consensus protocol.
+    #[validate(range(min = 1))]
     pub f: usize,
     /// The maximum timeout duration allowed before a replica proposes a
     /// [`Nullify`] message to the network.
@@ -57,16 +63,39 @@ impl ConsensusConfig {
     /// leader_manager = "RoundRobin"
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let config = Config::builder()
-            .add_source(File::with_name(path.as_ref().to_str().unwrap()))
-            .add_source(
-                Environment::with_prefix("consensus")
-                    .keep_prefix(true)
-                    .separator("__"),
-            )
-            .build()?;
+        let path = path.as_ref();
 
-        config.get::<Self>("consensus").map_err(anyhow::Error::msg)
+        let mut figment = Figment::new();
+
+        // Detect file format based on extension
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            figment = match ext {
+                "toml" => figment.merge(Toml::file(path)),
+                "yaml" | "yml" => figment.merge(Yaml::file(path)),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported config file format: {}. Use .toml, .yaml, or .yml",
+                        ext
+                    ));
+                }
+            };
+        } else {
+            return Err(anyhow::anyhow!(
+                "Config file must have an extension (.toml, .yaml, or .yml)"
+            ));
+        }
+
+        // Merge with environment variables (GATEWAY_ prefix)
+        // Environment variables take precedence over file config
+        figment = figment.merge(Env::prefixed("GATEWAY_").split("_"));
+
+        let config: ConsensusConfig = figment
+            .extract_inner("view_manager")
+            .map_err(anyhow::Error::msg)?;
+
+        config.validate()?;
+
+        Ok(config)
     }
 }
 
