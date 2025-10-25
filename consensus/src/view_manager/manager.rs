@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     consensus::ConsensusMessage,
-    crypto::aggregated::{BlsPublicKey, PeerId},
+    crypto::aggregated::BlsPublicKey,
     state::{
         block::Block,
         notarizations::{LNotarization, MNotarization, Vote},
@@ -588,14 +588,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
 
     fn handle_l_notarization(
         &mut self,
-        l_notarization: LNotarization<N, F, L_SIZE>,
+        _l_notarization: LNotarization<N, F, L_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
         todo!()
     }
 
     fn handle_nullification(
         &mut self,
-        nullification: Nullification<N, F, M_SIZE>,
+        _nullification: Nullification<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
         todo!()
     }
