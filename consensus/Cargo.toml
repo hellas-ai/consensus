@@ -10,7 +10,7 @@ ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
 ark-serialize = { workspace = true }
 blake3        = { workspace = true }
-config        = { workspace = true }
+figment       = { workspace = true, features = [ "env", "toml", "yaml" ] }
 hex           = { workspace = true }
 metrics       = { workspace = true }
 rand          = { workspace = true, features = [ "std" ] }
@@ -19,3 +19,4 @@ rkyv          = { workspace = true }
 rtrb          = { workspace = true }
 serde         = { workspace = true, features = [ "derive" ] }
 tracing       = { workspace = true }
+validator     = { workspace = true, features = [ "derive" ] }

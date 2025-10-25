@@ -12,24 +12,34 @@ use crate::{polynomial::Polynomial, scalar::Scalar};
 /// The domain separation tag for BLS signatures.
 const DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
-/// Share of a secret in Shamir's secret sharing scheme
+/// Share of a secret in Shamir's secret sharing scheme.
+/// Each share consists of an x-coordinate (index) and y-coordinate (secret share).
 #[derive(Clone, Debug)]
 pub struct Share {
-    /// The x-coordinate of the share
+    /// The x-coordinate (participant index from 1 to n)
     pub x: Scalar,
-    /// The y-coordinate of the share
+    /// The y-coordinate (secret share value)
     pub y: Scalar,
 }
 
-/// Shamir's secret sharing scheme
+/// Shamir's secret sharing scheme for threshold cryptography.
+/// Allows splitting a secret into n shares where any t shares can reconstruct the secret.
 pub struct ShamirSharing {
-    /// Threshold for reconstruction
+    /// Minimum shares needed to reconstruct the secret
     threshold: usize,
-    /// Total number of shares
+    /// Total number of shares to generate
     total_shares: usize,
 }
 
 impl ShamirSharing {
+    /// Create a new Shamir sharing scheme.
+    ///
+    /// # Arguments
+    /// * `threshold` - Minimum shares needed for reconstruction (t)
+    /// * `total_shares` - Total shares to generate (n)
+    ///
+    /// # Panics
+    /// Panics if threshold > total_shares or threshold == 0
     pub fn new(threshold: usize, total_shares: usize) -> Self {
         debug_assert!(threshold > 0 && threshold <= total_shares);
         Self {
@@ -38,7 +48,16 @@ impl ShamirSharing {
         }
     }
 
-    /// Split a secret into shares
+    /// Split a secret into shares using Shamir's scheme.
+    /// Creates a random polynomial of degree t-1 with the secret as constant term,
+    /// then evaluates at points 1, 2, ..., n to generate shares.
+    ///
+    /// # Arguments
+    /// * `secret` - The secret to split
+    /// * `rng` - Cryptographically secure random number generator
+    ///
+    /// # Returns
+    /// Vector of n shares, any t of which can reconstruct the secret
     pub fn split<R: Rng + CryptoRng>(&self, secret: Scalar, rng: &mut R) -> Vec<Share> {
         // Create polynomial with secret as constant term
         let poly = Polynomial::random(self.threshold - 1, secret, rng);
@@ -54,8 +73,17 @@ impl ShamirSharing {
         shares
     }
 
-    /// Compute Lagrange coefficient λ_i for reconstruction at x=0
-    /// λ_i = ∏(j≠i) x_j / (x_j - x_i)
+    /// Compute Lagrange coefficient λ_i for interpolation at x=0.
+    /// λ_i = ∏_{j≠i} x_j / (x_j - x_i)
+    ///
+    /// Used in reconstruction to weight each share appropriately.
+    ///
+    /// # Arguments
+    /// * `shares` - Slice of shares to use for interpolation
+    /// * `i` - Index of the share to compute the coefficient for
+    ///
+    /// # Returns
+    /// Lagrange coefficient λ_i for the given share
     pub fn lagrange_coefficient(&self, shares: &[Share], i: usize) -> Scalar {
         let mut numerator = Scalar::one();
         let mut denominator = Scalar::one();
@@ -77,8 +105,14 @@ impl ShamirSharing {
             .expect("Division by zero in Lagrange coefficient")
     }
 
-    /// Reconstruct secret from threshold shares using Lagrange interpolation
-    /// secret = ∑ y_i * λ_i
+    /// Reconstruct secret from threshold shares using Lagrange interpolation.
+    /// Combines shares with formula: secret = ∑ y_i × λ_i
+    ///
+    /// # Arguments
+    /// * `shares` - At least t shares to reconstruct from
+    ///
+    /// # Panics
+    /// Panics if fewer than threshold shares provided
     pub fn reconstruct(&self, shares: &[Share]) -> Scalar {
         debug_assert!(
             shares.len() >= self.threshold,
@@ -98,22 +132,30 @@ impl ShamirSharing {
     }
 }
 
-/// Key share for a peer in the consensus protocol
+/// Key share for a participant in threshold BLS signature scheme.
+/// Contains the participant's secret scalar and corresponding public key.
 #[derive(Clone)]
 pub struct KeyShare {
+    /// Participant identifier
     pub id: u64,
+    /// Secret scalar share
     pub secret_scalar: Scalar,
+    /// Public key corresponding to secret_scalar
     pub public_key: PublicKey,
 }
 
-/// Partial signature from a participant
+/// Partial signature from a single participant.
+/// Contains the participant ID and their signature share.
 #[derive(Clone)]
 pub struct PartialSignature {
+    /// Participant identifier
     pub id: u64,
+    /// Signature share
     pub signature: Signature,
 }
 
-/// BLS Threshold Signature Scheme
+/// BLS threshold signature scheme using Shamir's secret sharing.
+/// Enables distributed signing where t-out-of-n participants can create a valid signature.
 pub struct ThresholdBLS {
     threshold: usize,
     total_participants: usize,
@@ -121,6 +163,11 @@ pub struct ThresholdBLS {
 }
 
 impl ThresholdBLS {
+    /// Create a new threshold BLS scheme.
+    ///
+    /// # Arguments
+    /// * `threshold` - Minimum participants needed for valid signature (t)
+    /// * `total_participants` - Total number of participants (n)
     pub fn new(threshold: usize, total_participants: usize) -> Self {
         Self {
             threshold,
@@ -129,7 +176,20 @@ impl ThresholdBLS {
         }
     }
 
-    /// Convert scalar to public key (PK = scalar * G2_generator)
+    /// Convert a scalar (private key) to its corresponding BLS public key.
+    ///
+    /// Computes PK = scalar × G₂, where G₂ is the generator point of the G₂ group.
+    /// This is the standard BLS key derivation: public key is private key times generator.
+    ///
+    /// # Arguments
+    /// * `scalar` - The private key scalar
+    ///
+    /// # Returns
+    /// The corresponding BLS public key, or error if key derivation fails
+    ///
+    /// # Security
+    /// This operation is computationally expensive but secure.
+    /// The resulting public key can be safely shared.
     fn scalar_to_public_key(scalar: &Scalar) -> Result<PublicKey> {
         unsafe {
             // Get G2 generator
@@ -153,7 +213,14 @@ impl ThresholdBLS {
         }
     }
 
-    /// Trusted setup for the BLS threshold signature scheme
+    /// Generate master keypair and distribute key shares.
+    /// Creates a random master secret, derives public key, then splits secret into shares.
+    ///
+    /// # Arguments
+    /// * `rng` - Cryptographically secure random number generator
+    ///
+    /// # Returns
+    /// Tuple of (master_public_key, key_shares)
     pub fn trusted_setup<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,
@@ -181,6 +248,14 @@ impl ThresholdBLS {
         Ok((master_pk, key_shares))
     }
 
+    /// Create a partial signature for a message using a key share.
+    ///
+    /// # Arguments
+    /// * `key_share` - Participant's key share
+    /// * `message` - Message to sign
+    ///
+    /// # Returns
+    /// Partial signature that can be combined with others
     pub fn partial_sign(key_share: &KeyShare, message: &[u8]) -> Result<PartialSignature> {
         unsafe {
             // Hash message to G1 point
@@ -223,6 +298,14 @@ impl ThresholdBLS {
         }
     }
 
+    /// Aggregate partial signatures into a complete signature.
+    /// Uses Lagrange interpolation in the exponent to combine signatures correctly.
+    ///
+    /// # Arguments
+    /// * `partial_signatures` - At least t partial signatures to aggregate
+    ///
+    /// # Returns
+    /// Complete BLS signature
     pub fn aggregate(&self, partial_signatures: &[PartialSignature]) -> Result<Signature> {
         if partial_signatures.len() < self.threshold {
             return Err(anyhow::anyhow!(
@@ -327,7 +410,15 @@ impl ThresholdBLS {
         Ok(final_signature)
     }
 
-    /// Verify a signature
+    /// Verify a signature against a public key and message.
+    ///
+    /// # Arguments
+    /// * `public_key` - BLS public key
+    /// * `message` - Signed message
+    /// * `signature` - Signature to verify
+    ///
+    /// # Returns
+    /// Ok(()) if signature is valid, Error otherwise
     pub fn verify(public_key: &PublicKey, message: &[u8], signature: &Signature) -> Result<()> {
         let result = signature.verify(true, message, DST, &[], public_key, true);
 

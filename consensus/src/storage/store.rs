@@ -23,6 +23,19 @@ use super::{
     tables::{BLOCKS, LEADERS, MEMPOOL, NOTARIZATIONS, NULLIFICATIONS, STATE, VIEWS, VOTES},
 };
 
+/// [`ConsensusStore`] is a wrapper around the redb database that provides a convenient interface for storing and retrieving consensus data.
+///
+/// It provides methods for storing and retrieving blocks, leaders, views, transactions, notarizations, nullifications, and accounts.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let store = ConsensusStore::open("path/to/database").unwrap();
+/// let block = Block::new(1, 0, [0; 32], vec![], 100, false, 1);
+/// store.pub_block(&block).unwrap();
+/// let fetched = store.get_block(&block.get_hash()).unwrap().expect("get block");
+/// assert_eq!(fetched.view(), 1);
+/// ```
 pub struct ConsensusStore {
     db: Database,
 }
@@ -169,7 +182,7 @@ impl ConsensusStore {
     }
 
     /// Puts a block into the database.
-    pub fn pub_block(&self, block: &Block) -> Result<()> {
+    pub fn put_block(&self, block: &Block) -> Result<()> {
         self.put_value(BLOCKS, block)
     }
 
@@ -179,7 +192,7 @@ impl ConsensusStore {
     }
 
     /// Puts a leader into the database.
-    pub fn pub_leader(&self, leader: &Leader) -> Result<()> {
+    pub fn put_leader(&self, leader: &Leader) -> Result<()> {
         self.put_value(LEADERS, leader)
     }
 
@@ -189,7 +202,7 @@ impl ConsensusStore {
     }
 
     /// Puts a view into the database.
-    pub fn pub_view(&self, view: &View) -> Result<()> {
+    pub fn put_view(&self, view: &View) -> Result<()> {
         self.put_value(VIEWS, view)
     }
 
@@ -199,7 +212,7 @@ impl ConsensusStore {
     }
 
     /// Puts a transaction into the database.
-    pub fn pub_transaction(&self, transaction: &Transaction) -> Result<()> {
+    pub fn put_transaction(&self, transaction: &Transaction) -> Result<()> {
         self.put_value(MEMPOOL, transaction)
     }
 
@@ -209,7 +222,7 @@ impl ConsensusStore {
     }
 
     /// Puts a notarization into the database.
-    pub fn pub_notarization<const N: usize, const F: usize, const M_SIZE: usize>(
+    pub fn put_notarization<const N: usize, const F: usize, const M_SIZE: usize>(
         &self,
         notarization: &MNotarization<N, F, M_SIZE>,
     ) -> Result<()> {
@@ -225,7 +238,7 @@ impl ConsensusStore {
     }
 
     /// Puts a nullification into the database.
-    pub fn pub_nullification<const N: usize, const F: usize, const L_SIZE: usize>(
+    pub fn put_nullification<const N: usize, const F: usize, const L_SIZE: usize>(
         &self,
         nullification: &Nullification<N, F, L_SIZE>,
     ) -> Result<()> {
@@ -246,7 +259,7 @@ impl ConsensusStore {
     }
 
     /// Puts an account into the database.
-    pub fn pub_account(&self, account: &Account) -> Result<()> {
+    pub fn put_account(&self, account: &Account) -> Result<()> {
         self.put_value(ACCOUNTS, account)
     }
 
@@ -298,7 +311,7 @@ mod tests {
             // touching multiple tables via a write ensures tables are usable
             let (_sk, pk) = gen_keypair();
             let acct = Account::new(pk.clone(), 100, 1);
-            store.pub_account(&acct).expect("pub account");
+            store.put_account(&acct).expect("pub account");
         }
         std::fs::remove_file(&path).ok();
     }
@@ -319,7 +332,7 @@ mod tests {
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
             let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
 
-            store.pub_block(&block).unwrap();
+            store.put_block(&block).unwrap();
             let h = block.get_hash();
             let fetched = store.get_block(&h).unwrap().expect("get block");
             assert_eq!(fetched.get_hash(), block.get_hash());
@@ -338,7 +351,7 @@ mod tests {
             let (_sk, _pk) = gen_keypair();
             let leader = Leader::new(10, true, 10);
 
-            store.pub_leader(&leader).unwrap();
+            store.put_leader(&leader).unwrap();
             let fetched = store.get_leader(10).unwrap().expect("get leader");
 
             // Compare fields; `BlsPublicKey` lacks PartialEq, compare bytes instead.
@@ -358,7 +371,7 @@ mod tests {
             let (_sk, pk) = gen_keypair();
             let view = View::new(11, pk.clone(), true, false);
 
-            store.pub_view(&view).unwrap();
+            store.put_view(&view).unwrap();
             let fetched = store.get_view(11).unwrap().expect("get view");
 
             assert_eq!(fetched.view(), 11);
@@ -381,7 +394,7 @@ mod tests {
             let sig = sk.sign(&tx_hash);
             let tx = Transaction::new(pk.clone(), [9u8; 32], 100, 2, 2_000, 5, tx_hash, sig);
 
-            store.pub_transaction(&tx).unwrap();
+            store.put_transaction(&tx).unwrap();
             let fetched = store.get_transaction(&tx_hash).unwrap().expect("get tx");
 
             assert_eq!(fetched, tx);
@@ -434,7 +447,7 @@ mod tests {
                     .unwrap(),
             );
 
-            store.pub_notarization(&m).unwrap();
+            store.put_notarization(&m).unwrap();
             let h = block.get_hash();
             let fetched = store
                 .get_notarization::<N, F, M_SIZE>(&h)
@@ -456,7 +469,7 @@ mod tests {
             let (_sk, pk) = gen_keypair();
             let acct = Account::new(pk.clone(), 1234, 7);
 
-            store.pub_account(&acct).unwrap();
+            store.put_account(&acct).unwrap();
             let fetched = store.get_account(&pk).unwrap().expect("get account");
 
             assert_eq!(
@@ -511,7 +524,7 @@ mod tests {
                     .try_into()
                     .unwrap(),
             );
-            store.pub_nullification(&nullif).unwrap();
+            store.put_nullification(&nullif).unwrap();
 
             let fetched = store
                 .get_nullification::<N, F, M_SIZE>(view)

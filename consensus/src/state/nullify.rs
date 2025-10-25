@@ -10,12 +10,21 @@ use crate::{
     state::peer::PeerSet,
 };
 
+/// [`Nullify`] represents a nullify message in the consensus protocol.
+///
+/// A nullify message is a message that is sent by a peer to the network to indicate that the view is nullified,
+/// in his local state machine.
+/// It contains the view number, the leader's Peer ID, the signature of the nullify message, and the peer's Peer ID.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Nullify {
+    /// The view number for which the nullify is being cast
     pub view: u64,
+    /// The Peer ID of the leader for the current view
     pub leader_id: PeerId,
+    /// The signature of the nullify message
     #[rkyv(with = ArkSerdeWrapper)]
     pub signature: BlsSignature,
+    /// The Peer ID of the peer that is sending the nullify message
     pub peer_id: PeerId,
 }
 
@@ -54,6 +63,10 @@ impl Hash for Nullify {
     }
 }
 
+/// [`Nullification`] represents a nullification message in the consensus protocol.
+///
+/// A nullification contains a (2f + 1) number of nullify messages, and is used to finalize a view,
+/// as being nullfied, meaning no block can be finalized for that view.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Nullification<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The view number for which the nullification is being cast
