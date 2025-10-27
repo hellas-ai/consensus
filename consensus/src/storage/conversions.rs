@@ -5,13 +5,8 @@ use rkyv::{
 };
 
 use crate::state::{
-    account::Account,
-    block::Block,
-    leader::Leader,
-    notarizations::{LNotarization, MNotarization},
-    nullify::Nullification,
-    transaction::Transaction,
-    view::View,
+    account::Account, block::Block, leader::Leader, notarizations::MNotarization,
+    nullify::Nullification, transaction::Transaction, view::View,
 };
 
 /// Accesses an archived value from a byte slice.
@@ -119,19 +114,6 @@ impl Storable for Transaction {
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> Storable for MNotarization<N, F, M_SIZE> {
-    type Key = [u8; blake3::OUT_LEN];
-    type Value = AlignedVec;
-
-    fn key(&self) -> Self::Key {
-        self.block_hash
-    }
-
-    fn value(&self) -> Result<Self::Value> {
-        serialize_for_db(self)
-    }
-}
-
-impl<const N: usize, const F: usize, const L_SIZE: usize> Storable for LNotarization<N, F, L_SIZE> {
     type Key = [u8; blake3::OUT_LEN];
     type Value = AlignedVec;
 

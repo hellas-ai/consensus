@@ -1,5 +1,5 @@
 use crate::{
-    consensus::ConsensusMessage, crypto::aggregated::BlsPublicKey, state::nullify::Nullification,
+    consensus::ConsensusMessage, crypto::aggregated::PeerId, state::nullify::Nullification,
 };
 
 /// [`ViewProgressEvent`] represents an event that occurs in the view progress manager.
@@ -17,8 +17,7 @@ use crate::{
 /// the number of faulty replicas, the size of the aggregated signature for M-notarizations,
 /// and the size of the aggregated signature for L-notarizations, respectively.
 #[derive(Clone, Debug)]
-pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
-{
+pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> {
     /// If the current replica is the leader for the current `view`,
     /// and it should propose a block for the current view.
     ShouldProposeBlock {
@@ -58,14 +57,6 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
-    /// If the current replica should finalize a block for the current view.
-    ShouldLNotarize {
-        /// Current view number (for which the replica should notarize).
-        view: u64,
-        /// The hash of the block that the replica should notarize.
-        block_hash: [u8; blake3::OUT_LEN],
-    },
-
     /// If the current replica should finalize the state for the the `view`.
     /// Notice that, `view` does not necessarily correspond to the current view,
     /// as the replica might have already progressed to a later view (in case,
@@ -78,7 +69,7 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
         /// that is, the state machine replication protocol hasn't made
         /// any actual progress (due to a failure to collect enough votes
         /// to finalize a block for the `view`, and/or leader failure).
-        block_hash: Option<[u8; blake3::OUT_LEN]>,
+        block_hash: [u8; blake3::OUT_LEN],
     },
 
     /// If the current replica should progress to a new view. This happens
@@ -88,14 +79,14 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
         /// New view number (for which the replica should change).
         new_view: u64,
         /// The leader's BlsPublicKey of the new view.
-        leader: BlsPublicKey,
+        leader: PeerId,
     },
 
     /// If the current replica should broadcast a consensus message
     BroadcastConsensusMessage {
         /// The consensus message to be broadcasted by the current replica
         /// to its peers on the network.
-        message: Box<ConsensusMessage<N, F, M_SIZE, L_SIZE>>,
+        message: Box<ConsensusMessage<N, F, M_SIZE>>,
     },
 
     /// No operation is required at the moment, since (most likely) the replica
@@ -107,4 +98,16 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize, 
     /// until it either receives a block to vote on the current view, or the timeout
     /// is triggered.
     Await,
+
+    /// If the current replica should update the view context to a new view (in the future).
+    ///
+    /// This happens whenever the current replica receives a block for a future view,
+    /// and the leader of the future view is not the current leader.
+    ShouldUpdateView {
+        /// New view number (for which the replica should change).
+        new_view: u64,
+
+        /// The leader's ID of the new view.
+        leader: PeerId,
+    },
 }

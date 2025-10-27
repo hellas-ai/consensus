@@ -1,14 +1,14 @@
-use std::{collections::HashSet, str::FromStr, time::Instant};
+use std::str::FromStr;
 
 use anyhow::Result;
 use tracing::instrument;
 
 use crate::{
     consensus::ConsensusMessage,
-    crypto::aggregated::BlsPublicKey,
+    crypto::aggregated::{BlsPublicKey, PeerId},
     state::{
         block::Block,
-        notarizations::{LNotarization, MNotarization, Vote},
+        notarizations::{MNotarization, Vote},
         nullify::{Nullification, Nullify},
         peer::PeerSet,
         transaction::Transaction,
@@ -21,6 +21,7 @@ use crate::{
             NotarizationData, NullificationData, create_notarization_data,
             create_nullification_data,
         },
+        view_context::ViewContext,
     },
 };
 
@@ -29,76 +30,39 @@ use crate::{
 /// It is responsible for managing the view progress of the consensus protocol,
 /// including the leader selection, the block proposal, the voting, the nullification,
 /// the M-notarization, the L-notarization, and the nullification.
-pub struct ViewProgressManager<
-    const N: usize,
-    const F: usize,
-    const M_SIZE: usize,
-    const L_SIZE: usize,
-> {
+pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The configuration of the consensus protocol.
     config: ConsensusConfig,
+
     /// The leader manager algorithm to use for leader selection.
     #[allow(unused)]
     leader_manager: Box<dyn LeaderManager>,
+
+    /// The per-view context tracking
+    current_view_context: ViewContext<N, F, M_SIZE>,
+
+    /// The un-finalized view context (if any)
+    ///
+    /// This is a view not yet finalized by a supra-majority vote (n-f) or a nullification.
+    /// But that has already received a m-notarization, and therefore, the replica has
+    /// progressed to the next view.
+    unfinalized_view_context: Option<ViewContext<N, F, M_SIZE>>,
 
     /// The set of peers in the consensus protocol.
     #[allow(unused)]
     peers: PeerSet,
 
-    /// The current view
-    current_view: u64,
-    /// Whether the previous view has been finalized (either by a L-notarization or a nullification)
-    is_previous_view_finalized: bool,
-    /// The start time of the current view (measured in milliseconds by the current replica)
-    view_start_time: Instant,
-    /// The actual replica has already voted for the current view
-    has_voted_in_view: bool,
-    /// The block for which the actual replica has already voted for
-    voted_block_hash: Option<[u8; blake3::OUT_LEN]>,
-    /// The block hash of the block that the current view's leader has proposed for the current view
-    view_proposed_block_hash: Option<[u8; blake3::OUT_LEN]>,
-    /// If the current replica has proposed a block for the current view
-    has_proposed_in_view: bool,
-    /// If the current replica has proposed a nullified message for the current view
-    has_nullified_in_view: bool,
-    /// If the current replica is the leader for the current view
-    is_leader: bool,
-    /// Previous finalized block hash. It should be `None` only for the genesis view.
-    previous_finalized_block_hash: Option<[u8; blake3::OUT_LEN]>,
-
-    // In-memory state for current view
-    /// The block received for the current view (if any).
-    block: Option<Block>,
-    /// Received votes for the current view's block
-    #[allow(unused)]
-    votes: HashSet<Vote>,
-    /// Non-verified votes for the current view's block, this corresponds to votes
-    /// that have been received, while the current replica has not yet received the
-    /// view's proposed block hash from the leader.
-    #[allow(unused)]
-    non_verified_votes: HashSet<Vote>,
-    /// Nullify messages for the current view, we
-    /// just need to store the peer id for each replica.
-    #[allow(unused)]
-    nullify_messages: HashSet<Nullify>,
-    /// Nullifications for the current view
-    #[allow(unused)]
-    nullifications: HashSet<Nullification<N, F, M_SIZE>>,
-    /// Current M-notarizations for the current view's block
-    #[allow(unused)]
-    m_notarizations: HashSet<MNotarization<N, F, M_SIZE>>,
-    /// Current L-notarizations for the current view's block
-    #[allow(unused)]
-    l_notarizations: HashSet<LNotarization<N, F, L_SIZE>>,
-
     /// Transaction pool
     pending_txs: Vec<Transaction>,
 }
 
-impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
-    ViewProgressManager<N, F, M_SIZE, L_SIZE>
-{
-    pub fn new(config: ConsensusConfig, leader_manager: Box<dyn LeaderManager>) -> Self {
+impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N, F, M_SIZE> {
+    pub fn new(
+        config: ConsensusConfig,
+        replica_id: PeerId,
+        leader_manager: Box<dyn LeaderManager>,
+    ) -> Result<Self> {
+        let leader_id = leader_manager.leader_for_view(0)?.peer_id();
         let peers = PeerSet::new(
             config
                 .peers
@@ -106,35 +70,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
                 .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
                 .collect(),
         );
-        Self {
+        let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        Ok(Self {
             config,
             leader_manager,
-            current_view: 1,
-            view_start_time: Instant::now(),
-            has_voted_in_view: false,
-            voted_block_hash: None,
-            has_proposed_in_view: false,
-            has_nullified_in_view: false,
+            current_view_context: view_context,
+            unfinalized_view_context: None,
             peers,
-            view_proposed_block_hash: None,
-            non_verified_votes: HashSet::new(),
-            is_previous_view_finalized: false,
-            is_leader: todo!(),
-            #[allow(unreachable_code)]
-            previous_finalized_block_hash: None,
-            block: None,
-            votes: HashSet::new(),
-            nullify_messages: HashSet::new(),
-            nullifications: HashSet::new(),
-            m_notarizations: HashSet::new(),
-            l_notarizations: HashSet::new(),
             pending_txs: Vec::new(),
-        }
+        })
     }
 
     /// Creates a new view progress manager from the genesis state. This is used
     /// to initialize the view progress manager when the consensus protocol starts.
-    pub fn from_genesis(config: ConsensusConfig) -> Self {
+    pub fn from_genesis(config: ConsensusConfig, replica_id: PeerId) -> Result<Self> {
         let leader_manager = match config.leader_manager {
             LeaderSelectionStrategy::RoundRobin => {
                 Box::new(RoundRobinLeaderManager::new(config.n, Vec::new()))
@@ -151,30 +100,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
                 .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
                 .collect(),
         );
-        Self {
+        let leader_id = leader_manager.leader_for_view(0)?.peer_id();
+        let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        Ok(Self {
             config,
             leader_manager,
-            current_view: 0,
-            view_start_time: Instant::now(),
-            has_voted_in_view: false,
-            voted_block_hash: None,
-            has_proposed_in_view: false,
-            has_nullified_in_view: false,
+            current_view_context: view_context,
+            unfinalized_view_context: None,
             peers,
-            view_proposed_block_hash: None,
-            non_verified_votes: HashSet::new(),
-            is_previous_view_finalized: false,
-            is_leader: todo!(),
-            #[allow(unreachable_code)]
-            previous_finalized_block_hash: None,
-            block: None,
-            votes: HashSet::new(),
-            nullify_messages: HashSet::new(),
-            nullifications: HashSet::new(),
-            m_notarizations: HashSet::new(),
-            l_notarizations: HashSet::new(),
             pending_txs: Vec::new(),
-        }
+        })
     }
 
     /// [`process_consensus_msg`] is the main driver of the underlying state machine
@@ -182,17 +117,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
     /// these and makes sure progress the SMR whenever possible.
     pub fn process_consensus_msg(
         &mut self,
-        consensus_message: ConsensusMessage<N, F, M_SIZE, L_SIZE>,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+        consensus_message: ConsensusMessage<N, F, M_SIZE>,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         match consensus_message {
             ConsensusMessage::BlockProposal(block) => self.handle_block_proposal(block),
             ConsensusMessage::Vote(vote) => self.handle_new_vote(vote),
             ConsensusMessage::Nullify(nullify) => self.handle_nullify(nullify),
             ConsensusMessage::MNotarization(m_notarization) => {
                 self.handle_m_notarization(m_notarization)
-            }
-            ConsensusMessage::LNotarization(l_notarization) => {
-                self.handle_l_notarization(l_notarization)
             }
             ConsensusMessage::Nullification(nullification) => {
                 self.handle_nullification(nullification)
@@ -202,7 +134,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
 
     /// Called periodically to check timers and trigger view changes if needed
     #[instrument("debug", skip_all)]
-    pub fn tick(&mut self) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+    pub fn tick(&mut self) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         if self.is_leader && !self.has_proposed_in_view {
             if let Some(parent_block_hash) = self.select_parent() {
                 return Ok(ViewProgressEvent::ShouldProposeBlock {
@@ -256,57 +188,47 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
         todo!()
     }
 
-    fn handle_block_proposal(
-        &mut self,
-        block: Block,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+    /// [`handle_block_proposal`] is called when the current replica receives a new block proposal,
+    /// from the leader of the current view.
+    ///
+    /// It validates the block and adds it to the current view context.
+    /// If the block is for a future view, it returns a [`ViewProgressEvent::ShouldUpdateView`]
+    /// event, to update the view context to the future view.
+    /// If the block is for the current view, and it passes all validation checks in
+    /// [`ViewContext::add_new_view_block`], then the method returns a [`ViewProgressEvent::ShouldVote`]
+    /// event, to vote for the block.
+    fn handle_block_proposal(&mut self, block: Block) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         // Validate block for the current view
-        if block.header.view < self.current_view {
-            return Err(anyhow::anyhow!(
-                "Block for view {} is not the current view: {}",
-                block.header.view,
-                self.current_view
-            ));
-        } else if block.header.view > self.current_view {
-            self.try_update_view(block.header.view)?;
-        }
-
-        let current_leader = self
-            .leader_manager
-            .leader_for_view(self.current_view)?
-            .peer_id();
-
-        if block.leader != current_leader {
-            return Err(anyhow::anyhow!(
-                "Block leader {} is not the current leader: {}",
-                block.leader,
-                current_leader
-            ));
-        }
-
-        let previous_finalized_block_hash = self
-            .previous_finalized_block_hash
-            .expect("Call to `handle_block_proposal` should only be called after the genesis view");
-        if block.header.parent_block_hash != previous_finalized_block_hash {
-            return Ok(ViewProgressEvent::ShouldNullify {
-                view: self.current_view,
+        if block.header.view > self.current_view_context.view_number {
+            // If the block is for a future view, then we need to update the view context to the future view,
+            // if the leader of the future view is not the current leader.
+            let block_view_leader = self
+                .leader_manager
+                .leader_for_view(block.header.view)?
+                .peer_id();
+            if block_view_leader != block.leader {
+                return Err(anyhow::anyhow!(
+                    "Block leader {} is not the correct view leader {} for block's view {}",
+                    block_view_leader,
+                    block.leader,
+                    block.view()
+                ));
+            }
+            return Ok(ViewProgressEvent::ShouldUpdateView {
+                new_view: block.header.view,
+                leader: block_view_leader,
             });
         }
 
-        // Update the view proposed block hash
-        self.view_proposed_block_hash = Some(block.get_hash());
-        let drained_unverified_votes = self.non_verified_votes.drain().collect::<Vec<Vote>>();
-        for unverified_vote in drained_unverified_votes {
-            self.handle_new_vote(unverified_vote)?;
-        }
+        let block_hash = self.current_view_context.add_new_view_block(block)?;
 
         Ok(ViewProgressEvent::ShouldVote {
-            view: self.current_view,
-            block_hash: block.get_hash(),
+            view: self.current_view_context.view_number,
+            block_hash,
         })
     }
 
-    fn handle_new_vote(&mut self, vote: Vote) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+    fn handle_new_vote(&mut self, vote: Vote) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         let peer_public_key = self
             .peers
             .get_public_key(&vote.peer_id)
@@ -319,11 +241,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
-        if vote.view != self.current_view {
+        if vote.view > self.current_view {
+            // TODO: Handle the case where a vote for a future view is received.
+            // In this case, the replica should try to either sync up for the future view, or
+            // ignore it altogether. Ideally, the replica would try to sync up for the future view,
+            // but that involves more work, as it would require a supra-majority of replicas providing
+            // more blocks to the current replica. We will implement this in a future PR. For now,
+            // we will simply error out.
             return Err(anyhow::anyhow!(
-                "Vote for view {} is not the current view: {}",
+                "Vote for view {} is for a future view (current view is {}), ignoring it for now.",
                 vote.view,
-                self.current_view
+                self.current_view,
+            ));
+        }
+
+        if vote.view < self.current_view - 1 {
+            return Err(anyhow::anyhow!(
+                "Vote for view {} is for a previous view (current view is {}), ignoring it for now.",
+                vote.view,
+                self.current_view,
             ));
         }
 
@@ -378,23 +314,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
                     view: self.current_view,
                     block_hash,
                 })
-            } else if !(self.m_notarizations.is_empty()) && self.l_notarizations.is_empty() {
+            } else if self.m_notarizations.is_empty() {
                 // TODO:
                 todo!(
                     "Handle the case where votes + the current set of m-notarizations is enough to propose a new l-notarization"
                 )
-            } else if self.votes.len() > N - F && self.l_notarizations.is_empty() {
-                let NotarizationData {
-                    peer_ids,
-                    aggregated_signature,
-                } = create_notarization_data::<L_SIZE>(&self.votes)?;
-                self.l_notarizations.insert(LNotarization::new(
-                    self.current_view,
-                    block_hash,
-                    aggregated_signature,
-                    peer_ids,
-                ));
-                Ok(ViewProgressEvent::ShouldLNotarize {
+            } else if self.votes.len() > N - F {
+                Ok(ViewProgressEvent::ShouldFinalize {
                     view: self.current_view,
                     block_hash,
                 })
@@ -409,10 +335,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
         }
     }
 
-    fn handle_nullify(
-        &mut self,
-        nullify: Nullify,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+    fn handle_nullify(&mut self, nullify: Nullify) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         if nullify.view != self.current_view {
             return Err(anyhow::anyhow!(
                 "Nullify for view {} is not the current view: {}",
@@ -474,7 +397,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
     fn handle_m_notarization(
         &mut self,
         m_notarization: MNotarization<N, F, M_SIZE>,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         if self.is_previous_view_finalized && m_notarization.view != self.current_view {
             // If the previous view has been finalized, any m-notarization for a later view should be rejected.
             return Err(anyhow::anyhow!(
@@ -532,43 +455,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             ));
         }
 
-        // if !self.m_notarizations.is_empty() && self.l_notarizations.is_empty() {
-        //     // Verify if we can propose a new l-notarization for the current view.
-        //     let voting_peers_received = self
-        //         .votes
-        //         .iter()
-        //         .map(|v| v.peer_id)
-        //         .chain(self.m_notarizations.iter().flat_map(|m| m.peer_ids))
-        //         .collect::<HashSet<PeerId>>();
-        //     if voting_peers_received.len() < N - F {
-        //         self.m_notarizations.insert(m_notarization);
-        //         return Ok(ViewProgressEvent::NoOp);
-        //     }
-        //     // In this case, we have enough voting peers to propose a new l-notarization.
-        //     let voting_peers_received = voting_peers_received
-        //         .iter()
-        //         .take(N - F)
-        //         .collect::<Vec<&PeerId>>();
-        //     let NotarizationData {
-        //         peer_ids,
-        //         aggregated_signature,
-        //     } = create_notarization_data::<L_SIZE>(&voting_peers_received)?;
-        //     for vote in self.votes.iter() {
-        //         if vote.view == self.current_view {
-        //             votes.insert(vote.clone());
-        //         }
-        //     }
-        //     self.l_notarizations.insert(LNotarization::new(
-        //         self.current_view,
-        //         m_notarization.block_hash,
-        //         aggregated_signature,
-        //         peer_ids,
-        //     ));
-        //     return Ok(ViewProgressEvent::ShouldLNotarize {
-        //         view: self.current_view,
-        //         block_hash: m_notarization.block_hash,
-        //     });
-        // }
+        if self.m_notarizations.is_empty() {
+            return Ok(ViewProgressEvent::ShouldFinalize {
+                view: self.current_view,
+                block_hash: m_notarization.block_hash,
+            });
+        }
 
         if self
             .m_notarizations
@@ -583,21 +475,66 @@ impl<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
             return Ok(ViewProgressEvent::NoOp);
         }
 
-        todo!()
-    }
-
-    fn handle_l_notarization(
-        &mut self,
-        _l_notarization: LNotarization<N, F, L_SIZE>,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
-        todo!()
+        Ok(ViewProgressEvent::ViewChanged {
+            new_view: self.current_view + 1,
+            leader: self
+                .leader_manager
+                .leader_for_view(self.current_view + 1)?
+                .peer_id(),
+        })
     }
 
     fn handle_nullification(
         &mut self,
-        _nullification: Nullification<N, F, M_SIZE>,
-    ) -> Result<ViewProgressEvent<N, F, M_SIZE, L_SIZE>> {
-        todo!()
+        nullification: Nullification<N, F, M_SIZE>,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
+        if nullification.view != self.current_view && nullification.view < self.current_view - 1 {
+            return Err(anyhow::anyhow!(
+                "Nullification for view {} is not valid for the either the current view or the previous view: {}",
+                nullification.view,
+                self.current_view
+            ));
+        }
+
+        if self.previous_finalized_block_hash.unwrap() != nullification.block_hash {
+            return Err(anyhow::anyhow!(
+                "Nullification for block hash {} is not the previous finalized block hash: {}",
+                hex::encode(nullification.block_hash),
+                hex::encode(self.previous_finalized_block_hash.unwrap())
+            ));
+        }
+
+        if nullification.view == self.current_view {
+            if !self.has_nullified_in_view {
+                return Ok(ViewProgressEvent::ShouldNullify {
+                    view: nullification.view,
+                });
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Nullification for view {} is already present in the nullifications set",
+                    nullification.view
+                ));
+            }
+        } else if nullification.view == self.current_view - 1 {
+        }
+
+        if !self.peers.contains(&nullification.leader_id) {
+            return Err(anyhow::anyhow!(
+                "Nullification for leader {} is not present in the peers set",
+                nullification.leader_id
+            ));
+        }
+
+        if !nullification.verify(&self.peers) {
+            return Err(anyhow::anyhow!(
+                "Nullification signature is not valid for the view {}",
+                nullification.view
+            ));
+        }
+
+        if self.has_nullified_in_view {}
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
     fn try_update_view(&mut self, view: u64) -> Result<()> {
