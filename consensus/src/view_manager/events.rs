@@ -1,6 +1,4 @@
-use crate::{
-    consensus::ConsensusMessage, crypto::aggregated::PeerId, state::nullify::Nullification,
-};
+use crate::{consensus::ConsensusMessage, crypto::aggregated::PeerId};
 
 /// [`ViewProgressEvent`] represents an event that occurs in the view progress manager.
 ///
@@ -44,9 +42,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
 
     /// If the current replica should broadcast a nullification for the current view.
     ShouldBroadcastNullification {
-        /// The nullification to be broadcasted by the current replica
-        /// to its peers on the network.
-        nullification: Nullification<N, F, M_SIZE>,
+        /// The view number for which the replica should nullify.
+        view: u64,
     },
 
     /// If the current replica should M-notarize a block for the current view.
@@ -54,6 +51,14 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         /// Current view number (for which the replica should notarize).
         view: u64,
         /// The hash of the block that the replica should notarize.
+        block_hash: [u8; blake3::OUT_LEN],
+    },
+
+    /// If the current replica should notarize a block for the current view, and vote for it simultaneously.
+    ShouldVoteAndMNotarize {
+        /// Current view number (for which the replica should notarize and vote).
+        view: u64,
+        /// The hash of the block that the replica should notarize and vote for.
         block_hash: [u8; blake3::OUT_LEN],
     },
 
@@ -72,13 +77,21 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
+    /// If the current replica should vote for a block for the current view, and finalize it simultaneously.
+    ShouldVoteAndFinalize {
+        /// Current view number (for which the replica should vote and finalize).
+        view: u64,
+        /// The hash of the block that the replica should vote and finalize for.
+        block_hash: [u8; blake3::OUT_LEN],
+    },
+
     /// If the current replica should progress to a new view. This happens
     /// whenever the current replica receives either a M-notarization or a nullification
     /// for the current view.
-    ViewChanged {
+    ProgressToNextView {
         /// New view number (for which the replica should change).
         new_view: u64,
-        /// The leader's BlsPublicKey of the new view.
+        /// The leader's ID of the new view.
         leader: PeerId,
     },
 
@@ -109,5 +122,11 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
 
         /// The leader's ID of the new view.
         leader: PeerId,
+    },
+
+    /// If the current replica should nullify the current view.
+    ShouldNullifyView {
+        /// View number (for which the replica should nullify).
+        view: u64,
     },
 }

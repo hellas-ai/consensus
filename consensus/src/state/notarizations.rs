@@ -21,8 +21,9 @@ pub struct Vote {
     pub signature: BlsSignature,
     /// The public key of the peer that is
     /// voting for the current block
-    #[rkyv(with = ArkSerdeWrapper)]
     pub peer_id: PeerId,
+    /// The leader's ID of the view
+    pub leader_id: PeerId,
 }
 
 impl Vote {
@@ -31,12 +32,14 @@ impl Vote {
         block_hash: [u8; blake3::OUT_LEN],
         signature: BlsSignature,
         peer_id: PeerId,
+        leader_id: PeerId,
     ) -> Self {
         Self {
             view,
             block_hash,
             signature,
             peer_id,
+            leader_id,
         }
     }
 
@@ -86,6 +89,8 @@ pub struct MNotarization<const N: usize, const F: usize, const M_SIZE: usize> {
     pub aggregated_signature: BlsSignature,
     /// The peer IDs of the peers that have notarized the block
     pub peer_ids: [PeerId; M_SIZE],
+    /// The leader's ID of the view
+    pub leader_id: PeerId,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_SIZE> {
@@ -94,12 +99,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> MNotarization<N, F, M_
         block_hash: [u8; blake3::OUT_LEN],
         aggregated_signature: BlsSignature,
         peer_ids: [PeerId; M_SIZE],
+        leader_id: PeerId,
     ) -> Self {
         Self {
             view,
             block_hash,
             aggregated_signature,
             peer_ids,
+            leader_id,
         }
     }
 

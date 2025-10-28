@@ -217,6 +217,7 @@ fn main() {
             .collect::<Vec<PeerId>>()
             .try_into()
             .unwrap(),
+        leader_id: 0,
     };
     let mut arena = Arena::new();
     let start = std::time::Instant::now();

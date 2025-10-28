@@ -18,5 +18,9 @@ redb          = { workspace = true }
 rkyv          = { workspace = true }
 rtrb          = { workspace = true }
 serde         = { workspace = true, features = [ "derive" ] }
+slog          = { workspace = true }
+slog-async    = { workspace = true }
+slog-stdlog   = { workspace = true }
+slog-term     = { workspace = true }
 tracing       = { workspace = true }
 validator     = { workspace = true, features = [ "derive" ] }

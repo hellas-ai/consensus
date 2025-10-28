@@ -17,11 +17,10 @@ use crate::{
         config::ConsensusConfig,
         events::ViewProgressEvent,
         leader_manager::{LeaderManager, LeaderSelectionStrategy, RoundRobinLeaderManager},
-        utils::{
-            NotarizationData, NullificationData, create_notarization_data,
-            create_nullification_data,
+        view_context::{
+            CollectedNullificationsResult, CollectedVotesResult, LeaderProposalResult,
+            ShouldMNotarize, ViewContext,
         },
-        view_context::ViewContext,
     },
 };
 
@@ -54,6 +53,9 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
 
     /// Transaction pool
     pending_txs: Vec<Transaction>,
+
+    /// The logger
+    _logger: slog::Logger,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N, F, M_SIZE> {
@@ -61,6 +63,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         config: ConsensusConfig,
         replica_id: PeerId,
         leader_manager: Box<dyn LeaderManager>,
+        logger: slog::Logger,
     ) -> Result<Self> {
         let leader_id = leader_manager.leader_for_view(0)?.peer_id();
         let peers = PeerSet::new(
@@ -78,12 +81,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             unfinalized_view_context: None,
             peers,
             pending_txs: Vec::new(),
+            _logger: logger,
         })
     }
 
     /// Creates a new view progress manager from the genesis state. This is used
     /// to initialize the view progress manager when the consensus protocol starts.
-    pub fn from_genesis(config: ConsensusConfig, replica_id: PeerId) -> Result<Self> {
+    pub fn from_genesis(
+        config: ConsensusConfig,
+        replica_id: PeerId,
+        logger: slog::Logger,
+    ) -> Result<Self> {
         let leader_manager = match config.leader_manager {
             LeaderSelectionStrategy::RoundRobin => {
                 Box::new(RoundRobinLeaderManager::new(config.n, Vec::new()))
@@ -109,6 +117,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             unfinalized_view_context: None,
             peers,
             pending_txs: Vec::new(),
+            _logger: logger,
         })
     }
 
@@ -135,43 +144,39 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     /// Called periodically to check timers and trigger view changes if needed
     #[instrument("debug", skip_all)]
     pub fn tick(&mut self) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if self.is_leader && !self.has_proposed_in_view {
+        if self.current_view_context.is_leader() && !self.current_view_context.has_proposed {
             if let Some(parent_block_hash) = self.select_parent() {
                 return Ok(ViewProgressEvent::ShouldProposeBlock {
-                    view: self.current_view,
+                    view: self.current_view_context.view_number,
                     parent_block_hash,
                 });
             } else {
                 return Err(anyhow::anyhow!(
                     "Failed to retrieve a parent block hash for the current view: {}",
-                    self.current_view
+                    self.current_view_context.view_number
                 ));
             }
         }
 
-        if !self.has_nullified_in_view && self.view_start_time.elapsed() >= self.config.view_timeout
+        if !self.current_view_context.has_nullified
+            && self.current_view_context.entered_at.elapsed() >= self.config.view_timeout
         {
-            self.has_nullified_in_view = true;
+            self.current_view_context.has_nullified = true;
             return Ok(ViewProgressEvent::ShouldNullify {
-                view: self.current_view,
+                view: self.current_view_context.view_number,
             });
         }
 
-        if !self.has_voted_in_view && !self.has_nullified_in_view {
-            if let Some(block) = &self.block {
-                self.has_voted_in_view = true;
-                self.voted_block_hash = Some(block.get_hash());
-                Ok(ViewProgressEvent::ShouldVote {
-                    view: self.current_view,
+        if !self.current_view_context.has_voted && !self.current_view_context.has_nullified {
+            if let Some(block) = &self.current_view_context.block {
+                self.current_view_context.has_voted = true;
+                self.current_view_context.block_hash = Some(block.get_hash());
+                return Ok(ViewProgressEvent::ShouldVote {
+                    view: self.current_view_context.view_number,
                     block_hash: block.get_hash(),
-                })
-            } else {
-                // In this case, the replica still hasn't received a [`Block`]
-                // for the current view, and it hasn't nullify the view (possibly
-                // because the timeout hasn't been triggered yet). In this case,
-                // we return a NoOp
-                Ok(ViewProgressEvent::Await)
+                });
             }
+            Ok(ViewProgressEvent::Await)
         } else {
             // In this case, the replica has either voted for a block, or nullified the current view.
             // In both cases, we can return a no-op event.
@@ -220,7 +225,29 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
-        let block_hash = self.current_view_context.add_new_view_block(block)?;
+        let LeaderProposalResult {
+            block_hash,
+            is_enough_to_m_notarize,
+            is_enough_to_finalize,
+        } = self.current_view_context.add_new_view_block(block)?;
+
+        if is_enough_to_m_notarize {
+            // NOTE: In this case, the replica has collected enough votes to propose a M-notarization,
+            // but not enough to finalize the view. Therefore, the replica should vote for the block
+            // and notarize it simultaneously.
+            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
+                view: self.current_view_context.view_number,
+                block_hash,
+            });
+        } else if is_enough_to_finalize {
+            // NOTE: In this case, the replica has collected enough votes to finalize the view,
+            // before it has received the block proposal from the leader, as most likely the replica
+            // was beyond. In such case, the replica should vote for the block and finalize the view simultaneously.
+            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
+                view: self.current_view_context.view_number,
+                block_hash,
+            });
+        }
 
         Ok(ViewProgressEvent::ShouldVote {
             view: self.current_view_context.view_number,
@@ -229,315 +256,260 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     }
 
     fn handle_new_vote(&mut self, vote: Vote) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        let peer_public_key = self
-            .peers
-            .get_public_key(&vote.peer_id)
-            .expect("Peer not found");
-
-        if !vote.verify(peer_public_key) {
-            return Err(anyhow::anyhow!(
-                "Vote signature is not valid for peer {}",
-                vote.peer_id,
-            ));
-        }
-
-        if vote.view > self.current_view {
+        if vote.view > self.current_view_context.view_number {
             // TODO: Handle the case where a vote for a future view is received.
             // In this case, the replica should try to either sync up for the future view, or
             // ignore it altogether. Ideally, the replica would try to sync up for the future view,
             // but that involves more work, as it would require a supra-majority of replicas providing
-            // more blocks to the current replica. We will implement this in a future PR. For now,
-            // we will simply error out.
-            return Err(anyhow::anyhow!(
-                "Vote for view {} is for a future view (current view is {}), ignoring it for now.",
-                vote.view,
-                self.current_view,
-            ));
-        }
-
-        if vote.view < self.current_view - 1 {
-            return Err(anyhow::anyhow!(
-                "Vote for view {} is for a previous view (current view is {}), ignoring it for now.",
-                vote.view,
-                self.current_view,
-            ));
-        }
-
-        if !self.peers.contains(&vote.peer_id) {
-            return Err(anyhow::anyhow!(
-                "Vote for peer {} is not present in the peers set",
-                vote.peer_id
-            ));
-        }
-
-        // Check if the vote is already present in the votes set (either verified or non-verified)
-        let has_already_voted_in_view = self.votes.iter().any(|v| v.peer_id == vote.peer_id)
-            || self
-                .non_verified_votes
-                .iter()
-                .any(|v| v.peer_id == vote.peer_id);
-
-        if has_already_voted_in_view {
-            return Err(anyhow::anyhow!(
-                "Peer {} has already voted in view {}",
-                vote.peer_id,
-                self.current_view
-            ));
-        }
-
-        // TODO: Refactor the order of the conditions in this block, as it might always be preferable
-        if let Some(view_proposed_block_hash) = self.view_proposed_block_hash {
-            let block_hash = vote.block_hash;
-            if block_hash != view_proposed_block_hash {
+            // more blocks to the current replica.
+            let block_view_leader = self.leader_manager.leader_for_view(vote.view)?.peer_id();
+            if block_view_leader != vote.leader_id {
                 return Err(anyhow::anyhow!(
-                    "Vote for block hash {} is not the view proposed block hash: {}",
-                    hex::encode(block_hash),
-                    hex::encode(view_proposed_block_hash)
+                    "Vote for leader {} is not the correct view leader {} for vote's view {}",
+                    vote.leader_id,
+                    block_view_leader,
+                    vote.view
                 ));
             }
-            self.votes.insert(vote);
-            if self.votes.len() > 2 * F && self.m_notarizations.is_empty() {
-                let NotarizationData {
-                    peer_ids,
-                    aggregated_signature,
-                } = create_notarization_data::<M_SIZE>(&self.votes)?;
-                // NOTE: The view for the [`MNotarization`] is the current view,
-                // since the replica has not yet processed a M-notarization for the current view.
-                // Therefore, it has not yet transitioned to the next view.
-                self.m_notarizations.insert(MNotarization::new(
-                    self.current_view,
-                    block_hash,
-                    aggregated_signature,
-                    peer_ids,
-                ));
-                Ok(ViewProgressEvent::ShouldMNotarize {
-                    view: self.current_view,
-                    block_hash,
-                })
-            } else if self.m_notarizations.is_empty() {
-                // TODO:
-                todo!(
-                    "Handle the case where votes + the current set of m-notarizations is enough to propose a new l-notarization"
-                )
-            } else if self.votes.len() > N - F {
-                Ok(ViewProgressEvent::ShouldFinalize {
-                    view: self.current_view,
-                    block_hash,
-                })
-            } else {
-                Ok(ViewProgressEvent::NoOp)
-            }
-        } else {
-            // In this case, the replica has not yet received the view proposed block hash
-            // from the leader, so we need to store the vote in the non-verified votes set.
-            self.non_verified_votes.insert(vote);
-            Ok(ViewProgressEvent::Await)
-        }
-    }
-
-    fn handle_nullify(&mut self, nullify: Nullify) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if nullify.view != self.current_view {
-            return Err(anyhow::anyhow!(
-                "Nullify for view {} is not the current view: {}",
-                nullify.view,
-                self.current_view
-            ));
-        }
-
-        if !self.peers.contains(&nullify.peer_id) {
-            return Err(anyhow::anyhow!(
-                "Nullify for peer {} is not present in the peers set",
-                nullify.peer_id
-            ));
-        }
-
-        if !nullify.verify(
-            self.peers
-                .get_public_key(&nullify.peer_id)
-                .expect("Peer not found"),
-        ) {
-            return Err(anyhow::anyhow!(
-                "Nullify signature is not valid for peer {}",
-                nullify.peer_id
-            ));
-        }
-
-        if self
-            .nullify_messages
-            .iter()
-            .any(|n| n.peer_id == nullify.peer_id)
-        {
-            return Err(anyhow::anyhow!(
-                "Nullify for peer {} is already present in the nullify messages set",
-                nullify.peer_id
-            ));
-        }
-
-        self.nullify_messages.insert(nullify);
-        if self.nullify_messages.len() > 2 * F {
-            let NullificationData {
-                peer_ids,
-                aggregated_signature,
-            } = create_nullification_data::<M_SIZE>(&self.nullify_messages)?;
-            return Ok(ViewProgressEvent::ShouldBroadcastNullification {
-                nullification: Nullification::new(
-                    self.current_view,
-                    self.leader_manager
-                        .leader_for_view(self.current_view)?
-                        .peer_id(),
-                    aggregated_signature,
-                    peer_ids,
-                ),
+            return Ok(ViewProgressEvent::ShouldUpdateView {
+                new_view: vote.view,
+                leader: block_view_leader,
             });
         }
 
-        Ok(ViewProgressEvent::NoOp)
+        if self.current_view_context.view_number == vote.view {
+            let CollectedVotesResult {
+                should_await,
+                is_enough_to_m_notarize,
+                is_enough_to_finalize,
+            } = self.current_view_context.add_vote(vote, &self.peers)?;
+            if should_await {
+                return Ok(ViewProgressEvent::Await);
+            } else if is_enough_to_m_notarize {
+                return Ok(ViewProgressEvent::ShouldMNotarize {
+                    view: self.current_view_context.view_number,
+                    block_hash: self.current_view_context.block_hash.unwrap(),
+                });
+            } else if is_enough_to_finalize {
+                return Ok(ViewProgressEvent::ShouldFinalize {
+                    view: self.current_view_context.view_number,
+                    block_hash: self.current_view_context.block_hash.unwrap(),
+                });
+            } else {
+                return Ok(ViewProgressEvent::NoOp);
+            }
+        }
+
+        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
+            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
+            if vote.view == unfinalized_view_context.view_number {
+                let CollectedVotesResult {
+                    should_await,
+                    is_enough_to_m_notarize,
+                    is_enough_to_finalize,
+                } = unfinalized_view_context.add_vote(vote, &self.peers)?;
+                if should_await {
+                    return Ok(ViewProgressEvent::Await);
+                } else if is_enough_to_m_notarize {
+                    return Ok(ViewProgressEvent::ShouldMNotarize {
+                        view: unfinalized_view_context.view_number,
+                        block_hash: unfinalized_view_context.block_hash.unwrap(),
+                    });
+                } else if is_enough_to_finalize {
+                    return Ok(ViewProgressEvent::ShouldFinalize {
+                        view: unfinalized_view_context.view_number,
+                        block_hash: unfinalized_view_context.block_hash.unwrap(),
+                    });
+                } else {
+                    return Ok(ViewProgressEvent::NoOp);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Vote for view {} is not the current view {} or the unfinalized view {}",
+            vote.view,
+            self.current_view_context.view_number,
+            self.current_view_context.view_number - 1,
+        ))
+    }
+
+    fn handle_nullify(&mut self, nullify: Nullify) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
+        if nullify.view > self.current_view_context.view_number {
+            let block_view_leader = self.leader_manager.leader_for_view(nullify.view)?.peer_id();
+            if block_view_leader != nullify.leader_id {
+                return Err(anyhow::anyhow!(
+                    "Nullify for leader {} is not the correct view leader {} for nullify's view {}",
+                    nullify.leader_id,
+                    block_view_leader,
+                    nullify.view
+                ));
+            }
+            return Ok(ViewProgressEvent::ShouldUpdateView {
+                new_view: nullify.view,
+                leader: block_view_leader,
+            });
+        }
+
+        if self.current_view_context.view_number == nullify.view {
+            self.current_view_context
+                .add_nullify(nullify, &self.peers)?;
+            if self.current_view_context.nullification.is_some() {
+                return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                    view: self.current_view_context.view_number,
+                });
+            }
+            return Ok(ViewProgressEvent::NoOp);
+        }
+
+        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
+            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
+            if nullify.view == unfinalized_view_context.view_number {
+                unfinalized_view_context.add_nullify(nullify, &self.peers)?;
+                if unfinalized_view_context.nullification.is_some() {
+                    return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                        view: unfinalized_view_context.view_number,
+                    });
+                }
+                return Ok(ViewProgressEvent::NoOp);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Nullify for view {} is not the current view {} or the unfinalized view {}",
+            nullify.view,
+            self.current_view_context.view_number,
+            self.current_view_context.view_number - 1,
+        ))
     }
 
     fn handle_m_notarization(
         &mut self,
         m_notarization: MNotarization<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if self.is_previous_view_finalized && m_notarization.view != self.current_view {
-            // If the previous view has been finalized, any m-notarization for a later view should be rejected.
-            return Err(anyhow::anyhow!(
-                "M-notarization for view {} is not the current view: {}",
-                m_notarization.view,
-                self.current_view
-            ));
-        }
-
-        if !self.is_previous_view_finalized && m_notarization.view < self.current_view - 1 {
-            return Err(anyhow::anyhow!(
-                "M-notarization for view {} is not the previous view: {}",
-                m_notarization.view,
-                self.current_view
-            ));
-        }
-
-        if m_notarization.view > self.current_view {
-            // TODO: Handle the case where a m-notarization for a future view is received.
-            // In this case, the replica should try to either sync up for the future view, or
-            // ignore it altogether. Ideally, the replica would try to sync up for the future view,
-            // but that involves more work, as it would require a supra-majority of replicas providing
-            // more blocks to the current replica. We will implement this in a future PR. For now,
-            // we will simply error out.
-            return Err(anyhow::anyhow!(
-                "M-notarization for view {} is for a future view (current view is {}), ignoring it for now.",
-                m_notarization.view,
-                self.current_view,
-            ));
-        }
-
-        if self.view_proposed_block_hash.is_none() {
-            // Check if the m-notarization contains a vote by the current view leader.
-            return Err(anyhow::anyhow!(
-                "View proposed block hash not found for the current view",
-            ));
-        }
-
-        let view_proposed_block_hash = self
-            .view_proposed_block_hash
-            .expect("View proposed block hash not found");
-
-        if m_notarization.block_hash != view_proposed_block_hash {
-            return Err(anyhow::anyhow!(
-                "Received M-notarization for block hash {} has a different block hash than the view proposed block hash: {}",
-                hex::encode(m_notarization.block_hash),
-                hex::encode(view_proposed_block_hash)
-            ));
-        }
-
-        // TODO: The verification of the M-notarization should be ported to the p2p layer.
-        if !m_notarization.verify(&self.peers) {
-            return Err(anyhow::anyhow!(
-                "M-notarization signature is not valid for the current view",
-            ));
-        }
-
-        if self.m_notarizations.is_empty() {
-            return Ok(ViewProgressEvent::ShouldFinalize {
-                view: self.current_view,
-                block_hash: m_notarization.block_hash,
+        if self.current_view_context.view_number < m_notarization.view {
+            let block_view_leader = self
+                .leader_manager
+                .leader_for_view(m_notarization.view)?
+                .peer_id();
+            if block_view_leader != m_notarization.leader_id {
+                return Err(anyhow::anyhow!(
+                    "M-notarization for leader {} is not the correct view leader {} for m-notarization's view {}",
+                    m_notarization.leader_id,
+                    block_view_leader,
+                    m_notarization.view
+                ));
+            }
+            return Ok(ViewProgressEvent::ShouldUpdateView {
+                new_view: m_notarization.view,
+                leader: block_view_leader,
             });
         }
 
-        if self
-            .m_notarizations
-            .iter()
-            .any(|m| m.block_hash == m_notarization.block_hash)
-        {
-            tracing::info!(
-                "M-notarization for block hash {} is already present in the m-notarizations set",
-                hex::encode(m_notarization.block_hash)
-            );
-
+        if self.current_view_context.view_number == m_notarization.view {
+            let ShouldMNotarize {
+                should_notarize,
+                should_await,
+            } = self
+                .current_view_context
+                .add_m_notarization(m_notarization, &self.peers)?;
+            if should_notarize {
+                return Ok(ViewProgressEvent::ProgressToNextView {
+                    new_view: self.current_view_context.view_number + 1,
+                    leader: self
+                        .leader_manager
+                        .leader_for_view(self.current_view_context.view_number + 1)?
+                        .peer_id(),
+                });
+            }
+            if should_await {
+                return Ok(ViewProgressEvent::Await);
+            }
             return Ok(ViewProgressEvent::NoOp);
         }
 
-        Ok(ViewProgressEvent::ViewChanged {
-            new_view: self.current_view + 1,
-            leader: self
-                .leader_manager
-                .leader_for_view(self.current_view + 1)?
-                .peer_id(),
-        })
+        if let Some(ref unfinalized_view_context) = self.unfinalized_view_context {
+            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
+            if m_notarization.view == unfinalized_view_context.view_number {
+                // NOTE: There is not anything left to do here, as the m-notarization has already been added to the unfinalized view context.
+                return Ok(ViewProgressEvent::NoOp);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "M-notarization for view {} is not the current view {} or the unfinalized view {}",
+            m_notarization.view,
+            self.current_view_context.view_number,
+            self.current_view_context.view_number - 1,
+        ))
     }
 
     fn handle_nullification(
         &mut self,
         nullification: Nullification<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if nullification.view != self.current_view && nullification.view < self.current_view - 1 {
-            return Err(anyhow::anyhow!(
-                "Nullification for view {} is not valid for the either the current view or the previous view: {}",
-                nullification.view,
-                self.current_view
-            ));
-        }
-
-        if self.previous_finalized_block_hash.unwrap() != nullification.block_hash {
-            return Err(anyhow::anyhow!(
-                "Nullification for block hash {} is not the previous finalized block hash: {}",
-                hex::encode(nullification.block_hash),
-                hex::encode(self.previous_finalized_block_hash.unwrap())
-            ));
-        }
-
-        if nullification.view == self.current_view {
-            if !self.has_nullified_in_view {
-                return Ok(ViewProgressEvent::ShouldNullify {
-                    view: nullification.view,
-                });
-            } else {
+        if nullification.view > self.current_view_context.view_number {
+            let block_view_leader = self
+                .leader_manager
+                .leader_for_view(nullification.view)?
+                .peer_id();
+            if block_view_leader != nullification.leader_id {
                 return Err(anyhow::anyhow!(
-                    "Nullification for view {} is already present in the nullifications set",
+                    "Nullification for leader {} is not the correct view leader {} for nullification's view {}",
+                    nullification.leader_id,
+                    block_view_leader,
                     nullification.view
                 ));
             }
-        } else if nullification.view == self.current_view - 1 {
+            return Ok(ViewProgressEvent::ShouldUpdateView {
+                new_view: nullification.view,
+                leader: block_view_leader,
+            });
         }
 
-        if !self.peers.contains(&nullification.leader_id) {
-            return Err(anyhow::anyhow!(
-                "Nullification for leader {} is not present in the peers set",
-                nullification.leader_id
-            ));
+        if self.current_view_context.view_number == nullification.view {
+            let CollectedNullificationsResult {
+                should_broadcast_nullification,
+            } = self
+                .current_view_context
+                .add_nullification(nullification, &self.peers)?;
+            if should_broadcast_nullification {
+                return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                    view: self.current_view_context.view_number,
+                });
+            }
+            return Ok(ViewProgressEvent::ShouldNullify {
+                view: self.current_view_context.view_number,
+            });
         }
 
-        if !nullification.verify(&self.peers) {
-            return Err(anyhow::anyhow!(
-                "Nullification signature is not valid for the view {}",
-                nullification.view
-            ));
+        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
+            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
+            if nullification.view == unfinalized_view_context.view_number {
+                let CollectedNullificationsResult {
+                    should_broadcast_nullification,
+                } = unfinalized_view_context.add_nullification(nullification, &self.peers)?;
+                if should_broadcast_nullification {
+                    return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                        view: unfinalized_view_context.view_number,
+                    });
+                } else {
+                    return Ok(ViewProgressEvent::ShouldNullify {
+                        view: unfinalized_view_context.view_number,
+                    });
+                }
+            }
         }
 
-        if self.has_nullified_in_view {}
-
-        Ok(ViewProgressEvent::NoOp)
+        Err(anyhow::anyhow!(
+            "Nullification for view {} is not the current view {} or the unfinalized view {}",
+            nullification.view,
+            self.current_view_context.view_number,
+            self.current_view_context.view_number - 1,
+        ))
     }
 
-    fn try_update_view(&mut self, view: u64) -> Result<()> {
+    fn _try_update_view(&mut self, view: u64) -> Result<()> {
         // TODO: Implement view update logic
         tracing::info!("Trying to update view to {}", view);
         Ok(())
