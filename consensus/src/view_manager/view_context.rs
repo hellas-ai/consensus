@@ -314,9 +314,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             ));
         }
 
-        let is_enough_for_nullification = self.nullify_messages.len() > 2 * F;
-
         self.nullify_messages.insert(nullify);
+        let is_enough_for_nullification = self.nullify_messages.len() > 2 * F;
 
         let nullification = if is_enough_for_nullification {
             let NullificationData {
@@ -597,6 +596,52 @@ mod tests {
         let signature = secret_key.sign(&block_hash);
 
         Vote::new(view, block_hash, signature, peer_id, leader_id)
+    }
+
+    // Helper function to create a signed nullify message from a peer
+    fn create_test_nullify(
+        peer_index: usize,
+        view: u64,
+        leader_id: PeerId,
+        setup: &TestPeerSetup,
+    ) -> Nullify {
+        let peer_id = setup.peer_set.sorted_peer_ids[peer_index];
+        let secret_key = setup.peer_id_to_secret_key.get(&peer_id).unwrap();
+
+        // Create the message that needs to be signed (same as in Nullify::verify)
+        let message = blake3::hash(&[view.to_le_bytes(), leader_id.to_le_bytes()].concat());
+        let signature = secret_key.sign(message.as_bytes());
+
+        Nullify::new(view, leader_id, signature, peer_id)
+    }
+
+    // Helper function to create a test M-notarization from votes
+    fn create_test_m_notarization<const N: usize, const F: usize, const M_SIZE: usize>(
+        votes: &HashSet<Vote>,
+        view: u64,
+        block_hash: [u8; blake3::OUT_LEN],
+        leader_id: PeerId,
+    ) -> MNotarization<N, F, M_SIZE> {
+        let NotarizationData {
+            peer_ids,
+            aggregated_signature,
+        } = create_notarization_data::<M_SIZE>(votes).unwrap();
+
+        MNotarization::new(view, block_hash, aggregated_signature, peer_ids, leader_id)
+    }
+
+    // Helper function to create a test nullification from nullify messages
+    fn create_test_nullification<const N: usize, const F: usize, const M_SIZE: usize>(
+        nullify_messages: &HashSet<Nullify>,
+        view: u64,
+        leader_id: PeerId,
+    ) -> Nullification<N, F, M_SIZE> {
+        let NullificationData {
+            peer_ids,
+            aggregated_signature,
+        } = create_nullification_data::<M_SIZE>(nullify_messages).unwrap();
+
+        Nullification::new(view, leader_id, aggregated_signature, peer_ids)
     }
 
     // Helper function to create a test view context
@@ -1086,5 +1131,633 @@ mod tests {
         assert!(context.votes.contains(&non_verified_vote));
         assert_eq!(context.votes.len(), 2);
         assert_eq!(context.non_verified_votes.len(), 0);
+    }
+
+    #[test]
+    fn test_add_nullify_success() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [1u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Create and add a valid nullify message
+        let nullify = create_test_nullify(2, 10, leader_id, &setup);
+        let result = context.add_nullify(nullify.clone(), peers);
+
+        assert!(result.is_ok());
+        assert!(context.nullify_messages.contains(&nullify));
+        assert_eq!(context.nullify_messages.len(), 1);
+        assert!(context.nullification.is_none()); // Only 1 message, need > 2*F = 2
+    }
+
+    #[test]
+    fn test_add_nullify_peer_not_in_set() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [2u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Create a nullify with invalid peer ID (not in peer set)
+        let invalid_peer_id = 10; // Random peer ID not in set
+        let secret_key = BlsSecretKey::generate(&mut thread_rng());
+        let message = blake3::hash(&[10u64.to_le_bytes(), leader_id.to_le_bytes()].concat());
+        let signature = secret_key.sign(message.as_bytes());
+        let invalid_nullify = Nullify::new(10, leader_id, signature, invalid_peer_id);
+
+        let result = context.add_nullify(invalid_nullify, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("is not present in the peers set"));
+    }
+
+    #[test]
+    fn test_add_nullify_wrong_view() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [3u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Create nullify with wrong view number
+        let nullify = create_test_nullify(1, 15, leader_id, &setup); // view 15 instead of 10
+        let result = context.add_nullify(nullify, peers);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Nullify for view 15 is not the current view 10"));
+    }
+
+    #[test]
+    fn test_add_nullify_wrong_leader() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let correct_leader = peers.sorted_peer_ids[0];
+        let wrong_leader = peers.sorted_peer_ids[1];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [4u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, correct_leader, replica_id, parent_hash);
+
+        // Create nullify with wrong leader
+        let nullify = create_test_nullify(1, 10, wrong_leader, &setup);
+        let result = context.add_nullify(nullify, peers);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains(&format!(
+            "Nullify for leader {} is not the current leader {}",
+            wrong_leader, correct_leader
+        )));
+    }
+
+    #[test]
+    fn test_add_nullify_duplicate() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [5u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Add first nullify
+        let nullify = create_test_nullify(1, 10, leader_id, &setup);
+        let result1 = context.add_nullify(nullify.clone(), peers);
+        assert!(result1.is_ok());
+
+        // Try to add the same nullify again
+        let result2 = context.add_nullify(nullify, peers);
+        assert!(result2.is_err());
+        let error_msg = result2.unwrap_err().to_string();
+        assert!(error_msg.contains("already exists"));
+    }
+
+    #[test]
+    fn test_add_nullify_invalid_signature() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [6u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Create nullify with invalid signature (wrong secret key)
+        let peer_id = peers.sorted_peer_ids[1];
+        let wrong_secret_key = BlsSecretKey::generate(&mut thread_rng()); // Different key
+        let message = blake3::hash(&[10u64.to_le_bytes(), leader_id.to_le_bytes()].concat());
+        let invalid_signature = wrong_secret_key.sign(message.as_bytes());
+        let invalid_nullify = Nullify::new(10, leader_id, invalid_signature, peer_id);
+
+        let result = context.add_nullify(invalid_nullify, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("signature is not valid"));
+    }
+
+    #[test]
+    fn test_add_nullify_creates_nullification_when_threshold_reached() {
+        let setup = create_test_peer_setup(6); // N=6, F=1, so 2*F+1 = 3 nullify messages needed
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [7u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Add nullify messages until we reach the threshold (2*F + 1 = 3)
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 10, leader_id, &setup);
+            let result = context.add_nullify(nullify, peers);
+            assert!(result.is_ok());
+        }
+
+        assert_eq!(context.nullify_messages.len(), 3);
+        assert!(context.nullification.is_some());
+        let nullification = context.nullification.as_ref().unwrap();
+        assert_eq!(nullification.view, 10);
+        assert_eq!(nullification.leader_id, leader_id);
+    }
+
+    #[test]
+    fn test_add_nullify_preserves_other_state() {
+        let setup = create_test_peer_setup(4);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [8u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Set some initial state
+        context.has_voted = true;
+        context.has_nullified = true;
+        context.has_proposed = true;
+
+        let nullify = create_test_nullify(1, 10, leader_id, &setup);
+        let result = context.add_nullify(nullify, peers);
+
+        assert!(result.is_ok());
+        // These flags should remain unchanged
+        assert!(context.has_voted);
+        assert!(context.has_nullified);
+        assert!(context.has_proposed);
+        assert_eq!(context.view_number, 10);
+        assert_eq!(context.leader_id, leader_id);
+    }
+
+    #[test]
+    fn test_add_m_notarization_success() {
+        let setup = create_test_peer_setup(6); // Need enough peers for M_SIZE = 3
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [1u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Create votes for the block
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+
+        // Create M-notarization from votes
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
+        let result = context.add_m_notarization(m_notarization.clone(), peers);
+
+        assert!(result.is_ok());
+        let notarize_result = result.unwrap();
+        assert!(notarize_result.should_notarize);
+        assert!(!notarize_result.should_await);
+        assert!(context.m_notarization.is_some());
+        assert_eq!(context.m_notarization.as_ref().unwrap().view, 10);
+        assert_eq!(
+            context.m_notarization.as_ref().unwrap().block_hash,
+            block_hash
+        );
+        assert_eq!(
+            context.m_notarization.as_ref().unwrap().leader_id,
+            leader_id
+        );
+    }
+
+    #[test]
+    fn test_add_m_notarization_wrong_view() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [2u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Create votes and M-notarization with wrong view
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 15, block_hash, leader_id, &setup); // view 15 instead of 10
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 15, block_hash, leader_id);
+
+        let result = context.add_m_notarization(m_notarization, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("M-notarization for view 15 is not the current view 10"));
+    }
+
+    #[test]
+    fn test_add_m_notarization_wrong_leader() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let correct_leader = peers.sorted_peer_ids[0];
+        let wrong_leader = peers.sorted_peer_ids[1];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [3u8; blake3::OUT_LEN];
+        let mut context = creat_test_view_context_with_params::<6, 1, 3>(
+            10,
+            correct_leader,
+            replica_id,
+            parent_hash,
+        );
+
+        // Set a block hash first
+        let block = create_test_block(10, correct_leader, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Create votes and M-notarization with wrong leader
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, block_hash, wrong_leader, &setup); // wrong leader
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, wrong_leader);
+
+        let result = context.add_m_notarization(m_notarization, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains(&format!(
+            "M-notarization for leader {} is not the current leader {}",
+            wrong_leader, correct_leader
+        )));
+    }
+
+    #[test]
+    fn test_add_m_notarization_invalid_signature() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [4u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Create M-notarization with invalid signature (manually create with wrong signature)
+        let peer_ids: [PeerId; 3] = [
+            peers.sorted_peer_ids[0],
+            peers.sorted_peer_ids[1],
+            peers.sorted_peer_ids[2],
+        ];
+        let wrong_signature = BlsSecretKey::generate(&mut thread_rng()).sign(&[99u8; 32]); // Wrong signature
+        let invalid_m_notarization =
+            MNotarization::new(10, block_hash, wrong_signature, peer_ids, leader_id);
+
+        let result = context.add_m_notarization(invalid_m_notarization, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("signature is not valid"));
+    }
+
+    #[test]
+    fn test_add_m_notarization_stores_in_non_verified_when_no_block_hash() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [5u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Don't set block hash - should store in non-verified
+        let block_hash = [6u8; blake3::OUT_LEN];
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
+
+        let result = context.add_m_notarization(m_notarization.clone(), peers);
+        assert!(result.is_ok());
+        let notarize_result = result.unwrap();
+        assert!(!notarize_result.should_notarize);
+        assert!(notarize_result.should_await);
+        assert!(context.non_verified_m_notarization.is_some());
+        assert_eq!(
+            context
+                .non_verified_m_notarization
+                .as_ref()
+                .unwrap()
+                .block_hash,
+            block_hash
+        );
+    }
+
+    #[test]
+    fn test_add_m_notarization_wrong_block_hash() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [7u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let correct_block_hash = block.get_hash();
+        context.block_hash = Some(correct_block_hash);
+
+        // Create M-notarization with different block hash
+        let wrong_block_hash = [8u8; blake3::OUT_LEN];
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, wrong_block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, wrong_block_hash, leader_id);
+
+        let result = context.add_m_notarization(m_notarization, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("is not the block hash for the current view"));
+    }
+
+    #[test]
+    fn test_add_m_notarization_duplicate() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [9u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Add first M-notarization
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
+        let result1 = context.add_m_notarization(m_notarization.clone(), peers);
+        assert!(result1.is_ok());
+
+        // Try to add the same M-notarization again
+        let result2 = context.add_m_notarization(m_notarization, peers);
+        assert!(result2.is_ok());
+        let notarize_result = result2.unwrap();
+        assert!(!notarize_result.should_notarize); // Should not notarize again
+        assert!(!notarize_result.should_await);
+    }
+
+    #[test]
+    fn test_add_m_notarization_preserves_other_state() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [10u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set some initial state
+        context.has_voted = true;
+        context.has_nullified = true;
+        context.has_proposed = true;
+
+        // Set a block hash first
+        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        context.block_hash = Some(block_hash);
+
+        // Create and add M-notarization
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
+        let result = context.add_m_notarization(m_notarization, peers);
+
+        assert!(result.is_ok());
+        // These flags should remain unchanged
+        assert!(context.has_voted);
+        assert!(context.has_nullified);
+        assert!(context.has_proposed);
+        assert_eq!(context.view_number, 10);
+        assert_eq!(context.leader_id, leader_id);
+    }
+
+    #[test]
+    fn test_add_nullification_success() {
+        let setup = create_test_peer_setup(6); // Need enough peers for M_SIZE = 3
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [1u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Create nullify messages for the nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 10, leader_id, &setup);
+            nullify_messages.insert(nullify);
+        }
+
+        // Create nullification from nullify messages
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 10, leader_id);
+        let result = context.add_nullification(nullification.clone(), peers);
+
+        assert!(result.is_ok());
+        let broadcast_result = result.unwrap();
+        assert!(broadcast_result.should_broadcast_nullification);
+        assert!(context.nullification.is_some());
+        assert_eq!(context.nullification.as_ref().unwrap().view, 10);
+        assert_eq!(context.nullification.as_ref().unwrap().leader_id, leader_id);
+    }
+
+    #[test]
+    fn test_add_nullification_wrong_view() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [2u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Create nullify messages and nullification with wrong view
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 15, leader_id, &setup); // view 15 instead of 10
+            nullify_messages.insert(nullify);
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 15, leader_id);
+
+        let result = context.add_nullification(nullification, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Nullification for view 15 is not the current view 10"));
+    }
+
+    #[test]
+    fn test_add_nullification_wrong_leader() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let correct_leader = peers.sorted_peer_ids[0];
+        let wrong_leader = peers.sorted_peer_ids[1];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [3u8; blake3::OUT_LEN];
+        let mut context = creat_test_view_context_with_params::<6, 1, 3>(
+            10,
+            correct_leader,
+            replica_id,
+            parent_hash,
+        );
+
+        // Create nullify messages and nullification with wrong leader
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 10, wrong_leader, &setup); // wrong leader
+            nullify_messages.insert(nullify);
+        }
+        let nullification =
+            create_test_nullification::<6, 1, 3>(&nullify_messages, 10, wrong_leader);
+
+        let result = context.add_nullification(nullification, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains(&format!(
+            "Nullification for leader {} is not the current leader {}",
+            wrong_leader, correct_leader
+        )));
+    }
+
+    #[test]
+    fn test_add_nullification_invalid_signature() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [4u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Create nullification with invalid signature (manually create with wrong signature)
+        let peer_ids: [PeerId; 3] = [
+            peers.sorted_peer_ids[0],
+            peers.sorted_peer_ids[1],
+            peers.sorted_peer_ids[2],
+        ];
+        let wrong_signature = BlsSecretKey::generate(&mut thread_rng()).sign(&[99u8; 32]); // Wrong signature
+        let invalid_nullification = Nullification::new(10, leader_id, wrong_signature, peer_ids);
+
+        let result = context.add_nullification(invalid_nullification, peers);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("signature is not valid"));
+    }
+
+    #[test]
+    fn test_add_nullification_duplicate() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [5u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Create first nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 10, leader_id, &setup);
+            nullify_messages.insert(nullify);
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 10, leader_id);
+        let result1 = context.add_nullification(nullification.clone(), peers);
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().should_broadcast_nullification);
+
+        // Try to add the same nullification again
+        let result2 = context.add_nullification(nullification, peers);
+        assert!(result2.is_ok());
+        let broadcast_result = result2.unwrap();
+        assert!(!broadcast_result.should_broadcast_nullification); // Should not broadcast again
+    }
+
+    #[test]
+    fn test_add_nullification_preserves_other_state() {
+        let setup = create_test_peer_setup(6);
+        let peers = &setup.peer_set;
+        let leader_id = peers.sorted_peer_ids[0];
+        let replica_id = peers.sorted_peer_ids[1];
+        let parent_hash = [6u8; blake3::OUT_LEN];
+        let mut context =
+            creat_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Set some initial state
+        context.has_voted = true;
+        context.has_nullified = true;
+        context.has_proposed = true;
+
+        // Create and add nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            let nullify = create_test_nullify(i, 10, leader_id, &setup);
+            nullify_messages.insert(nullify);
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 10, leader_id);
+        let result = context.add_nullification(nullification, peers);
+
+        assert!(result.is_ok());
+        // These flags should remain unchanged
+        assert!(context.has_voted);
+        assert!(context.has_nullified);
+        assert!(context.has_proposed);
+        assert_eq!(context.view_number, 10);
+        assert_eq!(context.leader_id, leader_id);
     }
 }
