@@ -445,6 +445,7 @@ mod tests {
                     .collect::<Vec<PeerId>>()
                     .try_into()
                     .unwrap(),
+                0,
             );
 
             store.put_notarization(&m).unwrap();

@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::state::{
     block::Block,
-    notarizations::{LNotarization, MNotarization, Vote},
+    notarizations::{MNotarization, Vote},
     nullify::{Nullification, Nullify},
 };
 
@@ -15,12 +15,10 @@ use crate::state::{
 /// - A L-notarization for a block, for the current view (it can be proposed by any replica)
 /// - A nullification for a view, for the current view (it can be proposed by any replica)
 #[derive(Clone, Debug, Archive, Deserialize, Serialize)]
-pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize, const L_SIZE: usize>
-{
+pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize> {
     BlockProposal(Block),
     Vote(Vote),
     Nullify(Nullify),
     MNotarization(MNotarization<N, F, M_SIZE>),
-    LNotarization(LNotarization<N, F, L_SIZE>),
     Nullification(Nullification<N, F, M_SIZE>),
 }
