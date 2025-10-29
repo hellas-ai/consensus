@@ -3,15 +3,15 @@ use std::{collections::HashSet, time::Instant};
 use anyhow::Result;
 
 use crate::{
+    consensus_manager::utils::{
+        NotarizationData, NullificationData, create_notarization_data, create_nullification_data,
+    },
     crypto::aggregated::PeerId,
     state::{
         block::Block,
         notarizations::{MNotarization, Vote},
         nullify::{Nullification, Nullify},
         peer::PeerSet,
-    },
-    view_manager::utils::{
-        NotarizationData, NullificationData, create_notarization_data, create_nullification_data,
     },
 };
 

@@ -8,7 +8,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::view_manager::leader_manager::LeaderSelectionStrategy;
+use crate::consensus_manager::leader_manager::LeaderSelectionStrategy;
 
 /// [`ConsensusConfig`] sets the configuration values for the consensus protocol.
 ///

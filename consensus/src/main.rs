@@ -15,10 +15,10 @@ use crate::{
 };
 
 pub mod consensus;
+pub mod consensus_manager;
 pub mod crypto;
 pub mod state;
 pub mod storage;
-pub mod view_manager;
 
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 
