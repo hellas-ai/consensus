@@ -1,4 +1,4 @@
-use crate::state::{leader::Leader, peer::Peer};
+use crate::{crypto::aggregated::PeerId, state::leader::Leader};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -24,11 +24,11 @@ pub(crate) struct RoundRobinLeaderManager {
     n: usize,
 
     /// The vector of all available replicas in the consensus protocol.
-    pub replicas: Vec<Peer>,
+    pub replicas: Vec<PeerId>,
 }
 
 impl RoundRobinLeaderManager {
-    pub fn new(n: usize, replicas: Vec<Peer>) -> Self {
+    pub fn new(n: usize, replicas: Vec<PeerId>) -> Self {
         Self { n, replicas }
     }
 }
@@ -36,7 +36,7 @@ impl RoundRobinLeaderManager {
 impl LeaderManager for RoundRobinLeaderManager {
     fn leader_for_view(&self, view: u64) -> Result<Leader> {
         let leader_index = view as usize % self.n;
-        let leader_peer_id = self.replicas[leader_index].peer_id;
+        let leader_peer_id = self.replicas[leader_index];
         Ok(Leader::new(leader_peer_id, false, view))
     }
 }
