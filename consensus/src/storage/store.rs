@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ark_serialize::CanonicalSerialize;
@@ -41,8 +42,9 @@ use super::{
 /// let fetched = store.get_block(&block.get_hash()).unwrap().expect("get block");
 /// assert_eq!(fetched.view(), 1);
 /// ```
+#[derive(Clone)]
 pub struct ConsensusStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl ConsensusStore {
@@ -53,7 +55,7 @@ impl ConsensusStore {
         } else {
             Database::create(path).context("Failed to create database")?
         };
-        let consensus_store = Self { db };
+        let consensus_store = Self { db: Arc::new(db) };
         consensus_store.init_tables()?;
         Ok(consensus_store)
     }
