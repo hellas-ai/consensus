@@ -1,0 +1,103 @@
+name: "Setup APT Dependencies"
+description: "Cache and install system dependencies via apt-get"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Restore cached apt lists (restore-keys will get any previous cache)
+      uses: actions/cache/restore@v4
+      id: cache-lists-restore
+      with:
+        path: .apt-lists
+
+        # This is a bit interesting.
+        # We are intentionally using a key that is going to generate a miss.
+        # Instead, we want to get a hit from `restore-keys` (it will pack a key based on recency).
+        # As for why we are not matching the key directly, the answer is we can't.
+        # The key contains a hash that we must compute the contents of `apt/lists/*`, which we generate on the next step.
+        # This is a circular depenency, which is why we attempt to match with `restore-keys`.
+        key: dummy-key-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-apt-lists-
+
+    - name: Restore apt lists to system
+      shell: bash
+      run: |
+        # Restore apt lists from cache if available
+        if [ -d .apt-lists ] && [ "$(ls -A .apt-lists 2>/dev/null)" ]; then
+          echo "Restoring apt lists from previous cache..."
+          sudo cp -r .apt-lists/* /var/lib/apt/lists/ 2>/dev/null || true
+        else
+          echo "No cached apt lists found, will need to update..."
+        fi
+
+    - name: Generate cache key based on package versions
+      shell: bash
+      run: |
+        PACKAGES="build-essential pkg-config libssl-dev protobuf-compiler uuid-dev libbsd-dev libbsd0 libclang-dev"
+
+        # Generate hash based on what would be installed (using existing apt lists if available)
+        # If apt lists are stale or missing, this will produce a different hash than cached
+        echo "Running apt-get install --simulate to generate hash..."
+
+        HASH=$(apt-get install --simulate --dry-run $PACKAGES 2>&1 | tee /tmp/apt-simulate.log | grep "^Inst " | sha256sum | awk '{print $1}')
+
+        # "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" is the hash of the empty list.
+        if [ -z "$HASH" ] || [ "$HASH" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]; then
+          echo "Failed to generate hash from simulate, apt lists likely missing/corrupt"
+          echo "Running apt-get update to refresh..."
+          sudo apt-get update -qq
+          HASH=$(apt-get install --simulate --dry-run $PACKAGES 2>/dev/null | grep "^Inst " | sha256sum | awk '{print $1}')
+        fi
+
+        echo "APT_CACHE_HASH=$HASH" >> $GITHUB_ENV
+        echo "Generated cache hash: $HASH"
+
+    - name: Cache apt lists
+      uses: actions/cache@v4
+      with:
+        path: .apt-lists
+        key: ${{ runner.os }}-apt-lists-${{ env.APT_CACHE_HASH }}
+
+    - name: Cache apt packages
+      uses: actions/cache@v4
+      with:
+        path: .apt-cache
+        key: ${{ runner.os }}-apt-packages-${{ env.APT_CACHE_HASH }}
+        restore-keys: |
+          ${{ runner.os }}-apt-packages-
+
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        PACKAGES="build-essential pkg-config libssl-dev protobuf-compiler uuid-dev libbsd-dev libbsd0 libclang-dev"
+
+        # Restore cached apt packages if they exist
+        if [ -d .apt-cache ] && [ "$(ls -A .apt-cache/*.deb 2>/dev/null)" ]; then
+          echo "Restoring packages from cache..."
+          sudo cp .apt-cache/*.deb /var/cache/apt/archives/
+
+          # Try to install from cache without downloading
+          if sudo apt-get install -y --no-download $PACKAGES 2>/dev/null; then
+            echo "All packages installed from cache successfully!"
+            exit 0
+          else
+            echo "Cache incomplete, need to update and download..."
+          fi
+        fi
+
+        # If we get here, we need to download packages
+        # First ensure apt lists are up to date
+        echo "Updating apt lists..."
+        sudo apt-get update -qq
+
+        # Install packages
+        sudo apt-get install -y $PACKAGES
+
+        # Save apt lists for next time
+        mkdir -p .apt-lists
+        sudo cp -r /var/lib/apt/lists/* .apt-lists/ 2>/dev/null || true
+
+        # Cache the downloaded packages for next time
+        mkdir -p .apt-cache
+        sudo cp /var/cache/apt/archives/*.deb .apt-cache/ 2>/dev/null || true
