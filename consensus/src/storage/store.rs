@@ -10,17 +10,22 @@ use rkyv::{Archive, Serialize, deserialize};
 
 use crate::crypto::aggregated::BlsPublicKey;
 use crate::state::account::Account;
+use crate::state::notarizations::Vote;
+use crate::state::nullify::Nullify;
 use crate::state::{
     block::Block, leader::Leader, notarizations::MNotarization, nullify::Nullification,
     transaction::Transaction, view::View,
 };
 use crate::storage::config::StorageConfig;
 use crate::storage::conversions::Storable;
-use crate::storage::tables::ACCOUNTS;
+use crate::storage::tables::{ACCOUNTS, NULLIFIED_BLOCKS, NULLIFIES};
 
 use super::{
     conversions::access_archived,
-    tables::{BLOCKS, LEADERS, MEMPOOL, NOTARIZATIONS, NULLIFICATIONS, STATE, VIEWS, VOTES},
+    tables::{
+        FINALIZED_BLOCKS, LEADERS, MEMPOOL, NON_FINALIZED_BLOCKS, NOTARIZATIONS, NULLIFICATIONS,
+        STATE, VIEWS, VOTES,
+    },
 };
 
 /// [`ConsensusStore`] is a wrapper around the redb database that provides a convenient interface for storing and retrieving consensus data.
@@ -67,8 +72,14 @@ impl ConsensusStore {
             .context("Failed to begin write transaction")?;
         {
             write_txn
-                .open_table(BLOCKS)
-                .context("Failed to open blocks table")?;
+                .open_table(FINALIZED_BLOCKS)
+                .context("Failed to open finalized blocks table")?;
+            write_txn
+                .open_table(NON_FINALIZED_BLOCKS)
+                .context("Failed to open non-finalized blocks table")?;
+            write_txn
+                .open_table(NULLIFIED_BLOCKS)
+                .context("Failed to open nullified blocks table")?;
             write_txn
                 .open_table(LEADERS)
                 .context("Failed to open leaders table")?;
@@ -181,14 +192,44 @@ impl ConsensusStore {
         }
     }
 
-    /// Puts a block into the database.
-    pub fn put_block(&self, block: &Block) -> Result<()> {
-        self.put_value(BLOCKS, block)
+    /// Puts a finalized block into the database.
+    pub fn put_finalized_block(&self, block: &Block) -> Result<()> {
+        self.put_value(FINALIZED_BLOCKS, block)
     }
 
-    /// Retrieves a block from the database, if it exists.
-    pub fn get_block(&self, hash: &[u8; blake3::OUT_LEN]) -> Result<Option<Block>> {
-        unsafe { self.get_blob_value::<Block, _>(BLOCKS, *hash) }
+    /// Retrieves a finalized block from the database, if it exists.
+    pub fn get_finalized_block(&self, hash: &[u8; blake3::OUT_LEN]) -> Result<Option<Block>> {
+        unsafe { self.get_blob_value::<Block, _>(FINALIZED_BLOCKS, *hash) }
+    }
+
+    /// Puts a non-finalized block into the database.
+    pub fn put_non_finalized_block(&self, block: &Block) -> Result<()> {
+        self.put_value(NON_FINALIZED_BLOCKS, block)
+    }
+
+    /// Retrieves a non-finalized block from the database, if it exists.
+    pub fn get_non_finalized_block(&self, hash: &[u8; blake3::OUT_LEN]) -> Result<Option<Block>> {
+        unsafe { self.get_blob_value::<Block, _>(NON_FINALIZED_BLOCKS, *hash) }
+    }
+
+    /// Puts a nullified block into the database.
+    pub fn put_nullified_block(&self, block: &Block) -> Result<()> {
+        self.put_value(NULLIFIED_BLOCKS, block)
+    }
+
+    /// Retrieves a nullified block from the database, if it exists.
+    pub fn get_nullified_block(&self, hash: &[u8; blake3::OUT_LEN]) -> Result<Option<Block>> {
+        unsafe { self.get_blob_value::<Block, _>(NULLIFIED_BLOCKS, *hash) }
+    }
+
+    /// Puts a vote into the database.
+    pub fn put_vote(&self, vote: &Vote) -> Result<()> {
+        self.put_value(VOTES, vote)
+    }
+
+    /// Retrieves a vote from the database, if it exists.
+    pub fn get_vote(&self, vote_key: [u8; blake3::OUT_LEN]) -> Result<Option<Vote>> {
+        unsafe { self.get_blob_value::<Vote, _>(VOTES, vote_key) }
     }
 
     /// Puts a leader into the database.
@@ -235,6 +276,16 @@ impl ConsensusStore {
         hash: &[u8; blake3::OUT_LEN],
     ) -> Result<Option<MNotarization<N, F, M_SIZE>>> {
         unsafe { self.get_blob_value::<MNotarization<N, F, M_SIZE>, _>(NOTARIZATIONS, *hash) }
+    }
+
+    /// Puts a nullify message into the database.
+    pub fn put_nullify(&self, nullify: &Nullify) -> Result<()> {
+        self.put_value(NULLIFIES, nullify)
+    }
+
+    /// Retrieves a nullify message from the database, if it exists.
+    pub fn get_nullify(&self, view: u64) -> Result<Option<Nullify>> {
+        unsafe { self.get_blob_value::<Nullify, _>(NULLIFIES, view.to_le_bytes()) }
     }
 
     /// Puts a nullification into the database.
@@ -317,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn block_roundtrip() {
+    fn finalized_block_roundtrip() {
         let path = temp_db_path("block");
         {
             let store = ConsensusStore::open(&path).unwrap();
@@ -332,9 +383,70 @@ mod tests {
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
             let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
 
-            store.put_block(&block).unwrap();
+            store.put_finalized_block(&block).unwrap();
             let h = block.get_hash();
-            let fetched = store.get_block(&h).unwrap().expect("get block");
+            let fetched = store
+                .get_finalized_block(&h)
+                .unwrap()
+                .expect("get finalized block");
+            assert_eq!(fetched.get_hash(), block.get_hash());
+            assert_eq!(fetched.view(), 5);
+            assert_eq!(fetched.parent_block_hash(), parent);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn non_finalized_block_roundtrip() {
+        let path = temp_db_path("block");
+        {
+            let store = ConsensusStore::open(&path).unwrap();
+
+            // Prepare a transaction to embed in block
+            let (sk, pk) = gen_keypair();
+            let body = b"tx-body-1";
+            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
+            let sig = sk.sign(&tx_hash);
+            let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
+
+            let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
+            let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
+
+            store.put_non_finalized_block(&block).unwrap();
+            let h = block.get_hash();
+            let fetched = store
+                .get_non_finalized_block(&h)
+                .unwrap()
+                .expect("get non-finalized block");
+            assert_eq!(fetched.get_hash(), block.get_hash());
+            assert_eq!(fetched.view(), 5);
+            assert_eq!(fetched.parent_block_hash(), parent);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn nullified_block_roundtrip() {
+        let path = temp_db_path("block");
+        {
+            let store = ConsensusStore::open(&path).unwrap();
+
+            // Prepare a transaction to embed in block
+            let (sk, pk) = gen_keypair();
+            let body = b"tx-body-1";
+            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
+            let sig = sk.sign(&tx_hash);
+            let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
+
+            let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
+            let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
+
+            store.put_nullified_block(&block).unwrap();
+            let h = block.get_hash();
+            let fetched = store
+                .get_nullified_block(&h)
+                .unwrap()
+                .expect("get nullified block");
             assert_eq!(fetched.get_hash(), block.get_hash());
             assert_eq!(fetched.view(), 5);
             assert_eq!(fetched.parent_block_hash(), parent);
@@ -349,14 +461,13 @@ mod tests {
             let store = ConsensusStore::open(&path).unwrap();
 
             let (_sk, _pk) = gen_keypair();
-            let leader = Leader::new(10, true, 10);
+            let leader = Leader::new(10, 10);
 
             store.put_leader(&leader).unwrap();
             let fetched = store.get_leader(10).unwrap().expect("get leader");
 
             // Compare fields; `BlsPublicKey` lacks PartialEq, compare bytes instead.
             assert_eq!(fetched.view(), 10);
-            assert!(fetched.is_current());
             assert_eq!(fetched.peer_id(), leader.peer_id());
         }
         std::fs::remove_file(&path).ok();
@@ -534,6 +645,32 @@ mod tests {
             assert_eq!(fetched.view, view);
             assert_eq!(fetched.leader_id, 1);
             assert!(fetched.verify(&PeerSet::new(pks.to_vec())));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vote_roundtrip() {
+        let path = temp_db_path("vote");
+        {
+            let store = ConsensusStore::open(&path).unwrap();
+
+            let (sk, pk) = gen_keypair();
+            let view: u64 = 42;
+            let block_hash: [u8; blake3::OUT_LEN] = [5u8; blake3::OUT_LEN];
+            let sig = sk.sign(&block_hash);
+
+            let vote = Vote::new(view, block_hash, sig, pk.to_peer_id(), 1);
+
+            store.put_vote(&vote).unwrap();
+            let vote_key = vote.key();
+            let fetched = store.get_vote(vote_key).unwrap().expect("get vote");
+
+            assert_eq!(fetched.view, view);
+            assert_eq!(fetched.block_hash, block_hash);
+            assert_eq!(fetched.peer_id, pk.to_peer_id());
+            assert_eq!(fetched.leader_id, 1);
+            assert!(fetched.verify(&pk));
         }
         std::fs::remove_file(&path).ok();
     }

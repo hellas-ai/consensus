@@ -162,6 +162,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         let is_enough_to_m_notarize = self.votes.len() > 2 * F || self.m_notarization.is_some();
         let is_enough_to_finalize = self.votes.len() > N - F;
 
+        if is_enough_to_finalize && let Some(block) = self.block.as_mut() {
+            block.is_finalized = true;
+        }
+
         Ok(LeaderProposalResult {
             block_hash,
             is_enough_to_m_notarize,
@@ -322,6 +326,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 peer_ids,
                 aggregated_signature,
             } = create_nullification_data::<M_SIZE>(&self.nullify_messages)?;
+            if self.block.is_some() {
+                self.block.as_mut().unwrap().is_finalized = true;
+            }
             Some(Nullification::new(
                 self.view_number,
                 self.leader_id,
@@ -438,6 +445,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             return Err(anyhow::anyhow!(
                 "Nullification signature is not valid for the current view",
             ));
+        }
+
+        if self.block.is_some() {
+            self.block.as_mut().unwrap().is_finalized = true;
         }
 
         if self.nullification.is_some() {

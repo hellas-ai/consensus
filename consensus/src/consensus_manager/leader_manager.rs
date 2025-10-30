@@ -37,7 +37,7 @@ impl LeaderManager for RoundRobinLeaderManager {
     fn leader_for_view(&self, view: u64) -> Result<Leader> {
         let leader_index = view as usize % self.n;
         let leader_peer_id = self.replicas[leader_index];
-        Ok(Leader::new(leader_peer_id, false, view))
+        Ok(Leader::new(leader_peer_id, view))
     }
 }
 

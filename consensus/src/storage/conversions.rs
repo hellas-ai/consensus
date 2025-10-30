@@ -5,8 +5,13 @@ use rkyv::{
 };
 
 use crate::state::{
-    account::Account, block::Block, leader::Leader, notarizations::MNotarization,
-    nullify::Nullification, transaction::Transaction, view::View,
+    account::Account,
+    block::Block,
+    leader::Leader,
+    notarizations::{MNotarization, Vote},
+    nullify::{Nullification, Nullify},
+    transaction::Transaction,
+    view::View,
 };
 
 /// Accesses an archived value from a byte slice.
@@ -74,6 +79,23 @@ impl Storable for Block {
     }
 }
 
+impl Storable for Vote {
+    type Key = [u8; blake3::OUT_LEN];
+    type Value = AlignedVec;
+
+    fn key(&self) -> Self::Key {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.view.to_le_bytes());
+        hasher.update(&self.block_hash);
+        hasher.update(&self.peer_id.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    fn value(&self) -> Result<Self::Value> {
+        serialize_for_db(self)
+    }
+}
+
 impl Storable for Leader {
     type Key = [u8; 8];
     type Value = AlignedVec;
@@ -119,6 +141,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> Storable for MNotariza
 
     fn key(&self) -> Self::Key {
         self.block_hash
+    }
+
+    fn value(&self) -> Result<Self::Value> {
+        serialize_for_db(self)
+    }
+}
+
+impl Storable for Nullify {
+    type Key = [u8; 8];
+    type Value = AlignedVec;
+
+    fn key(&self) -> Self::Key {
+        self.view.to_le_bytes()
     }
 
     fn value(&self) -> Result<Self::Value> {

@@ -22,6 +22,7 @@ use crate::{
         peer::PeerSet,
         transaction::Transaction,
     },
+    storage::store::ConsensusStore,
 };
 
 // TODO: Add view progression logic
@@ -49,6 +50,12 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
     /// progressed to the next view.
     unfinalized_view_context: Option<ViewContext<N, F, M_SIZE>>,
 
+    /// The persistence storage for the consensus protocol
+    ///
+    /// This is used to persist the view contexts and the votes/nullifications/notarizations
+    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication protocol.
+    _persistence_storage: ConsensusStore,
+
     /// The set of peers in the consensus protocol.
     peers: PeerSet,
 
@@ -60,6 +67,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     pub fn new(
         config: ConsensusConfig,
         replica_id: PeerId,
+        persistence_storage: ConsensusStore,
         leader_manager: Box<dyn LeaderManager>,
     ) -> Result<Self> {
         let leader_id = leader_manager.leader_for_view(0)?.peer_id();
@@ -76,6 +84,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             leader_manager,
             current_view_context: view_context,
             unfinalized_view_context: None,
+            _persistence_storage: persistence_storage,
             peers,
             pending_txs: Vec::new(),
         })
@@ -83,7 +92,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
     /// Creates a new view progress manager from the genesis state. This is used
     /// to initialize the view progress manager when the consensus protocol starts.
-    pub fn from_genesis(config: ConsensusConfig, replica_id: PeerId) -> Result<Self> {
+    pub fn from_genesis(
+        config: ConsensusConfig,
+        replica_id: PeerId,
+        persistence_storage: ConsensusStore,
+    ) -> Result<Self> {
         let peers = PeerSet::new(
             config
                 .peers
@@ -119,6 +132,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             unfinalized_view_context: None,
             peers,
             pending_txs: Vec::new(),
+            _persistence_storage: persistence_storage,
         })
     }
 
@@ -193,6 +207,60 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     pub fn select_parent(&self) -> Option<[u8; blake3::OUT_LEN]> {
         todo!()
     }
+
+    // pub fn update_view(&mut self) -> Result<()> {
+    //     let new_leader = self
+    //         .leader_manager
+    //         .leader_for_view(self.current_view_context.view_number + 1)?;
+
+    //     if self.current_view_context.nullification.is_none()
+    //         && self.current_view_context.m_notarization.is_none()
+    //     {
+    //         return Err(anyhow::anyhow!(
+    //             "Cannot update current view to a new view without a nullification or m-notarization"
+    //         ));
+    //     }
+
+    //     if let Some(ref nullification) = self.current_view_context.nullification {
+    //         // Persist the nullified view to the persistence storage.
+    //         // self.persist_nullified_view(&self.current_view_context)?;
+
+    //         // Create a new view context for the next view.
+    //         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
+    //             nullification.view + 1,
+    //             new_leader.peer_id(),
+    //             self.current_view_context.replica_id,
+    //             self.current_view_context.parent_block_hash, // NOTE: No progress was made, use same parent
+    //         );
+    //         self.unfinalized_view_context = Some(self.current_view_context);
+
+    //         // Clear unfinalized view context on nullification
+    //         // (The nullified view is persisted and won't be finalized)
+    //         self.unfinalized_view_context = None;
+
+    //         // Progress to the next view (v := v + 1, reset state)
+    //         self.current_view_context = new_view_context;
+
+    //         return Ok(());
+    //     }
+
+    //     if let Some(ref current_view_m_notarization) = self.current_view_context.m_notarization {
+    //         // NOTE: This indicates that the view change has been triggered by a m-notarization.
+    //         // Therefore, the next view can consider the current view block hash as its parent block hash.
+    //         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
+    //             current_view_m_notarization.view + 1,
+    //             new_leader.peer_id(),
+    //             self.current_view_context.replica_id,
+    //             current_view_m_notarization.block_hash,
+    //         );
+    //         self.unfinalized_view_context = Some(self.current_view_context);
+    //         self.current_view_context = new_view_context;
+
+    //         return Ok(());
+    //     }
+
+    //     Ok(())
+    // }
 
     /// [`handle_block_proposal`] is called when the current replica receives a new block proposal,
     /// from the leader of the current view.
@@ -664,11 +732,21 @@ mod tests {
         )
     }
 
+    pub fn temp_db_path(suffix: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "consensus_store_test-{}-{}.redb",
+            suffix,
+            rand::random::<u64>()
+        ));
+        p.to_string_lossy().to_string()
+    }
+
     /// Creates a test view progress manager
     fn create_test_manager<const N: usize, const F: usize, const M_SIZE: usize>(
         setup: &TestSetup,
         replica_index: usize,
-    ) -> ViewProgressManager<N, F, M_SIZE> {
+    ) -> (ViewProgressManager<N, F, M_SIZE>, String) {
         let replica_id = setup.peer_set.sorted_peer_ids[replica_index];
         let mut peer_strs = Vec::with_capacity(setup.peer_set.sorted_peer_ids.len());
         for peer_id in &setup.peer_set.sorted_peer_ids {
@@ -684,18 +762,28 @@ mod tests {
             N,
             setup.peer_set.sorted_peer_ids.clone(),
         ));
-        ViewProgressManager::new(config, replica_id, leader_manager).unwrap()
+
+        let path = temp_db_path("view_manager");
+        let persistence_storage = ConsensusStore::open(&path).unwrap();
+        (
+            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
+                .unwrap(),
+            path,
+        )
     }
 
     #[test]
     fn test_new_creates_manager_with_correct_initial_state() {
         let setup = create_test_peer_setup(4);
-        let manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 0);
+        let (manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 0);
 
         assert_eq!(manager.current_view_context.view_number, 0);
         assert!(manager.unfinalized_view_context.is_none());
         assert_eq!(manager.peers.sorted_peer_ids.len(), 4);
         assert_eq!(manager.pending_txs.len(), 0);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -712,8 +800,10 @@ mod tests {
         }
         let config = create_test_config(4, 1, peer_strs);
 
+        let path = temp_db_path("view_manager");
+        let persistence_storage = ConsensusStore::open(&path).unwrap();
         let manager: ViewProgressManager<4, 1, 3> =
-            ViewProgressManager::from_genesis(config, replica_id).unwrap();
+            ViewProgressManager::from_genesis(config, replica_id, persistence_storage).unwrap();
 
         assert_eq!(manager.current_view_context.view_number, 0);
         assert!(manager.unfinalized_view_context.is_none());
@@ -723,17 +813,21 @@ mod tests {
     #[test]
     fn test_new_sets_correct_leader_for_view_zero() {
         let setup = create_test_peer_setup(4);
-        let manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         // For round-robin, view 0 should have leader at index 0
         let expected_leader = setup.peer_set.sorted_peer_ids[0];
         assert_eq!(manager.current_view_context.leader_id, expected_leader);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_add_transaction_increases_pending_txs() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 0);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 0);
 
         assert_eq!(manager.pending_txs.len(), 0);
 
@@ -742,24 +836,30 @@ mod tests {
 
         assert_eq!(manager.pending_txs.len(), 1);
         assert_eq!(manager.pending_txs[0], tx);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_add_multiple_transactions() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 0);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 0);
 
         for _ in 0..5 {
             manager.add_transaction(create_test_transaction());
         }
 
         assert_eq!(manager.pending_txs.len(), 5);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_block_proposal_for_current_view_returns_should_vote() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -777,12 +877,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldVote event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_block_proposal_for_future_view_returns_should_update_view() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         // Current view is 0, propose for view 5
         let leader_id = setup.peer_set.sorted_peer_ids[1]; // View 5 % 4 = 1
@@ -799,12 +902,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldUpdateView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_block_proposal_with_wrong_leader_returns_error() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         // View 0 should have leader at index 0, but we use index 1
         let wrong_leader = setup.peer_set.sorted_peer_ids[1];
@@ -813,12 +919,15 @@ mod tests {
 
         let result = manager.handle_block_proposal(block);
         assert!(result.is_err());
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_block_proposal_with_future_view_and_wrong_leader_returns_error() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         // View 5 should have leader at index 1, but we use index 0
         let wrong_leader = setup.peer_set.sorted_peer_ids[0];
@@ -827,12 +936,15 @@ mod tests {
 
         let result = manager.handle_block_proposal(block);
         assert!(result.is_err());
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_new_vote_for_current_view_without_block_hash_returns_await_event() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let block_hash = [1u8; blake3::OUT_LEN];
@@ -846,12 +958,15 @@ mod tests {
             ViewProgressEvent::Await => {}
             _ => panic!("Expected Await event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_new_vote_for_current_view_with_block_hash_returns_noop_event() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let block = create_test_block(0, leader_id, [0; blake3::OUT_LEN], 1);
@@ -868,12 +983,15 @@ mod tests {
             ViewProgressEvent::NoOp => {}
             _ => panic!("Expected Await event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_new_vote_for_future_view_returns_should_update_view() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[1]; // Leader for view 5
         let block_hash = [1u8; blake3::OUT_LEN];
@@ -889,12 +1007,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldUpdateView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_new_vote_with_wrong_leader_returns_error() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let wrong_leader = setup.peer_set.sorted_peer_ids[2];
         let block_hash = [1u8; blake3::OUT_LEN];
@@ -908,12 +1029,15 @@ mod tests {
                 .to_string()
                 .contains("is not the correct view leader")
         );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_new_vote_after_block_triggers_m_notarization() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -946,12 +1070,15 @@ mod tests {
                 }
             }
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_nullify_for_current_view_returns_no_op() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let nullify = create_test_nullify(2, 0, leader_id, &setup);
@@ -964,12 +1091,15 @@ mod tests {
             ViewProgressEvent::NoOp => {}
             _ => panic!("Expected NoOp event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_nullify_for_future_view_returns_should_update_view() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[1]; // Leader for view 5
         let nullify = create_test_nullify(2, 5, leader_id, &setup);
@@ -984,12 +1114,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldUpdateView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_nullify_triggers_broadcast_when_threshold_reached() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
 
@@ -1013,12 +1146,15 @@ mod tests {
                 }
             }
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_m_notarization_for_future_view_returns_should_update_view() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[5]; // Leader for view 5
         let block_hash = [1u8; blake3::OUT_LEN];
@@ -1042,12 +1178,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldUpdateView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_m_notarization_triggers_view_progress() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -1078,12 +1217,15 @@ mod tests {
             }
             _ => panic!("Expected ProgressToNextView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_nullification_for_future_view_returns_should_update_view() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[5]; // Leader for view 5
 
@@ -1105,12 +1247,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldUpdateView event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_nullification_for_current_view_returns_should_broadcast() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
 
@@ -1131,12 +1276,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldBroadcastNullification event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_process_consensus_msg_block_proposal() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -1150,12 +1298,15 @@ mod tests {
             ViewProgressEvent::ShouldVote { .. } => {}
             _ => panic!("Expected ShouldVote event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_process_consensus_msg_vote() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let block_hash = [1u8; blake3::OUT_LEN];
@@ -1169,12 +1320,15 @@ mod tests {
             ViewProgressEvent::Await => {}
             _ => panic!("Expected Await event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_process_consensus_msg_nullify() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let nullify = create_test_nullify(2, 0, leader_id, &setup);
@@ -1187,12 +1341,15 @@ mod tests {
             ViewProgressEvent::NoOp => {}
             _ => panic!("Expected NoOp event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_tick_when_non_leader_and_has_block_should_vote() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -1215,12 +1372,15 @@ mod tests {
             }
             _ => panic!("Expected ShouldVote event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_tick_when_already_voted_returns_no_op() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         manager.current_view_context.has_voted = true;
 
@@ -1231,12 +1391,15 @@ mod tests {
             ViewProgressEvent::NoOp => {}
             _ => panic!("Expected NoOp event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_tick_when_already_nullified_returns_no_op() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         manager.current_view_context.has_nullified = true;
 
@@ -1247,12 +1410,15 @@ mod tests {
             ViewProgressEvent::NoOp => {}
             _ => panic!("Expected NoOp event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_tick_without_block_returns_await() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         manager.current_view_context.has_voted = false;
         manager.current_view_context.has_nullified = false;
@@ -1265,12 +1431,15 @@ mod tests {
             ViewProgressEvent::Await => {}
             _ => panic!("Expected Await event"),
         }
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_vote_for_old_view_returns_error() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         // Manually advance to view 5
         manager.current_view_context.view_number = 5;
@@ -1288,12 +1457,15 @@ mod tests {
                 .to_string()
                 .contains("is not the current view")
         );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_multiple_block_proposals_for_same_view_returns_error() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -1309,12 +1481,15 @@ mod tests {
         let result2 = manager.handle_block_proposal(block2);
         assert!(result2.is_err());
         assert!(result2.unwrap_err().to_string().contains("already exists"));
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_handle_block_proposal_with_wrong_parent_hash_returns_error() {
         let setup = create_test_peer_setup(4);
-        let mut manager: ViewProgressManager<4, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let wrong_parent_hash = [99u8; blake3::OUT_LEN];
@@ -1328,12 +1503,15 @@ mod tests {
                 .to_string()
                 .contains("parent block hash")
         );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn test_concurrent_votes_and_block_proposal() {
         let setup = create_test_peer_setup(6);
-        let mut manager: ViewProgressManager<6, 1, 3> = create_test_manager(&setup, 1);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
 
         let leader_id = setup.peer_set.sorted_peer_ids[0];
         let parent_hash = [0; blake3::OUT_LEN];
@@ -1354,5 +1532,7 @@ mod tests {
         // Votes should have been moved to verified set
         assert_eq!(manager.current_view_context.votes.len(), 2);
         assert_eq!(manager.current_view_context.non_verified_votes.len(), 0);
+
+        std::fs::remove_file(path).unwrap();
     }
 }

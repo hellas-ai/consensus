@@ -10,31 +10,19 @@ use crate::crypto::aggregated::PeerId;
 pub struct Leader {
     /// The leader's BlsPublicKey
     pub peer_id: PeerId,
-    /// Whether the leader is currently active
-    pub is_current: bool,
     /// The view number
     pub view: u64,
 }
 
 impl Leader {
-    pub fn new(peer_id: PeerId, is_current: bool, view: u64) -> Self {
-        Self {
-            peer_id,
-            is_current,
-            view,
-        }
+    pub fn new(peer_id: PeerId, view: u64) -> Self {
+        Self { peer_id, view }
     }
 
     /// Returns the leader's BlsPublicKey
     #[inline]
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
-    }
-
-    /// Returns whether the leader is currently active
-    #[inline]
-    pub fn is_current(&self) -> bool {
-        self.is_current
     }
 
     /// Returns the view number
