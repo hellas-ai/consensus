@@ -576,7 +576,7 @@ mod tests {
     struct TestSetup {
         peer_set: PeerSet,
         peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
-        _temp_dir: TempDir,
+        temp_dir: TempDir,
         storage: ConsensusStore,
     }
 
@@ -604,7 +604,7 @@ mod tests {
             Self {
                 peer_set,
                 peer_id_to_secret_key,
-                _temp_dir: temp_dir,
+                temp_dir,
                 storage,
             }
         }
@@ -741,6 +741,8 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 1);
         assert_eq!(view_chain.unfinalized_count(), 1);
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=1);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -756,6 +758,8 @@ mod tests {
 
         assert_eq!(view_chain.current().view_number, 5);
         assert_eq!(view_chain.current().leader_id, leader_id);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -777,6 +781,17 @@ mod tests {
         let result = view_chain.route_vote(vote, &setup.peer_set);
 
         assert!(result.is_ok());
+        let votes_result = result.unwrap();
+        assert!(!votes_result.should_await);
+        assert!(!votes_result.is_enough_to_m_notarize);
+        assert!(!votes_result.is_enough_to_finalize);
+
+        assert_eq!(view_chain.current_view_number(), 1);
+        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=1);
+        assert_eq!(view_chain.current().votes.len(), 1);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -812,6 +827,38 @@ mod tests {
         let result = view_chain.route_vote(late_vote, &setup.peer_set);
 
         assert!(result.is_ok());
+
+        let votes_result = result.unwrap();
+        assert!(!votes_result.should_await);
+        assert!(votes_result.is_enough_to_m_notarize);
+        assert!(votes_result.is_enough_to_finalize);
+
+        assert_eq!(view_chain.current_view_number(), 2);
+        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=2);
+        assert_eq!(
+            view_chain.non_finalized_views.get(&1).unwrap().votes.len(),
+            4
+        );
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&1)
+                .unwrap()
+                .m_notarization
+                .is_some()
+        );
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&1)
+                .unwrap()
+                .nullification
+                .is_none()
+        );
+        assert_eq!(view_chain.current().votes.len(), 0);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -830,6 +877,8 @@ mod tests {
         let result = view_chain.route_vote(vote, &setup.peer_set);
 
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -848,6 +897,48 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
+
+        assert_eq!(view_chain.current_view_number(), 1);
+        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=1);
+        assert_eq!(view_chain.current().votes.len(), 0);
+
+        assert!(view_chain.current().m_notarization.is_none());
+
+        assert_eq!(view_chain.current().nullify_messages.len(), 1);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_route_nullifiers_to_nullification_in_current_view() {
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [4u8; blake3::OUT_LEN];
+
+        let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+
+        for i in 0..M_SIZE {
+            let nullify = create_nullify(i, 1, leader_id, &setup);
+            let result = view_chain.route_nullify(nullify.clone(), &setup.peer_set);
+            assert!(result.is_ok());
+        }
+
+        assert_eq!(view_chain.current_view_number(), 1);
+        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=1);
+        assert_eq!(view_chain.current().votes.len(), 0);
+
+        assert!(view_chain.current().m_notarization.is_none());
+
+        assert_eq!(view_chain.current().nullify_messages.len(), M_SIZE);
+
+        assert!(view_chain.current().nullification.is_some());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -881,6 +972,26 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 2);
         assert_eq!(view_chain.unfinalized_count(), 2);
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=2);
+        assert_eq!(view_chain.current().votes.len(), 0);
+
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&1)
+                .unwrap()
+                .m_notarization
+                .is_some()
+        );
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&2)
+                .unwrap()
+                .m_notarization
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -899,6 +1010,8 @@ mod tests {
         let result = view_chain.progress_with_m_notarization(ctx_v2);
 
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -928,6 +1041,8 @@ mod tests {
         let result = view_chain.progress_with_m_notarization(ctx_v5);
 
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -975,6 +1090,33 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 3);
         assert_eq!(view_chain.unfinalized_count(), 3);
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=3);
+
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&1)
+                .unwrap()
+                .m_notarization
+                .is_some()
+        );
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&2)
+                .unwrap()
+                .m_notarization
+                .is_some()
+        );
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&3)
+                .unwrap()
+                .m_notarization
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1013,6 +1155,20 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 2);
         assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 2..=2);
+
+        assert!(!view_chain.non_finalized_views.contains_key(&1));
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&2)
+                .unwrap()
+                .nullification
+                .is_none()
+        );
+        assert_eq!(view_chain.current().nullify_messages.len(), 0);
+        assert!(view_chain.current().nullification.is_none());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1031,11 +1187,9 @@ mod tests {
         let result = view_chain.progress_with_nullification(ctx_v2, &setup.peer_set);
 
         assert!(result.is_err());
-    }
 
-    // ============================================================================
-    // Progress with L-Notarization Tests (Finalizing)
-    // ============================================================================
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
 
     #[test]
     fn test_progress_with_l_notarization_success() {
@@ -1059,6 +1213,8 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(view_chain.current_view_number(), 2);
         assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1080,11 +1236,9 @@ mod tests {
         let result = view_chain.progress_with_l_notarization(ctx_v2, &setup.peer_set);
 
         assert!(result.is_err());
-    }
 
-    // ============================================================================
-    // Finalize Past Views Tests
-    // ============================================================================
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
 
     #[test]
     fn test_finalize_past_view_with_nullification() {
@@ -1138,6 +1292,8 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1171,6 +1327,8 @@ mod tests {
         let result = view_chain.finalize_with_nullification(1, &setup.peer_set);
 
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1211,11 +1369,30 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
-    }
+        assert_eq!(view_chain.current_view_number(), 2);
+        assert_eq!(view_chain.current().votes.len(), 0);
+        assert_eq!(view_chain.current().nullify_messages.len(), 0);
 
-    // ============================================================================
-    // Invariant Tests
-    // ============================================================================
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&2)
+                .unwrap()
+                .m_notarization
+                .is_none()
+        );
+
+        assert!(
+            view_chain
+                .non_finalized_views
+                .get(&2)
+                .unwrap()
+                .nullification
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
 
     #[test]
     fn test_consecutive_views_invariant() {
@@ -1264,6 +1441,28 @@ mod tests {
             ctx.add_m_notarization(m_not, &setup.peer_set).unwrap();
 
             view_chain.progress_with_m_notarization(ctx).unwrap();
+
+            assert_eq!(view_chain.current_view_number(), view_num);
+            assert_eq!(view_chain.unfinalized_count(), view_num as usize);
+            assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=view_num);
+            assert_eq!(view_chain.current().votes.len(), M_SIZE);
+            assert_eq!(view_chain.current().nullify_messages.len(), 0);
+            assert!(
+                view_chain
+                    .non_finalized_views
+                    .get(&view_num)
+                    .unwrap()
+                    .m_notarization
+                    .is_some()
+            );
+            assert!(
+                view_chain
+                    .non_finalized_views
+                    .get(&view_num)
+                    .unwrap()
+                    .nullification
+                    .is_none()
+            );
         }
 
         // Check that all views are consecutive
@@ -1275,6 +1474,8 @@ mod tests {
         for view_num in 1..=5 {
             assert!(view_chain.non_finalized_views.contains_key(&view_num));
         }
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1328,6 +1529,8 @@ mod tests {
 
         // This should panic because we're trying to finalize view 2 without finalizing view 1
         view_chain.check_finalization_invariant(2);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1368,6 +1571,8 @@ mod tests {
 
         // Verify current view (2) doesn't have m-notarization yet
         assert!(view_chain.current().m_notarization.is_none());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1384,6 +1589,8 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 1);
         assert_eq!(view_chain.unfinalized_count(), 1);
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 1..=1);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 
     #[test]
@@ -1412,5 +1619,7 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v11).unwrap();
 
         assert_eq!(view_chain.unfinalized_view_numbers_range(), 10..=11);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 }
