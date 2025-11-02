@@ -48,6 +48,10 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The block received by the current view's leader for the current view (if any).
     pub block: Option<Block>,
 
+    /// The number of received invalid votes for the current view's block. That is,
+    /// votes for a different block hash than the block hash received by the leader.
+    pub num_invalid_votes: usize,
+
     /// Received votes for the current view's block
     pub votes: HashSet<Vote>,
 
@@ -65,9 +69,13 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// A nullification for the current view (if any)
     pub nullification: Option<Nullification<N, F, M_SIZE>>,
+
+    /// Pending block proposal awaiting parent notarization
+    pub pending_block: Option<Block>,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SIZE> {
+    /// Creates a new [`ViewContext`] instance
     pub fn new(
         view_number: u64,
         leader_id: PeerId,
@@ -78,6 +86,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             view_number,
             block: None,
             votes: HashSet::new(),
+            num_invalid_votes: 0,
             replica_id,
             m_notarization: None,
             non_verified_m_notarization: None,
@@ -91,6 +100,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             has_nullified: false,
             has_proposed: false,
             leader_id,
+            pending_block: None,
         }
     }
 
@@ -170,6 +180,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             block_hash,
             is_enough_to_m_notarize,
             is_enough_to_finalize,
+            should_await: false,
         })
     }
 
@@ -230,17 +241,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 should_await: true,
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
+                should_nullify: false,
             });
         }
 
         let block_hash = self.block_hash.unwrap();
 
         if vote.block_hash != block_hash {
-            return Err(anyhow::anyhow!(
-                "Vote for block hash {} is not the block hash for the current view {}",
-                hex::encode(vote.block_hash),
-                hex::encode(block_hash)
-            ));
+            self.num_invalid_votes += 1;
+            let should_nullify = self.num_invalid_votes > 2 * F;
+            return Ok(CollectedVotesResult {
+                should_await: false,
+                is_enough_to_m_notarize: false,
+                is_enough_to_finalize: false,
+                should_nullify,
+            });
         }
 
         self.votes.insert(vote);
@@ -266,6 +281,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             should_await: false,
             is_enough_to_m_notarize,
             is_enough_to_finalize,
+            should_nullify: false,
         })
     }
 
@@ -384,12 +400,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             }
             return Ok(ShouldMNotarize {
                 should_notarize: false,
-                should_await: true,
+                should_await: false,
+                should_vote: true,
+                should_nullify: false,
             });
         }
 
         let block_hash = self.block_hash.unwrap();
         if m_notarization.block_hash != block_hash {
+            // We should nullify the current view if there the current view receives a M-notarization
+            // that is not consistent with the received block hash
             return Err(anyhow::anyhow!(
                 "M-notarization for block hash {} is not the block hash for the current view {}",
                 hex::encode(m_notarization.block_hash),
@@ -402,6 +422,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             return Ok(ShouldMNotarize {
                 should_notarize: false,
                 should_await: false,
+                should_vote: false,
+                should_nullify: false,
             });
         }
 
@@ -410,6 +432,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         Ok(ShouldMNotarize {
             should_notarize: true,
             should_await: false,
+            should_vote: false,
+            should_nullify: false,
         })
     }
 
@@ -497,6 +521,9 @@ pub struct LeaderProposalResult {
     pub is_enough_to_m_notarize: bool,
     /// Whether the current replica has collected enough votes to finalize the view
     pub is_enough_to_finalize: bool,
+    /// Whether the current replica should await for the current view's leader
+    /// proposed block to be finalized before voting for it
+    pub should_await: bool,
 }
 
 /// [`CollectedVotesResult`] is the result of collecting votes for the current view's block.
@@ -509,6 +536,9 @@ pub struct CollectedVotesResult {
     pub is_enough_to_m_notarize: bool,
     /// Whether the current replica has collected enough votes to finalize the view
     pub is_enough_to_finalize: bool,
+    /// Whether the current replica should nullify the current view, after receiving enough invalid votes,
+    /// that is, strictly more than 2 * F invalid votes.
+    pub should_nullify: bool,
 }
 
 /// [`ShouldMNotarize`] is the result of processing a newly received m-notarization for the current view.
@@ -518,6 +548,12 @@ pub struct ShouldMNotarize {
     pub should_notarize: bool,
     /// Whether the current replica should finalize the current view
     pub should_await: bool,
+    /// If the current replica should vote for the M-notarization block hash,
+    /// in case it hasn't voted yet and hasn't received a block proposal from the leader (yet)
+    pub should_vote: bool,
+    /// In case the replica receives a M-notarization for a different block hash than that
+    /// of the leader proposed block, it should broadcast a nullify block
+    pub should_nullify: bool,
 }
 
 /// [`CollectedNullificationsResult`] is the result of collecting nullifications for the current view.

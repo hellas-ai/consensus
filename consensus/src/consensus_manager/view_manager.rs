@@ -298,6 +298,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             block_hash,
             is_enough_to_m_notarize,
             is_enough_to_finalize,
+            should_await,
         } = self.current_view_context.add_new_view_block(block)?;
 
         if is_enough_to_m_notarize {
@@ -351,6 +352,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 should_await,
                 is_enough_to_m_notarize,
                 is_enough_to_finalize,
+                should_nullify,
             } = self.current_view_context.add_vote(vote, &self.peers)?;
             if should_await {
                 return Ok(ViewProgressEvent::Await);
@@ -376,6 +378,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                     should_await,
                     is_enough_to_m_notarize,
                     is_enough_to_finalize,
+                    should_nullify,
                 } = unfinalized_view_context.add_vote(vote, &self.peers)?;
                 if should_await {
                     return Ok(ViewProgressEvent::Await);
@@ -479,6 +482,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             let ShouldMNotarize {
                 should_notarize,
                 should_await,
+                should_vote,
+                should_nullify,
             } = self
                 .current_view_context
                 .add_m_notarization(m_notarization, &self.peers)?;
