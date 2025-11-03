@@ -229,7 +229,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_await: true,
-                should_vote: false, // We don't vote for the block yet, as we are awaiting the parent to be notarized
+                should_vote: false, /* We don't vote for the block yet, as we are awaiting the
+                                     * parent to be notarized */
             });
         }
 
@@ -407,24 +408,84 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// Finalizes a view with a l-notarization. Since l-notarizations are finalizing events
     /// we remove the view from the `non_finalized_views` map and persist the finalized view to the
     /// persistence storage.
-    ///
-    /// This method should ONLY be called for a `view_number` that is NOT the current view,
-    /// otherwise the caller should instead call the `progress_with_l_notarization` method.
     pub fn finalize_with_l_notarization(
         &mut self,
         finalized_view: u64,
         peers: &PeerSet,
     ) -> Result<()> {
         // 1. Check that the view number is not the current view.
-        if self.current_view == finalized_view {
+        if finalized_view > self.current_view {
             return Err(anyhow::anyhow!(
-                "View number {} is the current view, use the `progress_with_l_notarization` method instead",
+                "View number {} is not greater than the current view {}, cannot finalize views in the future",
+                finalized_view,
+                self.current_view,
+            ));
+        }
+
+        // 2. Get the context for the finalized view
+        let finalized_ctx =
+            self.non_finalized_views
+                .get(&finalized_view)
+                .ok_or(anyhow::anyhow!(
+                    "View number {} is not an non-finalized view",
+                    finalized_view
+                ))?;
+
+        // 3. Check that finalized view has L-notarization
+        if finalized_ctx.votes.len() < N - F {
+            return Err(anyhow::anyhow!(
+                "View number {} has not received a l-notarization",
                 finalized_view
             ));
         }
 
-        // 3. Persist the finalized view to the persistence storage, and remove the view from the
-        //    `non_finalized_views` map.
+        // 4. Find the parent view (the view the finalized block builds on)
+        let parent_hash = finalized_ctx
+            .block
+            .as_ref()
+            .ok_or(anyhow::anyhow!("Finalized view has no block"))?
+            .parent_block_hash();
+
+        let parent_view = self.find_parent_view(&parent_hash);
+
+        // 5. Validate the chain structure
+        if let Some(parent_view_number) = parent_view {
+            let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
+
+            // Parent must have M-notarization
+            if parent_ctx.m_notarization.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Parent view {} does not have M-notarization, cannot finalize view {}",
+                    parent_view_number,
+                    finalized_view
+                ));
+            }
+
+            if parent_ctx.view_number >= finalized_view {
+                return Err(anyhow::anyhow!(
+                    "Parent view {} is more recent than the finalized view {}, cannot finalize view {}",
+                    parent_view_number,
+                    finalized_view,
+                    finalized_view
+                ));
+            }
+
+            // All intermediate views must be nullified
+            for intermediate_view in (parent_view_number + 1)..finalized_view {
+                if let Some(inter_ctx) = self.non_finalized_views.get(&intermediate_view) {
+                    if inter_ctx.nullification.is_none() {
+                        return Err(anyhow::anyhow!(
+                            "Intermediate view {} between parent {} and finalized {} is not nullified",
+                            intermediate_view,
+                            parent_view_number,
+                            finalized_view
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 6. Persist all views from oldest to finalized
         let to_persist_range =
             self.non_finalized_views_until(finalized_view)
                 .ok_or(anyhow::anyhow!(
@@ -433,23 +494,46 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ))?;
 
         for view_number in to_persist_range {
-            let ctx = self.non_finalized_views.remove(&view_number).unwrap_or_else(|| panic!(
-                "View number {view_number} should be present in the non_finalized_views map",
-            ));
+            let ctx = self.non_finalized_views.remove(&view_number).unwrap();
+
             if view_number == finalized_view {
-                // 4. Check that the view has indeed received a l-notarization.
-                if ctx.votes.len() < N - F {
-                    return Err(anyhow::anyhow!(
-                        "View number {} has not received a l-notarization, but the view has been finalized with a l-notarization",
-                        finalized_view
-                    ));
-                }
+                // The view being finalized
                 self.previously_committed_block_hash = ctx.block_hash.unwrap();
                 self.persist_l_notarized_view(&ctx, peers)?;
+            } else if let Some(parent_view_number) = parent_view {
+                if view_number == parent_view_number {
+                    // The parent view - can be M-notarized or L-notarized
+                    if ctx.votes.len() >= N - F {
+                        // Has L-notarization too
+                        self.previously_committed_block_hash = ctx.block_hash.unwrap();
+                        self.persist_l_notarized_view(&ctx, peers)?;
+                    } else {
+                        // Only M-notarized
+                        self.persist_m_notarized_view(&ctx, peers)?;
+                    }
+                } else if view_number > parent_view_number {
+                    // Intermediate view - must be nullified (already validated above)
+                    self.persist_nullified_view(&ctx, peers)?;
+                } else {
+                    // View before parent - could be part of an earlier chain
+                    // These should have been finalized in a previous call or be nullified
+                    if ctx.nullification.is_some() {
+                        self.persist_nullified_view(&ctx, peers)?;
+                    } else if ctx.votes.len() >= N - F {
+                        self.previously_committed_block_hash = ctx.block_hash.unwrap();
+                        self.persist_l_notarized_view(&ctx, peers)?;
+                    } else {
+                        // M-notarized view from an earlier chain
+                        self.persist_m_notarized_view(&ctx, peers)?;
+                    }
+                }
             } else {
+                // Parent not in non-finalized views (already finalized)
+                // These are intermediate nullified views
                 if ctx.nullification.is_none() {
                     return Err(anyhow::anyhow!(
-                        "View number {view_number} has no nullification, but we are finalizing a more recent view {finalized_view}",
+                        "View {} has no nullification but parent is already finalized",
+                        view_number
                     ));
                 }
                 self.persist_nullified_view(&ctx, peers)?;
@@ -502,6 +586,55 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_storage.put_view(&view)?;
 
         // 5. Persist the votes for the view
+        for vote in ctx.votes.iter() {
+            self.persistence_storage.put_vote(vote)?;
+        }
+
+        Ok(())
+    }
+
+    /// Persists a m-notarized view to the persistence storage.
+    fn persist_m_notarized_view(
+        &self,
+        ctx: &ViewContext<N, F, M_SIZE>,
+        peers: &PeerSet,
+    ) -> Result<()> {
+        let view_number = ctx.view_number;
+
+        // 1. Persist both the block with `is_finalized` set to true, and the transactions
+        //    associated with the block.
+        if let Some(ref block) = ctx.block {
+            for tx in block.transactions.iter() {
+                self.persistence_storage.put_transaction(tx)?;
+
+                // TODO: Handle account creation as well.
+            }
+            self.persistence_storage.put_finalized_block(block)?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "View number {view_number} has no block, but the view has been finalized with a l-notarization"
+            ));
+        }
+
+        // Persist the M-notarization
+        if let Some(ref m_notarization) = ctx.m_notarization {
+            self.persistence_storage.put_notarization(m_notarization)?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "View number {view_number} has no m-notarization"
+            ));
+        }
+
+        // Persist leader and view metadata
+        let leader_id = ctx.leader_id;
+        let leader = Leader::new(leader_id, view_number);
+        self.persistence_storage.put_leader(&leader)?;
+
+        let leader_pk = peers.id_to_public_key.get(&leader_id).unwrap();
+        let view = View::new(view_number, leader_pk.clone(), false, false); // Not finalized
+        self.persistence_storage.put_view(&view)?;
+
+        // Persist the votes
         for vote in ctx.votes.iter() {
             self.persistence_storage.put_vote(vote)?;
         }
@@ -885,7 +1018,7 @@ mod tests {
 
         let votes_result = result.unwrap();
         assert!(!votes_result.should_await);
-        assert!(votes_result.is_enough_to_m_notarize);
+        assert!(!votes_result.is_enough_to_m_notarize); // M-notarization already exists, so we don't need to create it again
         assert!(votes_result.is_enough_to_finalize);
 
         assert_eq!(view_chain.current_view_number(), 2);
@@ -1208,10 +1341,10 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(view_chain.current_view_number(), 2);
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
-        assert_eq!(view_chain.non_finalized_view_numbers_range(), 2..=2);
+        assert_eq!(view_chain.unfinalized_count(), 2); // Both view 1 (nullified) and view 2 remain
+        assert!(view_chain.non_finalized_views.contains_key(&1));
+        assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=2);
 
-        assert!(!view_chain.non_finalized_views.contains_key(&1));
         assert!(
             view_chain
                 .non_finalized_views
@@ -1479,6 +1612,817 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v11).unwrap();
 
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 10..=11);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_m_notarization_does_not_finalize_blocks() {
+        // CRITICAL: M-notarization causes view progression but NOT finalization
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [20u8; blake3::OUT_LEN];
+
+        // Create view 1 with M-notarization (but not L-notarization)
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+
+        let votes: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_notarization, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // ASSERT: View 1 is still unfinalized (M-notarization does NOT finalize)
+        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert!(view_chain.non_finalized_views.contains_key(&1));
+
+        // View 1 block should NOT be marked as finalized
+        assert!(
+            !view_chain
+                .non_finalized_views
+                .get(&1)
+                .unwrap()
+                .block
+                .as_ref()
+                .unwrap()
+                .is_finalized
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_only_l_notarization_finalizes_blocks() {
+        // CRITICAL: Only L-notarization (n-f votes) can finalize blocks
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [21u8; blake3::OUT_LEN];
+
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+
+        // Add M-notarization (2f+1 = 3 votes)
+        let votes_m: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not = create_m_notarization(&votes_m, 1, block_hash_v1, leader_id);
+        ctx_v1.add_m_notarization(m_not, &setup.peer_set).unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // View 1 still unfinalized with only M-notarization
+        assert_eq!(view_chain.unfinalized_count(), 2);
+
+        // Now add votes to reach L-notarization threshold (n-f = 4 votes total)
+        let vote_4 = create_vote(3, 1, block_hash_v1, leader_id, &setup);
+        view_chain.route_vote(vote_4, &setup.peer_set).unwrap();
+
+        // View 1 still unfinalized until we explicitly finalize
+        assert_eq!(view_chain.unfinalized_count(), 2);
+
+        // Now finalize with L-notarization
+        let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
+        assert!(result.is_ok());
+
+        // After L-notarization, view 1 is removed (finalized)
+        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert!(!view_chain.non_finalized_views.contains_key(&1));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_nullified_view_remains_until_next_view_l_notarized() {
+        // Per Minimit: Nullified views stay in chain until a later view is L-notarized
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [22u8; blake3::OUT_LEN];
+
+        // View 1: Nullified
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let nullifies_v1: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .collect();
+        for nullify in nullifies_v1.iter() {
+            ctx_v1
+                .add_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification_v1 = create_nullification(&nullifies_v1, 1, leader_id);
+        ctx_v1
+            .add_nullification(nullification_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2 with nullification
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
+        view_chain.progress_with_nullification(ctx_v2).unwrap();
+
+        // CRITICAL: View 1 should STILL be in chain (nullification doesn't remove it)
+        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert!(view_chain.non_finalized_views.contains_key(&1));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_block_proposal_awaits_parent_m_notarization() {
+        // Per Minimit: When child proposal arrives before parent M-notarization,
+        // it should be marked as pending and processed later
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [23u8; blake3::OUT_LEN];
+
+        // View 1: Block proposed with only 2 votes (not enough for M-notarization yet)
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block_v1 = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash_v1 = block_v1.get_hash();
+        ctx_v1.add_new_view_block(block_v1).unwrap();
+
+        // Add 2 votes (not enough for M-notarization which needs 3)
+        for i in 0..2 {
+            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        // View 1 has NO M-notarization yet
+        assert!(ctx_v1.m_notarization.is_none());
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Manually create view 2 context (simulating view progression via nullification)
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
+
+        // Add nullification to view 1 so we can progress
+        let nullifies: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .collect();
+        for nullify in nullifies.iter() {
+            view_chain
+                .route_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification = create_nullification(&nullifies, 1, leader_id);
+        view_chain
+            .route_nullification(nullification, &setup.peer_set)
+            .unwrap();
+
+        view_chain.progress_with_nullification(ctx_v2).unwrap();
+
+        // Now try to propose a block for view 2 building on view 1
+        // This should FAIL because view 1 was nullified
+        let block_v2 = create_test_block(2, leader_id, block_hash_v1, 2);
+        let result = view_chain.add_block_proposal(2, block_v2);
+
+        // Should fail - cannot build on nullified parent
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nullified"));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_waits_for_parent_m_notarization() {
+        // Test the pending block mechanism: child arrives before parent M-notarization
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [29u8; blake3::OUT_LEN];
+
+        // View 1: Block with votes but M-notarization arrives separately
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block_v1 = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash_v1 = block_v1.get_hash();
+        ctx_v1.add_new_view_block(block_v1).unwrap();
+
+        // Add 2 votes (not enough for M-notarization)
+        for i in 0..2 {
+            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Simulate early M-notarization arrival (out of order network)
+        // Create M-notarization
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        view_chain
+            .route_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Add nullification to view 2 using route_nullify (routes to correct view)
+        let nullifies_v2: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .collect();
+        for nullify in nullifies_v2.iter() {
+            view_chain
+                .route_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification_v2 = create_nullification(&nullifies_v2, 2, leader_id);
+        view_chain
+            .route_nullification(nullification_v2, &setup.peer_set)
+            .unwrap();
+
+        // Progress to view 3
+        let ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_nullification(ctx_v3).unwrap();
+
+        // Now propose block for view 3 building on view 1 (which has M-notarization)
+        // This should succeed because:
+        // - Parent (view 1) has M-notarization
+        // - Intermediate view (view 2) is nullified
+        let block_v3 = create_test_block(3, leader_id, block_hash_v1, 2);
+        let result = view_chain.add_block_proposal(3, block_v3);
+
+        assert!(result.is_ok());
+        let proposal_result = result.unwrap();
+        assert!(!proposal_result.should_await);
+        assert!(proposal_result.should_vote);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_process_pending_child_proposals_after_m_notarization() {
+        // When parent gets M-notarization, pending child blocks should be processed
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [24u8; blake3::OUT_LEN];
+
+        // View 1: Block with M-notarization
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2 WITHOUT M-notarization (nullified)
+        let nullifies: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .collect();
+
+        let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        for nullify in nullifies.iter() {
+            ctx_v2
+                .add_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification_v2 = create_nullification(&nullifies, 2, leader_id);
+        ctx_v2
+            .add_nullification(nullification_v2, &setup.peer_set)
+            .unwrap();
+
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Progress to view 3
+        let ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_nullification(ctx_v3).unwrap();
+
+        // Propose block for view 3 building on view 1 (skipping nullified view 2)
+        let block_v3 = create_test_block(3, leader_id, block_hash_v1, 2);
+        let result = view_chain.add_block_proposal(3, block_v3.clone());
+
+        // Should succeed since parent (view 1) has M-notarization and view 2 is nullified
+        assert!(result.is_ok());
+        assert!(!result.unwrap().should_await);
+        assert!(view_chain.current().block.is_some());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_route_m_notarization() {
+        // Test routing M-notarization to appropriate view
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [25u8; blake3::OUT_LEN];
+
+        let mut ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash = block.get_hash();
+        ctx.add_new_view_block(block).unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+
+        // Create M-notarization
+        let mut votes = HashSet::new();
+        for i in 0..M_SIZE {
+            let vote = create_vote(i, 1, block_hash, leader_id, &setup);
+            votes.insert(vote);
+        }
+        let m_notarization = create_m_notarization(&votes, 1, block_hash, leader_id);
+
+        // Route M-notarization
+        let result = view_chain.route_m_notarization(m_notarization, &setup.peer_set);
+
+        assert!(result.is_ok());
+        let should_m_notarize = result.unwrap();
+        assert!(should_m_notarize.should_notarize);
+        assert!(view_chain.current().m_notarization.is_some());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalization_persists_intermediate_nullified_views() {
+        // When finalizing view N, all intermediate nullified views should be persisted
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [26u8; blake3::OUT_LEN];
+
+        // View 1: M-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // View 2: Nullified
+        let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        let nullifies_v2: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .collect();
+        for nullify in nullifies_v2.iter() {
+            ctx_v2
+                .add_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification_v2 = create_nullification(&nullifies_v2, 2, leader_id);
+        ctx_v2
+            .add_nullification(nullification_v2, &setup.peer_set)
+            .unwrap();
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // View 3: M-notarized and will be L-notarized
+        let mut ctx_v3 =
+            create_view_context_with_votes(3, leader_id, replica_id, block_hash_v1, M_SIZE, &setup);
+        let block_hash_v3 = ctx_v3.block.as_ref().unwrap().get_hash();
+        let votes_v3: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .collect();
+        let m_not_v3 = create_m_notarization(&votes_v3, 3, block_hash_v3, leader_id);
+        ctx_v3
+            .add_m_notarization(m_not_v3, &setup.peer_set)
+            .unwrap();
+        view_chain.progress_with_nullification(ctx_v3).unwrap();
+
+        // Add votes to view 3 for L-notarization
+        for i in M_SIZE..(N - F) {
+            let vote = create_vote(i, 3, block_hash_v3, leader_id, &setup);
+            view_chain.route_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        // View 4: Current
+        let ctx_v4 = ViewContext::new(4, leader_id, replica_id, block_hash_v3);
+        view_chain.progress_with_m_notarization(ctx_v4).unwrap();
+
+        // Finalize view 3
+        let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
+
+        // Should succeed and persist view 1, view 2 (nullified), and view 3 (finalized)
+        result.unwrap();
+        // assert!(result.is_ok());
+        // assert_eq!(view_chain.unfinalized_count(), 1); // Only view 4 remains
+        // assert!(!view_chain.non_finalized_views.contains_key(&1));
+        // assert!(!view_chain.non_finalized_views.contains_key(&2));
+        // assert!(!view_chain.non_finalized_views.contains_key(&3));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_block_proposal_requires_intermediate_nullifications() {
+        // Per Minimit: Can only vote for block if intermediate views are nullified
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [27u8; blake3::OUT_LEN];
+
+        // View 1: M-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // View 2: NOT nullified (just progressed somehow - simulate this)
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        // Manually insert without nullification (simulating error scenario)
+        view_chain.current_view = 2;
+        view_chain.non_finalized_views.insert(2, ctx_v2);
+
+        // View 3: Current
+        let ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v1);
+        view_chain.current_view = 3;
+        view_chain.non_finalized_views.insert(3, ctx_v3);
+
+        // Try to propose block for view 3 building on view 1
+        // Should FAIL because view 2 (intermediate) is not nullified
+        let block_v3 = create_test_block(3, leader_id, block_hash_v1, 2);
+        let result = view_chain.add_block_proposal(3, block_v3);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not nullified"));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_block_proposal_rejects_nullified_parent() {
+        // Cannot build on a nullified parent
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [28u8; blake3::OUT_LEN];
+
+        // View 1: Nullified
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block_v1 = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash_v1 = block_v1.get_hash();
+        ctx_v1.add_new_view_block(block_v1).unwrap();
+
+        let nullifies: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .collect();
+        for nullify in nullifies.iter() {
+            ctx_v1
+                .add_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification = create_nullification(&nullifies, 1, leader_id);
+        ctx_v1
+            .add_nullification(nullification, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
+        view_chain.progress_with_nullification(ctx_v2).unwrap();
+
+        // Try to propose block for view 2 building on nullified view 1
+        let block_v2 = create_test_block(2, leader_id, block_hash_v1, 2);
+        let result = view_chain.add_block_proposal(2, block_v2);
+
+        // Should FAIL - cannot build on nullified parent
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nullified"));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalize_fails_if_parent_lacks_m_notarization() {
+        // Error case: Parent view has no M-notarization
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [30u8; blake3::OUT_LEN];
+
+        // View 1: Block but NO M-notarization
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block_v1 = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash_v1 = block_v1.get_hash();
+        ctx_v1.add_new_view_block(block_v1).unwrap();
+        // Only 2 votes - not enough for M-notarization
+        for i in 0..2 {
+            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+        }
+        assert!(ctx_v1.m_notarization.is_none());
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Manually progress to view 2 (simulate nullification)
+        let nullifies: HashSet<Nullify> = (0..M_SIZE)
+            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .collect();
+        for nullify in nullifies.iter() {
+            view_chain
+                .route_nullify(nullify.clone(), &setup.peer_set)
+                .unwrap();
+        }
+        let nullification = create_nullification(&nullifies, 1, leader_id);
+        view_chain
+            .route_nullification(nullification, &setup.peer_set)
+            .unwrap();
+
+        let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        let block_v2 = create_test_block(2, leader_id, block_hash_v1, 2);
+        let block_hash_v2 = block_v2.get_hash();
+        ctx_v2.add_new_view_block(block_v2).unwrap();
+
+        // Add L-notarization to view 2
+        for i in 0..(N - F) {
+            let vote = create_vote(i, 2, block_hash_v2, leader_id, &setup);
+            ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        view_chain.progress_with_nullification(ctx_v2).unwrap();
+
+        // Try to finalize view 2 - should FAIL because parent (view 1) has no M-notarization
+        let result = view_chain.finalize_with_l_notarization(2, &setup.peer_set);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not have M-notarization")
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalize_fails_if_intermediate_view_not_nullified() {
+        // Error case: Intermediate view between parent and finalized is not nullified
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [31u8; blake3::OUT_LEN];
+
+        // View 1: M-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // View 2: NOT nullified (just progressed)
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // View 3: L-notarized, building on view 1
+        let mut ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v1);
+        let block_v3 = create_test_block(3, leader_id, block_hash_v1, 2);
+        let block_hash_v3 = block_v3.get_hash();
+        ctx_v3.add_new_view_block(block_v3).unwrap();
+        for i in 0..(N - F) {
+            let vote = create_vote(i, 3, block_hash_v3, leader_id, &setup);
+            ctx_v3.add_vote(vote, &setup.peer_set).unwrap();
+        }
+        view_chain.current_view = 3;
+        view_chain.non_finalized_views.insert(3, ctx_v3);
+
+        // Try to finalize view 3 - should FAIL because view 2 is not nullified
+        let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("is not nullified"));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalize_fails_if_view_lacks_l_notarization() {
+        // Error case: View doesn't have enough votes for L-notarization
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [32u8; blake3::OUT_LEN];
+
+        // View 1: M-notarized but not L-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Try to finalize view 1 - should FAIL because it only has M-notarization (3 votes), not L
+        // (4 votes)
+        let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("has not received a l-notarization")
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalize_with_parent_later_l_notarized() {
+        // Valid case: Parent gets M-notarization, child gets L-notarization,
+        // then parent also gets L-notarization before persisting
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [34u8; blake3::OUT_LEN];
+
+        // View 1: Initially M-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // View 2: L-notarized
+        let mut ctx_v2 =
+            create_view_context_with_votes(2, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let block_hash_v2 = ctx_v2.block.as_ref().unwrap().get_hash();
+        let votes_v2_m: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 2, block_hash_v2, leader_id, &setup))
+            .collect();
+        let m_not_v2 = create_m_notarization(&votes_v2_m, 2, block_hash_v2, leader_id);
+        ctx_v2
+            .add_m_notarization(m_not_v2, &setup.peer_set)
+            .unwrap();
+
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Now add more votes to view 1 to get L-notarization
+        for i in M_SIZE..(N - F) {
+            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            view_chain.route_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        // Progress to view 3
+        let ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v2);
+        view_chain.progress_with_m_notarization(ctx_v3).unwrap();
+
+        // Finalize view 2 - should persist both view 1 (L-notarized) and view 2 (L-notarized)
+        let result = view_chain.finalize_with_l_notarization(2, &setup.peer_set);
+
+        assert!(result.is_ok());
+        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 3 remains
+        assert!(!view_chain.non_finalized_views.contains_key(&1));
+        assert!(!view_chain.non_finalized_views.contains_key(&2));
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_finalize_complex_chain_with_multiple_nullified_views() {
+        // Complex case: v1 (L) -> v2 (null) -> v3 (null) -> v4 (null) -> v5 (L, parent=v1)
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [35u8; blake3::OUT_LEN];
+
+        // View 1: L-notarized
+        let mut ctx_v1 =
+            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, N - F, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let votes_v1_m: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1_m, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Views 2, 3, 4: All nullified
+        for view_num in 2..=4 {
+            let ctx = ViewContext::new(view_num, leader_id, replica_id, block_hash_v1);
+            if view_num == 2 {
+                view_chain.progress_with_m_notarization(ctx).unwrap();
+            } else {
+                view_chain.current_view = view_num;
+                view_chain.non_finalized_views.insert(view_num, ctx);
+            }
+
+            // Add nullifications
+            let nullifies: HashSet<Nullify> = (0..M_SIZE)
+                .map(|i| create_nullify(i, view_num, leader_id, &setup))
+                .collect();
+            for nullify in nullifies.iter() {
+                view_chain
+                    .route_nullify(nullify.clone(), &setup.peer_set)
+                    .unwrap();
+            }
+            let nullification = create_nullification(&nullifies, view_num, leader_id);
+            view_chain
+                .route_nullification(nullification, &setup.peer_set)
+                .unwrap();
+        }
+
+        // View 5: L-notarized, building on view 1
+        let mut ctx_v5 =
+            create_view_context_with_votes(5, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let block_hash_v5 = ctx_v5.block.as_ref().unwrap().get_hash();
+        let votes_v5_m: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| create_vote(i, 5, block_hash_v5, leader_id, &setup))
+            .collect();
+        let m_not_v5 = create_m_notarization(&votes_v5_m, 5, block_hash_v5, leader_id);
+        ctx_v5
+            .add_m_notarization(m_not_v5, &setup.peer_set)
+            .unwrap();
+
+        view_chain.current_view = 5;
+        view_chain.non_finalized_views.insert(5, ctx_v5);
+
+        // View 6: Current
+        let ctx_v6 = ViewContext::new(6, leader_id, replica_id, block_hash_v5);
+        view_chain.current_view = 6;
+        view_chain.non_finalized_views.insert(6, ctx_v6);
+
+        // Finalize view 5 - should persist all views 1-5
+        let result = view_chain.finalize_with_l_notarization(5, &setup.peer_set);
+
+        assert!(result.is_ok());
+        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 6 remains
+        for v in 1..=5 {
+            assert!(!view_chain.non_finalized_views.contains_key(&v));
+        }
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }

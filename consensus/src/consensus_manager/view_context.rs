@@ -1158,7 +1158,8 @@ mod tests {
         assert!(context.votes.iter().all(|v| v.block_hash == block_hash));
         assert!(context.nullify_messages.is_empty());
 
-        // NOTE: We don't form a M-notarization in this case, as this should be handled by the ViewProgressManager.
+        // NOTE: We don't form a M-notarization in this case, as this should be handled by the
+        // ViewProgressManager.
         assert!(context.m_notarization.is_none());
         assert!(context.nullification.is_none());
         assert!(context.pending_block.is_none());
@@ -3397,7 +3398,8 @@ mod tests {
         assert_eq!(context.votes.len(), 2);
         assert_eq!(context.num_invalid_votes, 0);
 
-        // 3. Add 3 invalid votes (different block hash) from peers 4, 5, 6 - should trigger nullification
+        // 3. Add 3 invalid votes (different block hash) from peers 4, 5, 6 - should trigger
+        //    nullification
         let wrong_hash = [99u8; blake3::OUT_LEN];
         for i in 4..=6 {
             let wrong_vote = create_test_vote(i, 10, wrong_hash, leader_id, &setup);
