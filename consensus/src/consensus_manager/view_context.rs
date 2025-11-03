@@ -371,7 +371,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.nullify_messages.insert(nullify);
         let is_enough_for_nullification = self.nullify_messages.len() > 2 * F;
 
-        let nullification = if is_enough_for_nullification {
+        if is_enough_for_nullification {
             let NullificationData {
                 peer_ids,
                 aggregated_signature,
@@ -379,17 +379,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             if self.block.is_some() {
                 self.block.as_mut().unwrap().is_finalized = true;
             }
-            Some(Nullification::new(
+
+            self.nullification = Some(Nullification::new(
                 self.view_number,
                 self.leader_id,
                 aggregated_signature,
                 peer_ids,
-            ))
-        } else {
-            None
-        };
+            ));
 
-        self.nullification = nullification;
+            // Set has_nullified flag when nullification is created
+            self.has_nullified = true;
+        }
 
         Ok(())
     }
@@ -465,9 +465,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         }
 
         self.m_notarization = Some(m_notarization);
+        let should_notarize = self.nullification.is_none();
 
         Ok(ShouldMNotarize {
-            should_notarize: true,
+            should_notarize,
             should_await: false,
             should_vote,
             should_nullify: false,
@@ -521,6 +522,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         }
 
         self.nullification = Some(nullification);
+        self.has_nullified = true;
 
         Ok(CollectedNullificationsResult {
             should_broadcast_nullification: true,
@@ -569,9 +571,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
     /// `unfinalized_view_context` is not left in an invalid state.
     #[inline]
     pub fn has_view_progressed_without_m_notarization(&self) -> Result<()> {
-        if self.m_notarization.is_none() {
+        if self.m_notarization.is_none() && self.nullification.is_none() {
             return Err(anyhow::anyhow!(
-                "The current m-notarization for the current view {} is not yet present, but the view has already progressed without a m-notarization, that should never happen.",
+                "View {} has progressed without M-notarization or nullification, which should never happen.",
                 self.view_number
             ));
         }
@@ -3445,7 +3447,10 @@ mod tests {
 
         // With 3 nullify messages, should detect conflicting evidence
         assert_eq!(context.nullify_messages.len(), 3);
-        assert!(context.should_nullify_after_receiving_new_vote());
+        // A nullification should have been created automatically
+        assert!(context.nullification.is_some());
+        // And the has_nullified flag should be set
+        assert!(context.has_nullified);
     }
 
     #[test]
