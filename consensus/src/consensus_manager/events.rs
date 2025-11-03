@@ -54,7 +54,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
-    /// If the current replica should notarize a block for the current view, and vote for it simultaneously.
+    /// If the current replica should notarize a block for the current view, and vote for it
+    /// simultaneously.
     ShouldVoteAndMNotarize {
         /// Current view number (for which the replica should notarize and vote).
         view: u64,
@@ -77,7 +78,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
-    /// If the current replica should vote for a block for the current view, and finalize it simultaneously.
+    /// If the current replica should vote for a block for the current view, and finalize it
+    /// simultaneously.
     ShouldVoteAndFinalize {
         /// Current view number (for which the replica should vote and finalize).
         view: u64,

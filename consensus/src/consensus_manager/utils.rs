@@ -27,7 +27,8 @@ pub(crate) struct NotarizationData<const N: usize> {
 ///
 /// # Important Notes
 ///
-/// - If the same peer has multiple votes, their peer ID may appear multiple times in the array or overwrite previous entries.
+/// - If the same peer has multiple votes, their peer ID may appear multiple times in the array or
+///   overwrite previous entries.
 ///
 /// # Parameters
 ///
@@ -85,7 +86,8 @@ pub(crate) struct NullificationData<const N: usize> {
     pub(crate) aggregated_signature: BlsSignature,
 }
 
-/// Creates nullification data by aggregating signatures and collecting peer IDs from nullifications.
+/// Creates nullification data by aggregating signatures and collecting peer IDs from
+/// nullifications.
 ///
 /// This function selects N nullifications from the provided HashSet and:
 /// 1. Aggregates their BLS signatures using `BlsSignature::aggregate`

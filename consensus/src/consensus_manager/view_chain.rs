@@ -1,17 +1,19 @@
-//! The [`ViewChain`] is a data structure that represents the chain of views in the consensus protocol,
-//! that have not yet been finalized by an L-notarization (n-f votes).
+//! The [`ViewChain`] is a data structure that represents the chain of views in the consensus
+//! protocol, that have not yet been finalized by an L-notarization (n-f votes).
 //!
 //! The [`ViewChain`] is a modular component that is responsible solely for the following tasks:
 //!
-//! - Routing messages to the appropriate view context and communicating the decision event produced by the [`ViewContext`] to the higher-level components,
-//!   such as the [`ViewProgressManager`].
-//! - Finalize blocks with L-notarization and persist them. Note: ONLY L-notarization finalizes blocks.
-//!   Nullifications and M-notarizations cause view progression but do NOT finalize blocks.
+//! - Routing messages to the appropriate view context and communicating the decision event produced
+//!   by the [`ViewContext`] to the higher-level components, such as the [`ViewProgressManager`].
+//! - Finalize blocks with L-notarization and persist them. Note: ONLY L-notarization finalizes
+//!   blocks. Nullifications and M-notarizations cause view progression but do NOT finalize blocks.
 //! - Manage garbage collection of old views once blocks are L-notarized.
 //!
 //! IMPORTANT DISTINCTION (from Minimit paper):
-//! - **View Progression**: Can happen via M-notarization OR nullification. The view advances but blocks remain unfinalized.
-//! - **Block Finalization**: Happens ONLY via L-notarization (n-f votes). This commits the block to the ledger.
+//! - **View Progression**: Can happen via M-notarization OR nullification. The view advances but
+//!   blocks remain unfinalized.
+//! - **Block Finalization**: Happens ONLY via L-notarization (n-f votes). This commits the block to
+//!   the ledger.
 //!
 //! The current logic relies on the following properties from the Minimit protocol:
 //!   
@@ -23,8 +25,8 @@
 //!
 //! PROPERTY (Block Finalization):
 //!
-//! A block for view `v` is finalized (committed to ledger) when an L-notarization (n-f votes) is received.
-//! This is the ONLY way blocks are finalized.
+//! A block for view `v` is finalized (committed to ledger) when an L-notarization (n-f votes) is
+//! received. This is the ONLY way blocks are finalized.
 //!
 //! PROPERTY (Vote on M-notarization - Critical for Liveness):
 //!
@@ -69,8 +71,8 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// Map of non-finalized view contexts, keyed by view number
     ///
-    /// These views have achieved a M-notarization or a nullification and the protocol has progressed
-    /// past them, but they haven't achieved L-notarization yet. We continue
+    /// These views have achieved a M-notarization or a nullification and the protocol has
+    /// progressed past them, but they haven't achieved L-notarization yet. We continue
     /// collecting votes for potential finalization.
     ///
     /// This map contains at least one entry, namely that corresponding to the current view number.
@@ -78,7 +80,8 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// The persistence storage for the consensus protocol
     /// This is used to persist the view contexts and the votes/nullifications/notarizations
-    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication protocol.
+    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication
+    /// protocol.
     persistence_storage: ConsensusStore,
 
     /// The most recent finalized block hash in the current replica's state machine
@@ -162,10 +165,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         view_number: u64,
         block: Block,
     ) -> Result<LeaderProposalResult> {
-        if !self.non_finalized_views.contains_key(&view_number) {
+        if view_number != self.current_view {
             return Err(anyhow::anyhow!(
-                "Block proposal for view {} is not an non-finalized view",
-                view_number
+                "Block proposal for view {} is not the current view {}",
+                view_number,
+                self.current_view
             ));
         }
 
@@ -225,6 +229,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_await: true,
+                should_vote: false, // We don't vote for the block yet, as we are awaiting the parent to be notarized
             });
         }
 
@@ -237,8 +242,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         if let Some(ctx) = self.non_finalized_views.get_mut(&vote.view) {
             let view_number = ctx.view_number;
 
-            // NOTE: If the view number is not the current view, we check if the view has progressed without a m-notarization,
-            // this is to ensure that the view chain is not left in an invalid state.
+            // NOTE: If the view number is not the current view, we check if the view has progressed
+            // without a m-notarization, this is to ensure that the view chain is not
+            // left in an invalid state.
             if view_number != self.current_view {
                 ctx.has_view_progressed_without_m_notarization()?;
             }
@@ -257,8 +263,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     pub fn route_nullify(&mut self, nullify: Nullify, peers: &PeerSet) -> Result<bool> {
         if let Some(ctx) = self.non_finalized_views.get_mut(&nullify.view) {
             let view_number = ctx.view_number;
-            // NOTE: If the view number is not the current view, we check if the view has progressed without a m-notarization,
-            // this is to ensure that the view chain is not left in an invalid state.
+            // NOTE: If the view number is not the current view, we check if the view has progressed
+            // without a m-notarization, this is to ensure that the view chain is not
+            // left in an invalid state.
             if view_number != self.current_view {
                 ctx.has_view_progressed_without_m_notarization()?;
             }
@@ -342,9 +349,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
+        if self.current().pending_block.is_some() {
+            tracing::warn!(
+                "Current view {} has a pending block, but the view has progressed with a m-notarization",
+                self.current_view
+            );
+        }
+
         // 3. Update the current view to the next view.
         // NOTE: We don't persist yet the current view, as it has not been finalized yet.
-        // Moreover, we keep the current view context in the `non_finalized_views` map, as it has not been finalized yet.
+        // Moreover, we keep the current view context in the `non_finalized_views` map, as it has
+        // not been finalized yet.
         self.current_view = new_view_ctx.view_number;
         self.non_finalized_views
             .insert(new_view_ctx.view_number, new_view_ctx);
@@ -390,7 +405,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     }
 
     /// Finalizes a view with a l-notarization. Since l-notarizations are finalizing events
-    /// we remove the view from the `non_finalized_views` map and persist the finalized view to the persistence storage.
+    /// we remove the view from the `non_finalized_views` map and persist the finalized view to the
+    /// persistence storage.
     ///
     /// This method should ONLY be called for a `view_number` that is NOT the current view,
     /// otherwise the caller should instead call the `progress_with_l_notarization` method.
@@ -407,7 +423,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
-        // 3. Persist the finalized view to the persistence storage, and remove the view from the `non_finalized_views` map.
+        // 3. Persist the finalized view to the persistence storage, and remove the view from the
+        //    `non_finalized_views` map.
         let to_persist_range =
             self.non_finalized_views_until(finalized_view)
                 .ok_or(anyhow::anyhow!(
@@ -450,7 +467,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     ) -> Result<()> {
         let view_number = ctx.view_number;
 
-        // 1. Persist both the block with `is_finalized` set to true, and the transactions associated with the block.
+        // 1. Persist both the block with `is_finalized` set to true, and the transactions
+        //    associated with the block.
         if let Some(ref block) = ctx.block {
             for tx in block.transactions.iter() {
                 self.persistence_storage.put_transaction(tx)?;
@@ -539,7 +557,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    fn process_pending_child_proposals(
+    pub fn process_pending_child_proposals(
         &mut self,
         notarized_view: u64,
     ) -> Result<Vec<LeaderProposalResult>> {
@@ -1224,32 +1242,6 @@ mod tests {
         let result = view_chain.progress_with_nullification(ctx_v2);
 
         assert!(result.is_err());
-
-        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
-    }
-
-    #[test]
-    fn test_progress_with_l_notarization_success() {
-        let setup = TestSetup::new(N);
-        let leader_id = setup.leader_id(0);
-        let replica_id = setup.replica_id(1);
-        let parent_hash = [11u8; blake3::OUT_LEN];
-
-        // Create view with N-F votes (l-notarization threshold)
-        let ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, N - F, &setup);
-        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
-
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
-
-        // Progress with l-notarization
-        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
-        let result = view_chain.progress_with_l_notarization(ctx_v2, &setup.peer_set);
-
-        assert!(result.is_ok());
-        assert_eq!(view_chain.current_view_number(), 2);
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }

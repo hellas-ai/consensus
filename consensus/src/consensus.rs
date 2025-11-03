@@ -9,7 +9,8 @@ use crate::state::{
 /// [`ConsensusMessage`] represents a message in the consensus protocol.
 ///
 /// It can either be:
-/// - A proposal for a new block, for the current view (it must be always proposed by the leader of the current view)
+/// - A proposal for a new block, for the current view (it must be always proposed by the leader of
+///   the current view)
 /// - A vote for a block, for the current view (it can be proposed by any replica)
 /// - A M-notarization for a block, for the current view (it can be proposed by any replica)
 /// - A L-notarization for a block, for the current view (it can be proposed by any replica)

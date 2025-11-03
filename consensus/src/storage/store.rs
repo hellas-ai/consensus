@@ -29,9 +29,11 @@ use super::{
     },
 };
 
-/// [`ConsensusStore`] is a wrapper around the redb database that provides a convenient interface for storing and retrieving consensus data.
+/// [`ConsensusStore`] is a wrapper around the redb database that provides a convenient interface
+/// for storing and retrieving consensus data.
 ///
-/// It provides methods for storing and retrieving blocks, leaders, views, transactions, notarizations, nullifications, and accounts.
+/// It provides methods for storing and retrieving blocks, leaders, views, transactions,
+/// notarizations, nullifications, and accounts.
 ///
 /// # Examples
 ///
