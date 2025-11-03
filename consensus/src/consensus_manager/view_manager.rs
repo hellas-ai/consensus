@@ -27,7 +27,8 @@ use crate::{
 
 // TODO: Add view progression logic
 
-/// [`ViewProgressManager`] is the main service for the view progress of the underlying Minimmit consensus protocol.
+/// [`ViewProgressManager`] is the main service for the view progress of the underlying Minimmit
+/// consensus protocol.
 ///
 /// It is responsible for managing the view progress of the consensus protocol,
 /// including the leader selection, the block proposal, the voting, the nullification,
@@ -53,7 +54,8 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
     /// The persistence storage for the consensus protocol
     ///
     /// This is used to persist the view contexts and the votes/nullifications/notarizations
-    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication protocol.
+    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication
+    /// protocol.
     _persistence_storage: ConsensusStore,
 
     /// The set of peers in the consensus protocol.
@@ -193,8 +195,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             }
             Ok(ViewProgressEvent::Await)
         } else {
-            // In this case, the replica has either voted for a block, or nullified the current view.
-            // In both cases, we can return a no-op event.
+            // In this case, the replica has either voted for a block, or nullified the current
+            // view. In both cases, we can return a no-op event.
             Ok(ViewProgressEvent::NoOp)
         }
     }
@@ -217,8 +219,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     //         && self.current_view_context.m_notarization.is_none()
     //     {
     //         return Err(anyhow::anyhow!(
-    //             "Cannot update current view to a new view without a nullification or m-notarization"
-    //         ));
+    //             "Cannot update current view to a new view without a nullification or
+    // m-notarization"         ));
     //     }
 
     //     if let Some(ref nullification) = self.current_view_context.nullification {
@@ -230,8 +232,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     //             nullification.view + 1,
     //             new_leader.peer_id(),
     //             self.current_view_context.replica_id,
-    //             self.current_view_context.parent_block_hash, // NOTE: No progress was made, use same parent
-    //         );
+    //             self.current_view_context.parent_block_hash, // NOTE: No progress was made, use
+    // same parent         );
     //         self.unfinalized_view_context = Some(self.current_view_context);
 
     //         // Clear unfinalized view context on nullification
@@ -246,8 +248,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
     //     if let Some(ref current_view_m_notarization) = self.current_view_context.m_notarization {
     //         // NOTE: This indicates that the view change has been triggered by a m-notarization.
-    //         // Therefore, the next view can consider the current view block hash as its parent block hash.
-    //         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
+    //         // Therefore, the next view can consider the current view block hash as its parent
+    // block hash.         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
     //             current_view_m_notarization.view + 1,
     //             new_leader.peer_id(),
     //             self.current_view_context.replica_id,
@@ -269,13 +271,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     /// If the block is for a future view, it returns a [`ViewProgressEvent::ShouldUpdateView`]
     /// event, to update the view context to the future view.
     /// If the block is for the current view, and it passes all validation checks in
-    /// [`ViewContext::add_new_view_block`], then the method returns a [`ViewProgressEvent::ShouldVote`]
-    /// event, to vote for the block.
+    /// [`ViewContext::add_new_view_block`], then the method returns a
+    /// [`ViewProgressEvent::ShouldVote`] event, to vote for the block.
     fn handle_block_proposal(&mut self, block: Block) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         // Validate block for the current view
         if block.header.view > self.current_view_context.view_number {
-            // If the block is for a future view, then we need to update the view context to the future view,
-            // if the leader of the future view is not the current leader.
+            // If the block is for a future view, then we need to update the view context to the
+            // future view, if the leader of the future view is not the current leader.
             let block_view_leader = self
                 .leader_manager
                 .leader_for_view(block.header.view)?
@@ -298,12 +300,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             block_hash,
             is_enough_to_m_notarize,
             is_enough_to_finalize,
+            should_await,
+            should_vote,
         } = self.current_view_context.add_new_view_block(block)?;
 
         if is_enough_to_m_notarize {
-            // NOTE: In this case, the replica has collected enough votes to propose a M-notarization,
-            // but not enough to finalize the view. Therefore, the replica should vote for the block
-            // and notarize it simultaneously.
+            // NOTE: In this case, the replica has collected enough votes to propose a
+            // M-notarization, but not enough to finalize the view. Therefore, the
+            // replica should vote for the block and notarize it simultaneously.
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: self.current_view_context.view_number,
                 block_hash,
@@ -311,7 +315,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         } else if is_enough_to_finalize {
             // NOTE: In this case, the replica has collected enough votes to finalize the view,
             // before it has received the block proposal from the leader, as most likely the replica
-            // was beyond. In such case, the replica should vote for the block and finalize the view simultaneously.
+            // was beyond. In such case, the replica should vote for the block and finalize the view
+            // simultaneously.
             return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
                 view: self.current_view_context.view_number,
                 block_hash,
@@ -329,8 +334,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             // TODO: Handle the case where a vote for a future view is received.
             // In this case, the replica should try to either sync up for the future view, or
             // ignore it altogether. Ideally, the replica would try to sync up for the future view,
-            // but that involves more work, as it would require a supra-majority of replicas providing
-            // more blocks to the current replica.
+            // but that involves more work, as it would require a supra-majority of replicas
+            // providing more blocks to the current replica.
             let block_view_leader = self.leader_manager.leader_for_view(vote.view)?.peer_id();
             if block_view_leader != vote.leader_id {
                 return Err(anyhow::anyhow!(
@@ -351,6 +356,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 should_await,
                 is_enough_to_m_notarize,
                 is_enough_to_finalize,
+                should_nullify,
             } = self.current_view_context.add_vote(vote, &self.peers)?;
             if should_await {
                 return Ok(ViewProgressEvent::Await);
@@ -376,6 +382,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                     should_await,
                     is_enough_to_m_notarize,
                     is_enough_to_finalize,
+                    should_nullify,
                 } = unfinalized_view_context.add_vote(vote, &self.peers)?;
                 if should_await {
                     return Ok(ViewProgressEvent::Await);
@@ -479,6 +486,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             let ShouldMNotarize {
                 should_notarize,
                 should_await,
+                should_vote,
+                should_nullify,
             } = self
                 .current_view_context
                 .add_m_notarization(m_notarization, &self.peers)?;
@@ -500,7 +509,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         if let Some(ref unfinalized_view_context) = self.unfinalized_view_context {
             unfinalized_view_context.has_view_progressed_without_m_notarization()?;
             if m_notarization.view == unfinalized_view_context.view_number {
-                // NOTE: There is not anything left to do here, as the m-notarization has already been added to the unfinalized view context.
+                // NOTE: There is not anything left to do here, as the m-notarization has already
+                // been added to the unfinalized view context.
                 return Ok(ViewProgressEvent::NoOp);
             }
         }

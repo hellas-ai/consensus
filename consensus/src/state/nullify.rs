@@ -12,9 +12,10 @@ use crate::{
 
 /// [`Nullify`] represents a nullify message in the consensus protocol.
 ///
-/// A nullify message is a message that is sent by a peer to the network to indicate that the view is nullified,
-/// in his local state machine.
-/// It contains the view number, the leader's Peer ID, the signature of the nullify message, and the peer's Peer ID.
+/// A nullify message is a message that is sent by a peer to the network to indicate that the view
+/// is nullified, in his local state machine.
+/// It contains the view number, the leader's Peer ID, the signature of the nullify message, and the
+/// peer's Peer ID.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Nullify {
     /// The view number for which the nullify is being cast
@@ -38,9 +39,10 @@ impl Nullify {
         }
     }
 
-    /// Verifies if the nullify message has been successfully signed by the peer with the given public key.
-    /// Note: this does not verify that the [`PeerId`] matches the public key
-    /// of the peer that signed the nullify message. This should be verified by the caller, beforehand.
+    /// Verifies if the nullify message has been successfully signed by the peer with the given
+    /// public key. Note: this does not verify that the [`PeerId`] matches the public key
+    /// of the peer that signed the nullify message. This should be verified by the caller,
+    /// beforehand.
     pub fn verify(&self, public_key: &BlsPublicKey) -> bool {
         let message =
             blake3::hash(&[self.view.to_le_bytes(), self.leader_id.to_le_bytes()].concat());

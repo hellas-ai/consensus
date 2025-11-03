@@ -106,7 +106,8 @@ pub enum Network {
     /// [`Local`] represents a local network, where the replicas are running on the same machine.
     Local,
 
-    /// [`Devnet`] represents a development network, where the replicas are running on different machines.
+    /// [`Devnet`] represents a development network, where the replicas are running on different
+    /// machines.
     Devnet,
 
     /// [`Testnet`] represents a test network, where the replicas are running on different machines.
