@@ -2550,6 +2550,96 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_block_proposal_to_same_view_fails() {
+        // Test that attempting to add a second block to a view that already has one fails
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+
+        // Add first block proposal
+        let block_1 = create_test_block(1, leader_id, parent_hash, 1);
+        let result_1 = view_chain.add_block_proposal(1, block_1);
+        assert!(result_1.is_ok());
+
+        // Attempt to add second block proposal to the same view
+        let block_2 = create_test_block(1, leader_id, parent_hash, 1);
+        let result_2 = view_chain.add_block_proposal(1, block_2);
+
+        // Should fail with error indicating block already exists
+        assert!(result_2.is_err());
+        assert!(
+            result_2
+                .unwrap_err()
+                .to_string()
+                .contains("already has a block from leader")
+        );
+
+        // Verify only the first block exists
+        assert!(view_chain.current().block.is_some());
+        assert!(view_chain.current().pending_block.is_none());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_duplicate_pending_block_fails() {
+        // Test that attempting to add a block when a pending block already exists fails
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [62u8; blake3::OUT_LEN];
+
+        // View 1: Block without M-notarization (so child will be pending)
+        let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let block_v1 = create_test_block(1, leader_id, parent_hash, 1);
+        let block_hash_v1 = block_v1.get_hash();
+        ctx_v1.add_new_view_block(block_v1).unwrap();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // Manually insert view 2 (simulating progression without going through normal flow)
+        // This avoids nullifying view 1
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.current_view = 2;
+        view_chain.non_finalized_views.insert(2, ctx_v2);
+
+        // Add first block proposal for view 2 building on view 1 (which has NO M-notarization)
+        // This should be pending because parent lacks M-notarization
+        let block_2a = create_test_block(2, leader_id, block_hash_v1, 2);
+        let result_1 = view_chain.add_block_proposal(2, block_2a);
+        assert!(result_1.is_ok());
+        let result_1 = result_1.unwrap();
+        assert!(result_1.should_await); // Should be pending
+        assert!(view_chain.current().pending_block.is_some());
+        assert!(view_chain.current().block.is_none());
+
+        // Attempt to add second block proposal to same view (should fail)
+        let block_2b = create_test_block(2, leader_id, block_hash_v1, 2);
+        let result_2 = view_chain.add_block_proposal(2, block_2b);
+
+        // Should fail with error indicating pending block already exists
+        assert!(result_2.is_err());
+        assert!(
+            result_2
+                .unwrap_err()
+                .to_string()
+                .contains("already has a pending block")
+        );
+
+        // Verify only the first pending block exists
+        assert!(view_chain.current().pending_block.is_some());
+        assert!(view_chain.current().block.is_none());
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
     fn test_process_pending_returns_results() {
         // Verify that process_pending_child_proposals returns correct results
         let setup = TestSetup::new(N);
