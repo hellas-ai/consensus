@@ -18,7 +18,12 @@ use crate::{
     },
 };
 
-/// Per-view state tracking
+/// State tracking for a single view in the consensus protocol.
+///
+/// A [`ViewContext`] encapsulates all consensus-related state for a specific view, including
+/// the block proposal, collected votes, nullifications, and the replica's own participation
+/// status. Each view has a designated leader who proposes a block, and replicas vote on
+/// proposals or send nullify messages if consensus cannot be reached.
 #[derive(Debug, Clone)]
 pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The view number

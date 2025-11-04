@@ -93,10 +93,7 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE> {
-    /// Creates a new [`ViewChain`] from the given context
-    ///
-    /// # Arguments
-    /// * `initial_view` - The
+    /// Creates a new [`ViewChain`] starting from the given initial view.
     pub fn new(
         initial_view: ViewContext<N, F, M_SIZE>,
         persistence_storage: ConsensusStore,
@@ -128,8 +125,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.current_view
     }
 
-    /// Returns the number of unfinalized views
-    pub fn unfinalized_count(&self) -> usize {
+    /// Returns the number of non-finalized views
+    pub fn non_finalized_count(&self) -> usize {
         self.non_finalized_views.len()
     }
 
@@ -138,7 +135,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let current_view = self.current_view;
         let least_non_finalized_view = self
             .current_view
-            .saturating_sub(self.unfinalized_count() as u64)
+            .saturating_sub(self.non_finalized_count() as u64)
             + 1;
         least_non_finalized_view..=current_view
     }
@@ -152,7 +149,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let upper_bound = view_number.min(current_view);
         let least_non_finalized_view = self
             .current_view
-            .saturating_sub(self.unfinalized_count() as u64)
+            .saturating_sub(self.non_finalized_count() as u64)
             + 1;
         if least_non_finalized_view > upper_bound {
             return None;
@@ -160,6 +157,35 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
+    /// Adds a block proposal to a non-finalized view and validates the chain structure.
+    ///
+    /// This method performs critical validation to ensure the block extends the correct chain:
+    /// - The view must exist in the non-finalized views
+    /// - The view must not already have a block or pending block
+    /// - The parent block must either be finalized or have an M-notarization
+    /// - All intermediate views between the parent and current view must be nullified
+    /// - The parent view itself must not be nullified
+    ///
+    /// If the parent view lacks an M-notarization, the block is stored as pending and will
+    /// be processed once the parent receives M-notarization.
+    ///
+    /// # Arguments
+    /// * `view_number` - The view number for which the block is proposed
+    /// * `block` - The block proposal to add
+    ///
+    /// # Returns
+    /// * `Ok(LeaderProposalResult)` - Contains block hash and flags indicating whether:
+    ///   - The view has enough votes to M-notarize
+    ///   - The view has enough votes to finalize
+    ///   - The replica should await parent M-notarization
+    ///   - The replica should vote for the block
+    ///
+    /// # Errors
+    /// * View is not in non-finalized views
+    /// * View already has a block or pending block
+    /// * Parent view is nullified
+    /// * Intermediate views are not nullified
+    /// * Parent block hash doesn't match any finalized or non-finalized block
     pub fn add_block_proposal(
         &mut self,
         view_number: u64,
@@ -258,7 +284,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         ctx.add_new_view_block(block)
     }
 
-    /// Routes a vote to the appropriate view context
+    /// Routes a vote to the appropriate non-finalized view context.
+    ///
+    /// Validates that the vote's view exists in the chain and adds it to that view's context.
+    /// For past views, ensures they haven't progressed without M-notarization.
+    ///
+    /// # Arguments
+    /// * `vote` - The vote to route
+    /// * `peers` - The peer set for signature verification
+    ///
+    /// # Returns
+    /// * `Ok(CollectedVotesResult)` - Indicates if enough votes for M-notarization or finalization
+    ///
+    /// # Errors
+    /// * Vote is for a view not in the non-finalized views
+    /// * View has progressed without M-notarization (invalid state)
     pub fn route_vote(&mut self, vote: Vote, peers: &PeerSet) -> Result<CollectedVotesResult> {
         if let Some(ctx) = self.non_finalized_views.get_mut(&vote.view) {
             let view_number = ctx.view_number;
@@ -280,7 +320,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         ))
     }
 
-    /// Routes a nullify message to the appropriate view context
+    /// Routes a nullify message to the appropriate non-finalized view context.
+    ///
+    /// Validates that the nullify's view exists in the chain and adds it to that view's context.
+    /// For past views, ensures they haven't progressed without M-notarization.
+    ///
+    /// # Arguments
+    /// * `nullify` - The nullify message to route
+    /// * `peers` - The peer set for signature verification
+    ///
+    /// # Returns
+    /// * `Ok(true)` - If enough nullify messages collected to form a nullification (2f+1)
+    /// * `Ok(false)` - If nullify added but threshold not yet reached
+    ///
+    /// # Errors
+    /// * Nullify is for a view not in the non-finalized views
+    /// * View has progressed without M-notarization (invalid state)
     pub fn route_nullify(&mut self, nullify: Nullify, peers: &PeerSet) -> Result<bool> {
         if let Some(ctx) = self.non_finalized_views.get_mut(&nullify.view) {
             let view_number = ctx.view_number;
@@ -304,7 +359,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         ))
     }
 
-    /// Routes an M-notarization to the appropriate view context
+    /// Routes an M-notarization to the appropriate non-finalized view context.
+    ///
+    /// Validates that the M-notarization's view exists in the chain and adds it to that view's
+    /// context. For past views, ensures they haven't progressed without M-notarization.
+    ///
+    /// # Arguments
+    /// * `m_notarization` - The M-notarization to route
+    /// * `peers` - The peer set for signature verification
+    ///
+    /// # Returns
+    /// * `Ok(ShouldMNotarize)` - Indicates whether the replica should vote, notarize, await, or
+    ///   nullify
+    ///
+    /// # Errors
+    /// * M-notarization is for a view not in the non-finalized views
+    /// * View has progressed without M-notarization (invalid state)
     pub fn route_m_notarization(
         &mut self,
         m_notarization: MNotarization<N, F, M_SIZE>,
@@ -324,7 +394,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         ))
     }
 
-    /// Routes a nullification to the appropriate view context
+    /// Routes a nullification to the appropriate non-finalized view context.
+    ///
+    /// Validates that the nullification's view exists in the chain and adds it to that view's
+    /// context. For past views, ensures they haven't progressed without M-notarization.
+    ///
+    /// # Arguments
+    /// * `nullification` - The nullification (aggregated 2f+1 nullify messages) to route
+    /// * `peers` - The peer set for signature verification
+    ///
+    /// # Returns
+    /// * `Ok(CollectedNullificationsResult)` - Indicates if the nullification was successfully
+    ///   added
+    ///
+    /// # Errors
+    /// * Nullification is for a view not in the non-finalized views
+    /// * View has progressed without M-notarization (invalid state)
     pub fn route_nullification(
         &mut self,
         nullification: Nullification<N, F, M_SIZE>,
@@ -344,11 +429,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         ))
     }
 
-    /// Progresses to the next view with M-notarization.
+    /// Progresses to the next view after the current view receives an M-notarization.
     ///
-    /// This operation inserts a new view context for the next view.
-    /// The current view context is left intact as it received an M-notarization
-    /// (not a finalizing event - only L-notarization finalizes).
+    /// M-notarization (2f+1 votes) allows view progression but does NOT finalize blocks.
+    /// The current view remains in the non-finalized chain and continues collecting votes
+    /// for potential L-notarization (n-f votes), which is required for block finalization.
+    ///
+    /// # Arguments
+    /// * `new_view_ctx` - The view context for the next view (current_view + 1)
+    ///
+    /// # Errors
+    /// * New view number is not exactly current_view + 1
+    /// * Current view lacks an M-notarization
+    ///
+    /// # Note
+    /// If the current view has a pending block, it will be logged as a warning but progression
+    /// continues. The pending block will not be processed in the new view.
     pub fn progress_with_m_notarization(
         &mut self,
         new_view_ctx: ViewContext<N, F, M_SIZE>,
@@ -388,14 +484,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Progresses to the next view with nullification.
+    /// Progresses to the next view after the current view receives a nullification.
     ///
-    /// IMPORTANT: Nullifications do NOT finalize blocks. They only cause view progression.
-    /// The nullified view remains in the chain as non-finalized.
-    /// Only L-notarization finalizes blocks.
+    /// Nullification (2f+1 nullify messages) allows view progression but does NOT finalize blocks.
+    /// The nullified view remains in the non-finalized chain. Nullified views are persisted later
+    /// when garbage collection occurs during L-notarization of a subsequent view.
     ///
-    /// This method updates the current view and inserts the next view context.
-    /// The nullified view is kept in `non_finalized_views` for potential future L-notarization.
+    /// # Arguments
+    /// * `next_view_ctx` - The view context for the next view (current_view + 1)
+    ///
+    /// # Errors
+    /// * Next view number is not exactly current_view + 1
+    /// * Current view lacks a nullification
+    ///
+    /// # Note
+    /// Nullified views represent failed consensus attempts where the replica network
+    /// could not agree on a block proposal, typically due to leader failure or network issues.
     pub fn progress_with_nullification(
         &mut self,
         next_view_ctx: ViewContext<N, F, M_SIZE>,
@@ -425,9 +529,37 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Finalizes a view with a l-notarization. Since l-notarizations are finalizing events
-    /// we remove the view from the `non_finalized_views` map and persist the finalized view to the
-    /// persistence storage.
+    /// Finalizes a view with L-notarization and performs garbage collection.
+    ///
+    /// L-notarization (n-f votes) is the ONLY mechanism that finalizes blocks and commits them
+    /// to the ledger. This method validates the chain structure, persists all views from the
+    /// oldest non-finalized view up to the finalized view, and removes them from the chain.
+    ///
+    /// # Chain Validation
+    /// - The finalized view must have n-f votes (L-notarization threshold)
+    /// - The parent view must have at least a M-notarization (2f+1 votes)
+    /// - All intermediate views between parent and finalized must be nullified
+    ///
+    /// # Persistence Behavior
+    /// All views from the oldest non-finalized view to the finalized view are persisted:
+    /// - **L-notarized views**: Persisted as finalized blocks (committed to ledger)
+    /// - **M-notarized views**: Persisted as non-finalized (progressed but not committed)
+    /// - **Nullified views**: Persisted as failed consensus attempts
+    ///
+    /// After persistence, these views are removed from `non_finalized_views` (garbage collection)
+    /// and added to persistence storage.
+    ///
+    /// # Arguments
+    /// * `finalized_view` - The view number to finalize (must have n-f votes)
+    /// * `peers` - The peer set for validation
+    ///
+    /// # Errors
+    /// * Finalized view is in the future (greater than current view)
+    /// * View is not in non-finalized views or already finalized
+    /// * View has fewer than n-f votes (lacks L-notarization)
+    /// * Finalized view has no block
+    /// * Parent view lacks M-notarization
+    /// * Intermediate views are not nullified
     pub fn finalize_with_l_notarization(
         &mut self,
         finalized_view: u64,
@@ -563,7 +695,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Persists a l-notarized view to the persistence storage.
+    /// Persists an L-notarized view to storage as a finalized block.
+    ///
+    /// This method commits the block to the ledger by persisting all consensus artifacts:
+    /// - Block (marked as `is_finalized = true`) and its transactions
+    /// - M-notarization (required before L-notarization can occur)
+    /// - All votes collected (n-f or more)
+    /// - Leader and view metadata
+    ///
+    /// # Arguments
+    /// * `ctx` - The view context containing the finalized block and consensus data
+    /// * `peers` - The peer set for extracting leader public key
+    ///
+    /// # Errors
+    /// * View has no block despite being L-notarized
+    /// * View has no M-notarization (invalid state - L-notarization requires prior M-notarization)
+    /// * Storage operation fails
+    ///
+    /// # Note
+    /// L-notarization implies the view previously achieved M-notarization, as replicas
+    /// only vote after seeing M-notarization or the block proposal.
     fn persist_l_notarized_view(
         &self,
         ctx: &ViewContext<N, F, M_SIZE>,
@@ -616,7 +767,31 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Persists a m-notarized view to the persistence storage.
+    /// Persists an M-notarized view to storage as a non-finalized block.
+    ///
+    /// This method persists a view that achieved M-notarization (2f+1 votes) and caused
+    /// view progression, but never reached L-notarization (n-f votes). The block is saved
+    /// but NOT marked as finalized, preserving the distinction between view progression
+    /// and block finalization.
+    ///
+    /// Persisted artifacts include:
+    /// - Block (with `is_finalized = false`) and its transactions
+    /// - M-notarization (2f+1 votes)
+    /// - All votes collected (between 2f+1 and n-f-1)
+    /// - Leader and view metadata (marked as not finalized)
+    ///
+    /// # Arguments
+    /// * `ctx` - The view context containing the M-notarized block and consensus data
+    /// * `peers` - The peer set for extracting leader public key
+    ///
+    /// # Errors
+    /// * View has no block despite being M-notarized
+    /// * View has no M-notarization
+    /// * Storage operation fails
+    ///
+    /// # Note
+    /// This occurs during garbage collection when a later view is L-notarized, and earlier
+    /// M-notarized views need to be persisted before removal from the chain.
     fn persist_m_notarized_view(
         &self,
         ctx: &ViewContext<N, F, M_SIZE>,
@@ -665,7 +840,30 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Persists a nullified view to the persistence storage.
+    /// Persists a nullified view to storage as a failed consensus attempt.
+    ///
+    /// Nullified views represent failed consensus where the replica network collected 2f+1
+    /// nullify messages instead of achieving M-notarization. This typically occurs due to
+    /// leader failure, network partition, or timeout.
+    ///
+    /// Persisted artifacts include:
+    /// - Block (if received from leader) marked as nullified, not finalized
+    /// - Nullification (aggregated 2f+1 nullify messages)
+    /// - All votes collected (if any)
+    /// - All nullify messages (2f+1 or more)
+    /// - Leader and view metadata
+    ///
+    /// # Arguments
+    /// * `ctx` - The view context containing the nullification and consensus data
+    /// * `peers` - The peer set for extracting leader public key
+    ///
+    /// # Errors
+    /// * View has no nullification despite being called for a nullified view
+    /// * Storage operation fails
+    ///
+    /// # Note
+    /// The block may be absent if the leader was faulty and never proposed. This is
+    /// expected behavior and not treated as an error.
     fn persist_nullified_view(
         &self,
         ctx: &ViewContext<N, F, M_SIZE>,
@@ -713,6 +911,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
+    /// Processes pending block proposals that were awaiting parent M-notarization.
+    ///
+    /// When a view receives M-notarization, child blocks that were stored as pending
+    /// (because they arrived before their parent was notarized) can now be processed.
+    /// This method finds all such pending blocks in future views and attempts to add
+    /// them to their respective view contexts.
+    ///
+    /// # Arguments
+    /// * `notarized_view` - The view number that just received M-notarization
+    ///
+    /// # Returns
+    /// * `Ok(Vec<LeaderProposalResult>)` - Results from processing each pending block, indicating
+    ///   vote status and whether they should be processed immediately or await
+    ///
+    /// # Errors
+    /// * Block validation fails during processing (invalid chain structure, duplicate blocks, etc.)
+    ///
+    /// # Note
+    /// This is called after a view receives M-notarization to unblock any dependent
+    /// child proposals that were waiting.
     pub fn process_pending_child_proposals(
         &mut self,
         notarized_view: u64,
@@ -738,9 +956,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(results)
     }
 
-    /// Persists all the view contexts in the `non_finalized_views` map to the persistence storage.
+    /// Persists all non-finalized views to storage during graceful shutdown.
     ///
-    /// This method is mostly used when the consensus engine is gracefully shutting down.
+    /// This method saves the current state of the consensus chain by persisting all
+    /// blocks in non-finalized views as non-finalized blocks. This allows the replica
+    /// to resume from its last known state after restart, without losing progress on
+    /// views that achieved M-notarization but not yet L-notarization.
+    ///
+    /// The method drains `non_finalized_views`, removing all entries from the chain.
+    ///
+    /// # Returns
+    /// * `Ok(())` - All views successfully persisted
+    ///
+    /// # Errors
+    /// * Storage operation fails during persistence
+    ///
+    /// # Note
+    /// Only blocks are persisted; votes, nullifications, and other consensus artifacts
+    /// are not saved. This is sufficient for recovery since the replica can re-sync
+    /// these artifacts from peers upon restart.
     pub fn persist_all_views(&mut self) -> Result<()> {
         for (_view_number, ctx) in self.non_finalized_views.drain() {
             if let Some(ref block) = ctx.block {
@@ -751,6 +985,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
+    /// Finds the view number for a given parent block hash in the non-finalized chain.
+    ///
+    /// Searches through all non-finalized views to locate which view contains a block
+    /// with the specified hash. Returns `None` if the parent is not found in the chain
+    /// (typically because it's already been finalized and garbage collected).
+    ///
+    /// # Arguments
+    /// * `parent_hash` - The block hash to search for
+    ///
+    /// # Returns
+    /// * `Some(view_number)` - The view that contains the block with this hash
+    /// * `None` - No non-finalized view has a block with this hash
     fn find_parent_view(&self, parent_hash: &[u8; blake3::OUT_LEN]) -> Option<u64> {
         for (view_num, ctx) in &self.non_finalized_views {
             if let Some(hash) = ctx.block_hash
@@ -951,7 +1197,7 @@ mod tests {
             ViewChain::<N, F, M_SIZE>::new(initial_view, setup.storage, Duration::from_secs(10));
 
         assert_eq!(view_chain.current_view_number(), 1);
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -999,7 +1245,7 @@ mod tests {
         assert!(!votes_result.is_enough_to_finalize);
 
         assert_eq!(view_chain.current_view_number(), 1);
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
         assert_eq!(view_chain.current().votes.len(), 1);
 
@@ -1046,7 +1292,7 @@ mod tests {
         assert!(votes_result.is_enough_to_finalize);
 
         assert_eq!(view_chain.current_view_number(), 2);
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=2);
         assert_eq!(
             view_chain.non_finalized_views.get(&1).unwrap().votes.len(),
@@ -1111,7 +1357,7 @@ mod tests {
         assert!(!result.unwrap());
 
         assert_eq!(view_chain.current_view_number(), 1);
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
         assert_eq!(view_chain.current().votes.len(), 0);
 
@@ -1140,7 +1386,7 @@ mod tests {
         }
 
         assert_eq!(view_chain.current_view_number(), 1);
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
         assert_eq!(view_chain.current().votes.len(), 0);
 
@@ -1182,7 +1428,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(view_chain.current_view_number(), 2);
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=2);
         assert_eq!(view_chain.current().votes.len(), 0);
 
@@ -1300,7 +1546,7 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v3).unwrap();
 
         assert_eq!(view_chain.current_view_number(), 3);
-        assert_eq!(view_chain.unfinalized_count(), 3);
+        assert_eq!(view_chain.non_finalized_count(), 3);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=3);
 
         assert!(
@@ -1365,7 +1611,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(view_chain.current_view_number(), 2);
-        assert_eq!(view_chain.unfinalized_count(), 2); // Both view 1 (nullified) and view 2 remain
+        assert_eq!(view_chain.non_finalized_count(), 2); // Both view 1 (nullified) and view 2 remain
         assert!(view_chain.non_finalized_views.contains_key(&1));
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=2);
 
@@ -1440,7 +1686,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
 
         assert!(result.is_ok());
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 2 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 2 remains
         assert_eq!(view_chain.current_view_number(), 2);
         assert_eq!(view_chain.current().votes.len(), 0);
         assert_eq!(view_chain.current().nullify_messages.len(), 0);
@@ -1515,7 +1761,7 @@ mod tests {
             view_chain.progress_with_m_notarization(ctx).unwrap();
 
             assert_eq!(view_chain.current_view_number(), view_num);
-            assert_eq!(view_chain.unfinalized_count(), view_num as usize);
+            assert_eq!(view_chain.non_finalized_count(), view_num as usize);
             assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=view_num);
             assert_eq!(view_chain.current().votes.len(), M_SIZE);
             assert_eq!(view_chain.current().nullify_messages.len(), 0);
@@ -1540,7 +1786,7 @@ mod tests {
         // Check that all views are consecutive
         let range = view_chain.non_finalized_view_numbers_range();
         assert_eq!(range, 1..=5);
-        assert_eq!(view_chain.unfinalized_count(), 5);
+        assert_eq!(view_chain.non_finalized_count(), 5);
 
         // Verify each view exists in the chain
         for view_num in 1..=5 {
@@ -1604,7 +1850,7 @@ mod tests {
             ViewChain::<N, F, M_SIZE>::new(genesis_ctx, setup.storage, Duration::from_secs(10));
 
         assert_eq!(view_chain.current_view_number(), 1);
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -1669,7 +1915,7 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // ASSERT: View 1 is still unfinalized (M-notarization does NOT finalize)
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
         assert!(view_chain.non_finalized_views.contains_key(&1));
 
         // View 1 block should NOT be marked as finalized
@@ -1714,21 +1960,21 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // View 1 still unfinalized with only M-notarization
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
 
         // Now add votes to reach L-notarization threshold (n-f = 4 votes total)
         let vote_4 = create_vote(3, 1, block_hash_v1, leader_id, &setup);
         view_chain.route_vote(vote_4, &setup.peer_set).unwrap();
 
         // View 1 still unfinalized until we explicitly finalize
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
 
         // Now finalize with L-notarization
         let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
         assert!(result.is_ok());
 
         // After L-notarization, view 1 is removed (finalized)
-        assert_eq!(view_chain.unfinalized_count(), 1);
+        assert_eq!(view_chain.non_finalized_count(), 1);
         assert!(!view_chain.non_finalized_views.contains_key(&1));
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -1765,7 +2011,7 @@ mod tests {
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
         // CRITICAL: View 1 should STILL be in chain (nullification doesn't remove it)
-        assert_eq!(view_chain.unfinalized_count(), 2);
+        assert_eq!(view_chain.non_finalized_count(), 2);
         assert!(view_chain.non_finalized_views.contains_key(&1));
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -2060,7 +2306,7 @@ mod tests {
         // Should succeed and persist view 1, view 2 (nullified), and view 3 (finalized)
         result.unwrap();
         // assert!(result.is_ok());
-        // assert_eq!(view_chain.unfinalized_count(), 1); // Only view 4 remains
+        // assert_eq!(view_chain.non_finalized_count(), 1); // Only view 4 remains
         // assert!(!view_chain.non_finalized_views.contains_key(&1));
         // assert!(!view_chain.non_finalized_views.contains_key(&2));
         // assert!(!view_chain.non_finalized_views.contains_key(&3));
@@ -2364,7 +2610,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(2, &setup.peer_set);
 
         assert!(result.is_ok());
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 3 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 3 remains
         assert!(!view_chain.non_finalized_views.contains_key(&1));
         assert!(!view_chain.non_finalized_views.contains_key(&2));
 
@@ -2443,7 +2689,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(5, &setup.peer_set);
 
         assert!(result.is_ok());
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 6 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 6 remains
         for v in 1..=5 {
             assert!(!view_chain.non_finalized_views.contains_key(&v));
         }
@@ -2853,7 +3099,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
 
         assert!(result.is_ok());
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 4 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 4 remains
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -2890,7 +3136,7 @@ mod tests {
         assert!(result.is_ok());
 
         // After persisting, non_finalized_views should be empty
-        assert_eq!(view_chain.unfinalized_count(), 0);
+        assert_eq!(view_chain.non_finalized_count(), 0);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -2992,7 +3238,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
 
         assert!(result.is_ok());
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 4 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 4 remains
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3423,7 +3669,7 @@ mod tests {
         assert!(stored_leader_v4.is_none());
 
         // Verify the chain state is correct after finalization
-        assert_eq!(view_chain.unfinalized_count(), 1); // Only view 4 remains
+        assert_eq!(view_chain.non_finalized_count(), 1); // Only view 4 remains
         assert_eq!(view_chain.current_view_number(), 4);
 
         // Verify previously_committed_block_hash was updated
