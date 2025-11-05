@@ -9,12 +9,13 @@ use crate::{
         config::ConsensusConfig,
         events::ViewProgressEvent,
         leader_manager::{LeaderManager, LeaderSelectionStrategy, RoundRobinLeaderManager},
+        view_chain::ViewChain,
         view_context::{
             CollectedNullificationsResult, CollectedVotesResult, LeaderProposalResult,
             ShouldMNotarize, ViewContext,
         },
     },
-    crypto::aggregated::{BlsPublicKey, PeerId},
+    crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId},
     state::{
         block::Block,
         notarizations::{MNotarization, Vote},
@@ -30,33 +31,32 @@ use crate::{
 /// [`ViewProgressManager`] is the main service for the view progress of the underlying Minimmit
 /// consensus protocol.
 ///
-/// It is responsible for managing the view progress of the consensus protocol,
-/// including the leader selection, the block proposal, the voting, the nullification,
-/// the M-notarization, the L-notarization, and the nullification.
+/// It coordinates consensus by managing the view chain, processing consensus messages,
+/// handling leader selection, and triggering view progression and block finalization events.
+///
+/// # Responsibilities
+/// - Route consensus messages to the appropriate view in the chain
+/// - Track view progression via M-notarization (2f+1 votes) or nullification (2f+1 nullify messages)
+/// - Trigger block finalization via L-notarization (n-f votes)
+/// - Manage leader selection and block proposal
+/// - Maintain transaction pool for block proposals
+///
+/// # Type Parameters
+/// * `N` - Total number of replicas in the network
+/// * `F` - Maximum number of faulty replicas tolerated
+/// * `M_SIZE` - Size of aggregated signature for M-notarizations (typically 2f+1)
 pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The configuration of the consensus protocol.
     config: ConsensusConfig,
 
     /// The leader manager algorithm to use for leader selection.
-    #[allow(unused)]
     leader_manager: Box<dyn LeaderManager>,
 
-    /// The per-view context tracking
-    current_view_context: ViewContext<N, F, M_SIZE>,
+    /// The chain of non-finalized views.
+    view_chain: ViewChain<N, F, M_SIZE>,
 
-    /// The un-finalized view context (if any)
-    ///
-    /// This is a view not yet finalized by a supra-majority vote (n-f) or a nullification.
-    /// But that has already received a m-notarization, and therefore, the replica has
-    /// progressed to the next view.
-    unfinalized_view_context: Option<ViewContext<N, F, M_SIZE>>,
-
-    /// The persistence storage for the consensus protocol
-    ///
-    /// This is used to persist the view contexts and the votes/nullifications/notarizations
-    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication
-    /// protocol.
-    _persistence_storage: ConsensusStore,
+    /// The replica's own peer ID.
+    replica_id: PeerId,
 
     /// The set of peers in the consensus protocol.
     peers: PeerSet,
@@ -81,12 +81,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .collect(),
         );
         let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        let view_chain = ViewChain::new(view_context, persistence_storage, config.view_timeout);
         Ok(Self {
             config,
             leader_manager,
-            current_view_context: view_context,
-            unfinalized_view_context: None,
-            _persistence_storage: persistence_storage,
+            view_chain,
+            replica_id,
             peers,
             pending_txs: Vec::new(),
         })
@@ -125,29 +125,32 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
                 .collect(),
         );
+
         let leader_id = leader_manager.leader_for_view(0)?.peer_id();
         let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        let view_chain = ViewChain::new(view_context, persistence_storage, config.view_timeout);
+
         Ok(Self {
             config,
             leader_manager,
-            current_view_context: view_context,
-            unfinalized_view_context: None,
+            view_chain,
+            replica_id,
             peers,
             pending_txs: Vec::new(),
-            _persistence_storage: persistence_storage,
         })
     }
 
-    /// [`process_consensus_msg`] is the main driver of the underlying state machine
-    /// replication algorithm. Based on received [`ConsensusMessage`], it processes
-    /// these and makes sure progress the SMR whenever possible.
+    /// Main driver of the state machine replication algorithm.
+    ///
+    /// Processes received `ConsensusMessage` and emits appropriate `ViewProgressEvent`s
+    /// to guide the replica's actions.
     pub fn process_consensus_msg(
         &mut self,
         consensus_message: ConsensusMessage<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
         match consensus_message {
             ConsensusMessage::BlockProposal(block) => self.handle_block_proposal(block),
-            ConsensusMessage::Vote(vote) => self.handle_new_vote(vote),
+            ConsensusMessage::Vote(vote) => self.handle_vote(vote),
             ConsensusMessage::Nullify(nullify) => self.handle_nullify(nullify),
             ConsensusMessage::MNotarization(m_notarization) => {
                 self.handle_m_notarization(m_notarization)
@@ -158,141 +161,276 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
     }
 
-    /// Called periodically to check timers and trigger view changes if needed
+    /// Called periodically to check timers and trigger view changes if needed.
+    ///
+    /// Implements the core logic from Minimmit paper Algorithm 1, checking at every timeslot:
+    /// - Leader block proposal
+    /// - Voting on valid proposals or M-notarizations
+    /// - Timeout-based nullification
+    /// - Nullification based on conflicting votes
     #[instrument("debug", skip_all)]
     pub fn tick(&mut self) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if self.current_view_context.is_leader() && !self.current_view_context.has_proposed {
-            if let Some(parent_block_hash) = self.select_parent() {
-                return Ok(ViewProgressEvent::ShouldProposeBlock {
-                    view: self.current_view_context.view_number,
-                    parent_block_hash,
+        let current_view = self.view_chain.current();
+        let view_range = self.view_chain.non_finalized_view_numbers_range();
+
+        for view_number in view_range {
+            // Check if this past view has timed out and should be nullified
+            let view_ctx = self.view_chain.find_view_context(view_number).unwrap();
+
+            if current_view.view_number == view_ctx.view_number {
+                // NOTE: In the case of the current view, we should prioritize handling leader block proposal
+                continue;
+            }
+
+            if view_ctx.should_timeout_nullify(self.config.view_timeout) {
+                return Ok(ViewProgressEvent::ShouldNullify {
+                    view: view_ctx.view_number,
                 });
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Failed to retrieve a parent block hash for the current view: {}",
-                    self.current_view_context.view_number
-                ));
             }
         }
 
-        if !self.current_view_context.has_nullified
-            && self.current_view_context.entered_at.elapsed() >= self.config.view_timeout
-        {
-            self.current_view_context.has_nullified = true;
-            return Ok(ViewProgressEvent::ShouldNullify {
-                view: self.current_view_context.view_number,
+        // If this replica is the leader and hasn't proposed yet
+        if current_view.is_leader() && !current_view.has_proposed {
+            return Ok(ViewProgressEvent::ShouldProposeBlock {
+                view: current_view.view_number,
+                parent_block_hash: current_view.parent_block_hash,
             });
         }
 
-        if !self.current_view_context.has_voted && !self.current_view_context.has_nullified {
-            if let Some(block) = &self.current_view_context.block {
-                self.current_view_context.has_voted = true;
-                self.current_view_context.block_hash = Some(block.get_hash());
-                return Ok(ViewProgressEvent::ShouldVote {
-                    view: self.current_view_context.view_number,
-                    block_hash: block.get_hash(),
+        if !current_view.has_voted
+            && !current_view.has_nullified
+            && let Some(ref block) = current_view.block
+        {
+            return Ok(ViewProgressEvent::ShouldVote {
+                view: current_view.view_number,
+                block_hash: block.get_hash(),
+            });
+        }
+
+        // If timer = 2Δ and haven't nullified and haven't voted, send nullify
+        if !current_view.has_nullified
+            && !current_view.has_voted
+            && current_view.entered_at.elapsed() >= self.config.view_timeout
+        {
+            return Ok(ViewProgressEvent::ShouldNullify {
+                view: current_view.view_number,
+            });
+        }
+
+        // If M-notarization exists for current view and haven't voted/nullified, vote before progressing
+        if !current_view.has_voted
+            && !current_view.has_nullified
+            && current_view.nullification.is_none()
+            && let Some(ref m_notarization) = current_view.m_notarization
+        {
+            return Ok(ViewProgressEvent::ShouldVote {
+                view: current_view.view_number,
+                block_hash: m_notarization.block_hash,
+            });
+        }
+
+        if current_view.has_voted
+            && !current_view.has_nullified
+            && let Some(block_hash) = current_view.block_hash
+        {
+            // Count conflicting messages: nullifies + votes for different blocks
+            let mut conflicting_count = current_view.nullify_messages.len();
+
+            for vote in &current_view.votes {
+                if vote.block_hash != block_hash {
+                    conflicting_count += 1;
+                }
+            }
+
+            // If we have ≥2f+1 conflicting messages, we should nullify immediately
+            if conflicting_count >= 2 * F + 1 {
+                return Ok(ViewProgressEvent::ShouldNullify {
+                    view: current_view.view_number,
                 });
             }
-            Ok(ViewProgressEvent::Await)
-        } else {
-            // In this case, the replica has either voted for a block, or nullified the current
-            // view. In both cases, we can return a no-op event.
-            Ok(ViewProgressEvent::NoOp)
         }
+
+        // Check if we have L-notarization (n-f votes) for any block in current view
+        if current_view.votes.len() >= N - F
+            && let Some(block_hash) = current_view.block_hash
+        {
+            return Ok(ViewProgressEvent::ShouldFinalize {
+                view: current_view.view_number,
+                block_hash,
+            });
+        }
+
+        // If no block available yet, await
+        if !current_view.has_voted && !current_view.has_nullified && current_view.block.is_none() {
+            return Ok(ViewProgressEvent::Await);
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
-    /// Adds a new transaction to the replica's `pending_transactions` values.
+    /// Adds a new transaction to the replica's pending transaction pool.
     pub fn add_transaction(&mut self, tx: Transaction) {
         self.pending_txs.push(tx)
     }
 
-    pub fn select_parent(&self) -> Option<[u8; blake3::OUT_LEN]> {
-        todo!()
+    /// Returns pending transactions for block proposal (and clears the pool).
+    pub fn take_pending_transactions(&mut self) -> Vec<Transaction> {
+        std::mem::take(&mut self.pending_txs)
     }
 
-    // pub fn update_view(&mut self) -> Result<()> {
-    //     let new_leader = self
-    //         .leader_manager
-    //         .leader_for_view(self.current_view_context.view_number + 1)?;
+    /// Returns the current view number.
+    pub fn current_view_number(&self) -> u64 {
+        self.view_chain.current_view_number()
+    }
 
-    //     if self.current_view_context.nullification.is_none()
-    //         && self.current_view_context.m_notarization.is_none()
-    //     {
-    //         return Err(anyhow::anyhow!(
-    //             "Cannot update current view to a new view without a nullification or
-    // m-notarization"         ));
-    //     }
+    /// Returns the replica's peer ID.
+    pub fn replica_id(&self) -> PeerId {
+        self.replica_id
+    }
 
-    //     if let Some(ref nullification) = self.current_view_context.nullification {
-    //         // Persist the nullified view to the persistence storage.
-    //         // self.persist_nullified_view(&self.current_view_context)?;
+    /// Returns the number of non-finalized views in the chain.
+    pub fn non_finalized_count(&self) -> usize {
+        self.view_chain.non_finalized_count()
+    }
 
-    //         // Create a new view context for the next view.
-    //         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
-    //             nullification.view + 1,
-    //             new_leader.peer_id(),
-    //             self.current_view_context.replica_id,
-    //             self.current_view_context.parent_block_hash, // NOTE: No progress was made, use
-    // same parent         );
-    //         self.unfinalized_view_context = Some(self.current_view_context);
-
-    //         // Clear unfinalized view context on nullification
-    //         // (The nullified view is persisted and won't be finalized)
-    //         self.unfinalized_view_context = None;
-
-    //         // Progress to the next view (v := v + 1, reset state)
-    //         self.current_view_context = new_view_context;
-
-    //         return Ok(());
-    //     }
-
-    //     if let Some(ref current_view_m_notarization) = self.current_view_context.m_notarization {
-    //         // NOTE: This indicates that the view change has been triggered by a m-notarization.
-    //         // Therefore, the next view can consider the current view block hash as its parent
-    // block hash.         let new_view_context = ViewContext::<N, F, M_SIZE>::new(
-    //             current_view_m_notarization.view + 1,
-    //             new_leader.peer_id(),
-    //             self.current_view_context.replica_id,
-    //             current_view_m_notarization.block_hash,
-    //         );
-    //         self.unfinalized_view_context = Some(self.current_view_context);
-    //         self.current_view_context = new_view_context;
-
-    //         return Ok(());
-    //     }
-
-    //     Ok(())
-    // }
-
-    /// [`handle_block_proposal`] is called when the current replica receives a new block proposal,
-    /// from the leader of the current view.
+    /// Finalizes a view with L-notarization.
     ///
-    /// It validates the block and adds it to the current view context.
-    /// If the block is for a future view, it returns a [`ViewProgressEvent::ShouldUpdateView`]
-    /// event, to update the view context to the future view.
-    /// If the block is for the current view, and it passes all validation checks in
-    /// [`ViewContext::add_new_view_block`], then the method returns a
-    /// [`ViewProgressEvent::ShouldVote`] event, to vote for the block.
+    /// Should be called when a view reaches n-f votes to commit the block to the ledger.
+    pub fn finalize_view(&mut self, view: u64) -> Result<()> {
+        self.view_chain
+            .finalize_with_l_notarization(view, &self.peers)
+    }
+
+    /// Marks that the current replica has proposed a block for a view.
+    pub fn mark_proposed(&mut self, view: u64) -> Result<()> {
+        if view == self.view_chain.current_view_number() {
+            self.view_chain.current_view_mut().has_proposed = true;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Cannot mark proposed for view {} (current view: {})",
+                view,
+                self.view_chain.current_view_number()
+            ))
+        }
+    }
+
+    /// Marks that the current replica has voted for a block for a view.
+    pub fn mark_voted(&mut self, view: u64) -> Result<()> {
+        if let Some(ctx) = self.view_chain.find_view_context_mut(view) {
+            ctx.has_voted = true;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Cannot mark voted for view {} (view not found)",
+                view
+            ))
+        }
+    }
+
+    /// Marks that the current replica has nullified a view.
+    pub fn mark_nullified(&mut self, view: u64) -> Result<()> {
+        if let Some(ctx) = self.view_chain.find_view_context_mut(view) {
+            ctx.has_nullified = true;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Cannot mark nullified for view {} (view not found)",
+                view
+            ))
+        }
+    }
+
+    /// Returns the M-notarization for a view.
+    ///
+    /// Returns an error if the view is not found or the M-notarization is not found.
+    pub fn get_m_notarization(&self, view: u64) -> Result<MNotarization<N, F, M_SIZE>> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+
+        view_ctx
+            .m_notarization
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("M-notarization not found for view {}", view))
+    }
+
+    /// Returns the nullification for a view.
+    ///
+    /// Returns an error if the view is not found or the nullification is not found.
+    pub fn get_nullification(&self, view: u64) -> Result<Nullification<N, F, M_SIZE>> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+
+        view_ctx
+            .nullification
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Nullification not found for view {}", view))
+    }
+
+    /// Adds the current replica's vote for a block in a view.
+    /// Should be called by the state machine after creating and broadcasting a vote.
+    pub fn add_own_vote(&mut self, view: u64, signature: BlsSignature) -> Result<()> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+
+        view_ctx.add_own_vote(signature)?;
+        Ok(())
+    }
+
+    /// Adds the leader's implicit vote when proposing a block.
+    /// Should be called by the state machine after creating and broadcasting a block proposal.
+    pub fn add_leader_vote_for_block_proposal(
+        &mut self,
+        view: u64,
+        block: Block,
+        signature: BlsSignature,
+    ) -> Result<()> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+
+        view_ctx.add_leader_vote_for_block_proposal(block, signature)?;
+        Ok(())
+    }
+
+    /// Gracefully shuts down by persisting all non-finalized views.
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.view_chain.persist_all_views()
+    }
+
+    /// Handles a new block proposal.
+    ///
+    /// Routes to view chain; only checks if we need to update to a future view.
+    /// All other validation is delegated to [`ViewChain`]/[`ViewContext`].
     fn handle_block_proposal(&mut self, block: Block) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        // Validate block for the current view
-        if block.header.view > self.current_view_context.view_number {
-            // If the block is for a future view, then we need to update the view context to the
-            // future view, if the leader of the future view is not the current leader.
-            let block_view_leader = self
+        let current_view_number = self.view_chain.current_view_number();
+        let block_view_number = block.header.view;
+
+        // Check if the current block is for a future view - in this case,
+        // we need to update the view chain for a future view
+        if block_view_number > current_view_number {
+            let leader_id = self
                 .leader_manager
-                .leader_for_view(block.header.view)?
+                .leader_for_view(block_view_number)?
                 .peer_id();
-            if block_view_leader != block.leader {
+            if leader_id != block.leader {
                 return Err(anyhow::anyhow!(
                     "Block leader {} is not the correct view leader {} for block's view {}",
-                    block_view_leader,
                     block.leader,
-                    block.view()
+                    leader_id,
+                    block_view_number
                 ));
             }
             return Ok(ViewProgressEvent::ShouldUpdateView {
-                new_view: block.header.view,
-                leader: block_view_leader,
+                new_view: block_view_number,
+                leader: leader_id,
             });
         }
 
@@ -302,290 +440,333 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             is_enough_to_finalize,
             should_await,
             should_vote,
-        } = self.current_view_context.add_new_view_block(block)?;
+        } = self
+            .view_chain
+            .add_block_proposal(block_view_number, block)?;
+
+        if should_await {
+            return Ok(ViewProgressEvent::Await);
+        }
+
+        if is_enough_to_m_notarize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
+                view: block_view_number,
+                block_hash,
+            });
+        }
+
+        if is_enough_to_finalize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
+                view: block_view_number,
+                block_hash,
+            });
+        }
 
         if is_enough_to_m_notarize {
-            // NOTE: In this case, the replica has collected enough votes to propose a
-            // M-notarization, but not enough to finalize the view. Therefore, the
-            // replica should vote for the block and notarize it simultaneously.
-            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
-                view: self.current_view_context.view_number,
-                block_hash,
-            });
-        } else if is_enough_to_finalize {
-            // NOTE: In this case, the replica has collected enough votes to finalize the view,
-            // before it has received the block proposal from the leader, as most likely the replica
-            // was beyond. In such case, the replica should vote for the block and finalize the view
-            // simultaneously.
-            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
-                view: self.current_view_context.view_number,
+            return Ok(ViewProgressEvent::ShouldMNotarize {
+                view: block_view_number,
                 block_hash,
             });
         }
 
-        Ok(ViewProgressEvent::ShouldVote {
-            view: self.current_view_context.view_number,
-            block_hash,
-        })
+        if is_enough_to_finalize {
+            return Ok(ViewProgressEvent::ShouldFinalize {
+                view: block_view_number,
+                block_hash,
+            });
+        }
+
+        if should_vote {
+            return Ok(ViewProgressEvent::ShouldVote {
+                view: block_view_number,
+                block_hash,
+            });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
-    fn handle_new_vote(&mut self, vote: Vote) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if vote.view > self.current_view_context.view_number {
-            // TODO: Handle the case where a vote for a future view is received.
-            // In this case, the replica should try to either sync up for the future view, or
-            // ignore it altogether. Ideally, the replica would try to sync up for the future view,
-            // but that involves more work, as it would require a supra-majority of replicas
-            // providing more blocks to the current replica.
-            let block_view_leader = self.leader_manager.leader_for_view(vote.view)?.peer_id();
-            if block_view_leader != vote.leader_id {
-                return Err(anyhow::anyhow!(
-                    "Vote for leader {} is not the correct view leader {} for vote's view {}",
-                    vote.leader_id,
-                    block_view_leader,
-                    vote.view
-                ));
-            }
+    /// Handles a new vote.
+    ///
+    /// Routes to view chain; only checks if we need to update to a future view.
+    /// All other validation is delegated to ViewChain/ViewContext.
+    fn handle_vote(&mut self, vote: Vote) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
+        let current_view_number = self.view_chain.current_view_number();
+
+        // Check if message is for a future view - in this case,
+        // we need to update the view chain for a future view
+        if vote.view > current_view_number {
+            let leader_id = self.leader_manager.leader_for_view(vote.view)?.peer_id();
             return Ok(ViewProgressEvent::ShouldUpdateView {
                 new_view: vote.view,
-                leader: block_view_leader,
+                leader: leader_id,
             });
         }
 
-        if self.current_view_context.view_number == vote.view {
-            let CollectedVotesResult {
-                should_await,
-                is_enough_to_m_notarize,
-                is_enough_to_finalize,
-                should_nullify,
-            } = self.current_view_context.add_vote(vote, &self.peers)?;
-            if should_await {
-                return Ok(ViewProgressEvent::Await);
-            } else if is_enough_to_m_notarize {
-                return Ok(ViewProgressEvent::ShouldMNotarize {
-                    view: self.current_view_context.view_number,
-                    block_hash: self.current_view_context.block_hash.unwrap(),
-                });
-            } else if is_enough_to_finalize {
-                return Ok(ViewProgressEvent::ShouldFinalize {
-                    view: self.current_view_context.view_number,
-                    block_hash: self.current_view_context.block_hash.unwrap(),
-                });
-            } else {
-                return Ok(ViewProgressEvent::NoOp);
-            }
+        let vote_view_number = vote.view;
+        let vote_block_hash = vote.block_hash;
+
+        let CollectedVotesResult {
+            should_await,
+            is_enough_to_m_notarize,
+            is_enough_to_finalize,
+            should_nullify,
+            should_vote,
+        } = self.view_chain.route_vote(vote, &self.peers)?;
+
+        if should_await {
+            return Ok(ViewProgressEvent::Await);
         }
 
-        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
-            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
-            if vote.view == unfinalized_view_context.view_number {
-                let CollectedVotesResult {
-                    should_await,
-                    is_enough_to_m_notarize,
-                    is_enough_to_finalize,
-                    should_nullify,
-                } = unfinalized_view_context.add_vote(vote, &self.peers)?;
-                if should_await {
-                    return Ok(ViewProgressEvent::Await);
-                } else if is_enough_to_m_notarize {
-                    return Ok(ViewProgressEvent::ShouldMNotarize {
-                        view: unfinalized_view_context.view_number,
-                        block_hash: unfinalized_view_context.block_hash.unwrap(),
-                    });
-                } else if is_enough_to_finalize {
-                    return Ok(ViewProgressEvent::ShouldFinalize {
-                        view: unfinalized_view_context.view_number,
-                        block_hash: unfinalized_view_context.block_hash.unwrap(),
-                    });
-                } else {
-                    return Ok(ViewProgressEvent::NoOp);
-                }
-            }
+        if should_nullify {
+            return Ok(ViewProgressEvent::ShouldNullify {
+                view: vote_view_number,
+            });
         }
 
-        Err(anyhow::anyhow!(
-            "Vote for view {} is not the current view {} or the unfinalized view {}",
-            vote.view,
-            self.current_view_context.view_number,
-            self.current_view_context.view_number - 1,
-        ))
+        if is_enough_to_m_notarize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+            });
+        }
+
+        if is_enough_to_finalize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+            });
+        }
+
+        if is_enough_to_m_notarize {
+            return Ok(ViewProgressEvent::ShouldMNotarize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+            });
+        }
+
+        if is_enough_to_finalize {
+            return Ok(ViewProgressEvent::ShouldFinalize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+            });
+        }
+
+        if should_vote {
+            return Ok(ViewProgressEvent::ShouldVote {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+            });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
+    /// Handles a nullify message.
+    ///
+    /// Routes to view chain; only checks if we need to update to a future view.
     fn handle_nullify(&mut self, nullify: Nullify) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if nullify.view > self.current_view_context.view_number {
-            let block_view_leader = self.leader_manager.leader_for_view(nullify.view)?.peer_id();
-            if block_view_leader != nullify.leader_id {
+        let current_view_number = self.view_chain.current_view_number();
+
+        // Check if message is for a future view
+        if nullify.view > current_view_number {
+            let leader_id = self.leader_manager.leader_for_view(nullify.view)?.peer_id();
+            if leader_id != nullify.leader_id {
                 return Err(anyhow::anyhow!(
                     "Nullify for leader {} is not the correct view leader {} for nullify's view {}",
                     nullify.leader_id,
-                    block_view_leader,
+                    leader_id,
                     nullify.view
                 ));
             }
             return Ok(ViewProgressEvent::ShouldUpdateView {
                 new_view: nullify.view,
-                leader: block_view_leader,
+                leader: leader_id,
             });
         }
 
-        if self.current_view_context.view_number == nullify.view {
-            self.current_view_context
-                .add_nullify(nullify, &self.peers)?;
-            if self.current_view_context.nullification.is_some() {
-                return Ok(ViewProgressEvent::ShouldBroadcastNullification {
-                    view: self.current_view_context.view_number,
-                });
-            }
-            return Ok(ViewProgressEvent::NoOp);
+        // Route to view chain
+        let nullify_view_number = nullify.view;
+        let has_nullification = self.view_chain.route_nullify(nullify, &self.peers)?;
+
+        if has_nullification {
+            return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                view: nullify_view_number,
+            });
         }
 
-        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
-            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
-            if nullify.view == unfinalized_view_context.view_number {
-                unfinalized_view_context.add_nullify(nullify, &self.peers)?;
-                if unfinalized_view_context.nullification.is_some() {
-                    return Ok(ViewProgressEvent::ShouldBroadcastNullification {
-                        view: unfinalized_view_context.view_number,
-                    });
-                }
-                return Ok(ViewProgressEvent::NoOp);
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "Nullify for view {} is not the current view {} or the unfinalized view {}",
-            nullify.view,
-            self.current_view_context.view_number,
-            self.current_view_context.view_number - 1,
-        ))
+        Ok(ViewProgressEvent::NoOp)
     }
 
+    /// Handles an M-notarization.
+    ///
+    /// Routes to view chain and triggers view progression if appropriate.
     fn handle_m_notarization(
         &mut self,
         m_notarization: MNotarization<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if self.current_view_context.view_number < m_notarization.view {
-            let block_view_leader = self
+        let current_view_number = self.view_chain.current_view_number();
+
+        // Check if message is for a future view
+        if m_notarization.view > current_view_number {
+            let leader_id = self
                 .leader_manager
                 .leader_for_view(m_notarization.view)?
                 .peer_id();
-            if block_view_leader != m_notarization.leader_id {
+            if leader_id != m_notarization.leader_id {
                 return Err(anyhow::anyhow!(
                     "M-notarization for leader {} is not the correct view leader {} for m-notarization's view {}",
                     m_notarization.leader_id,
-                    block_view_leader,
+                    leader_id,
                     m_notarization.view
                 ));
             }
             return Ok(ViewProgressEvent::ShouldUpdateView {
                 new_view: m_notarization.view,
-                leader: block_view_leader,
+                leader: leader_id,
             });
         }
 
-        if self.current_view_context.view_number == m_notarization.view {
-            let ShouldMNotarize {
-                should_notarize,
-                should_await,
-                should_vote,
-                should_nullify,
-            } = self
-                .current_view_context
-                .add_m_notarization(m_notarization, &self.peers)?;
-            if should_notarize {
+        let m_notarization_view_number = m_notarization.view;
+        let m_notarization_block_hash = m_notarization.block_hash;
+
+        let ShouldMNotarize {
+            should_notarize,
+            should_await,
+            should_vote,
+            should_nullify,
+        } = self
+            .view_chain
+            .route_m_notarization(m_notarization, &self.peers)?;
+
+        if should_await {
+            return Ok(ViewProgressEvent::Await);
+        }
+
+        if should_nullify {
+            return Ok(ViewProgressEvent::ShouldNullifyView {
+                view: m_notarization_view_number,
+            });
+        }
+
+        if m_notarization_view_number == current_view_number {
+            let new_view = m_notarization_view_number + 1;
+            let new_leader = self.leader_manager.leader_for_view(new_view)?.peer_id();
+
+            // With M-notarization, parent hash updates to the notarized block
+            let parent_hash = m_notarization_block_hash;
+            let new_view_context =
+                ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
+            self.view_chain
+                .progress_with_m_notarization(new_view_context)?;
+
+            if should_vote {
+                return Ok(ViewProgressEvent::ShouldVoteAndProgressToNextView {
+                    old_view: m_notarization_view_number,
+                    block_hash: m_notarization_block_hash,
+                    new_view,
+                    leader: new_leader,
+                });
+            } else {
                 return Ok(ViewProgressEvent::ProgressToNextView {
-                    new_view: self.current_view_context.view_number + 1,
-                    leader: self
-                        .leader_manager
-                        .leader_for_view(self.current_view_context.view_number + 1)?
-                        .peer_id(),
+                    new_view,
+                    leader: new_leader,
+                    notarized_block_hash: m_notarization_block_hash,
                 });
             }
-            if should_await {
-                return Ok(ViewProgressEvent::Await);
-            }
-            return Ok(ViewProgressEvent::NoOp);
         }
 
-        if let Some(ref unfinalized_view_context) = self.unfinalized_view_context {
-            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
-            if m_notarization.view == unfinalized_view_context.view_number {
-                // NOTE: There is not anything left to do here, as the m-notarization has already
-                // been added to the unfinalized view context.
-                return Ok(ViewProgressEvent::NoOp);
-            }
+        if should_notarize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
+                view: m_notarization_view_number,
+                block_hash: m_notarization_block_hash,
+            });
         }
 
-        Err(anyhow::anyhow!(
-            "M-notarization for view {} is not the current view {} or the unfinalized view {}",
-            m_notarization.view,
-            self.current_view_context.view_number,
-            self.current_view_context.view_number - 1,
-        ))
+        if should_notarize {
+            // Process pending child blocks
+
+            return Ok(ViewProgressEvent::ShouldMNotarize {
+                view: m_notarization_view_number,
+                block_hash: m_notarization_block_hash,
+            });
+        }
+
+        if should_vote {
+            return Ok(ViewProgressEvent::ShouldVote {
+                view: m_notarization_view_number,
+                block_hash: m_notarization_block_hash,
+            });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
+    /// Handles a nullification.
+    ///
+    /// Routes to view chain and triggers view progression if appropriate.
     fn handle_nullification(
         &mut self,
         nullification: Nullification<N, F, M_SIZE>,
     ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
-        if nullification.view > self.current_view_context.view_number {
-            let block_view_leader = self
+        let current_view_number = self.view_chain.current_view_number();
+
+        // Check if message is for a future view
+        if nullification.view > current_view_number {
+            let leader_id = self
                 .leader_manager
                 .leader_for_view(nullification.view)?
                 .peer_id();
-            if block_view_leader != nullification.leader_id {
+            if leader_id != nullification.leader_id {
                 return Err(anyhow::anyhow!(
                     "Nullification for leader {} is not the correct view leader {} for nullification's view {}",
                     nullification.leader_id,
-                    block_view_leader,
+                    leader_id,
                     nullification.view
                 ));
             }
             return Ok(ViewProgressEvent::ShouldUpdateView {
                 new_view: nullification.view,
-                leader: block_view_leader,
+                leader: leader_id,
             });
         }
 
-        if self.current_view_context.view_number == nullification.view {
-            let CollectedNullificationsResult {
+        let nullification_view_number = nullification.view;
+
+        let CollectedNullificationsResult {
+            should_broadcast_nullification,
+        } = self
+            .view_chain
+            .route_nullification(nullification, &self.peers)?;
+
+        // Progress to next view with nullification
+        if nullification_view_number == current_view_number {
+            let new_view = nullification_view_number + 1;
+            let new_leader = self.leader_manager.leader_for_view(new_view)?.peer_id();
+
+            // With nullification, parent hash stays the same (no progress)
+            let parent_hash = self.view_chain.current().parent_block_hash;
+            let new_view_context =
+                ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
+            self.view_chain
+                .progress_with_nullification(new_view_context)?;
+
+            return Ok(ViewProgressEvent::ProgressToNextViewOnNullification {
+                new_view,
+                leader: new_leader,
                 should_broadcast_nullification,
-            } = self
-                .current_view_context
-                .add_nullification(nullification, &self.peers)?;
-            if should_broadcast_nullification {
-                return Ok(ViewProgressEvent::ShouldBroadcastNullification {
-                    view: self.current_view_context.view_number,
-                });
-            }
-            return Ok(ViewProgressEvent::ShouldNullify {
-                view: self.current_view_context.view_number,
             });
         }
 
-        if let Some(ref mut unfinalized_view_context) = self.unfinalized_view_context {
-            unfinalized_view_context.has_view_progressed_without_m_notarization()?;
-            if nullification.view == unfinalized_view_context.view_number {
-                let CollectedNullificationsResult {
-                    should_broadcast_nullification,
-                } = unfinalized_view_context.add_nullification(nullification, &self.peers)?;
-                if should_broadcast_nullification {
-                    return Ok(ViewProgressEvent::ShouldBroadcastNullification {
-                        view: unfinalized_view_context.view_number,
-                    });
-                } else {
-                    return Ok(ViewProgressEvent::ShouldNullify {
-                        view: unfinalized_view_context.view_number,
-                    });
-                }
-            }
+        if should_broadcast_nullification {
+            return Ok(ViewProgressEvent::ShouldBroadcastNullification {
+                view: nullification_view_number,
+            });
         }
 
-        Err(anyhow::anyhow!(
-            "Nullification for view {} is not the current view {} or the unfinalized view {}",
-            nullification.view,
-            self.current_view_context.view_number,
-            self.current_view_context.view_number - 1,
-        ))
+        Ok(ViewProgressEvent::ShouldNullify {
+            view: nullification_view_number,
+        })
     }
 
     fn _try_update_view(&mut self, view: u64) -> Result<()> {

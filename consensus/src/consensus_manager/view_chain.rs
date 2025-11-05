@@ -120,6 +120,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             .expect("Current view context not found")
     }
 
+    /// Finds a view context by view number
+    pub fn find_view_context(&self, view_number: u64) -> Option<&ViewContext<N, F, M_SIZE>> {
+        self.non_finalized_views.get(&view_number)
+    }
+
+    /// Finds a mutable view context by view number
+    pub fn find_view_context_mut(
+        &mut self,
+        view_number: u64,
+    ) -> Option<&mut ViewContext<N, F, M_SIZE>> {
+        self.non_finalized_views.get_mut(&view_number)
+    }
+
     /// Returns the current view number
     pub fn current_view_number(&self) -> u64 {
         self.current_view

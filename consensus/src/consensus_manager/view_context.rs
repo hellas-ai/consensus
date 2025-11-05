@@ -258,12 +258,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         if self.block_hash.is_none() {
             // NOTE: In this case, the replica has not yet received the view proposed block hash
             // from the leader, so we need to store the vote in the non-verified votes set.
+            let should_vote = !self.has_voted
+                && !self.has_nullified
+                && self
+                    .non_verified_votes
+                    .iter()
+                    .filter(|v| v.block_hash == vote.block_hash)
+                    .count() + 1 // NOTE: We need to include the current vote in the count
+                    > 2 * F;
             self.non_verified_votes.insert(vote);
+
             return Ok(CollectedVotesResult {
                 should_await: true,
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_nullify: self.should_nullify_after_receiving_new_vote(),
+                should_vote,
             });
         }
 
@@ -277,6 +287,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_nullify,
+                should_vote: false,
             });
         }
 
@@ -305,6 +316,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             is_enough_to_m_notarize,
             is_enough_to_finalize,
             should_nullify,
+            should_vote: false,
         })
     }
 
@@ -317,6 +329,54 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.votes.insert(Vote::new(
             self.view_number,
             self.block_hash.unwrap(),
+            signature,
+            self.replica_id,
+            self.leader_id,
+        ));
+        Ok(())
+    }
+
+    /// Adds a leader vote for a block proposal to the current view's context.
+    ///
+    /// Validates the block's view number, leader, and parent hash match the current view.
+    /// Stores the vote in the votes set.
+    ///
+    /// Returns an error if validation fails.
+    ///
+    /// TODO: The [`Block`] should have a [`BlockHeader`] with a [`Signature`] field. Moreover,
+    /// the signature should be verified and should be consistent with the [`Vote`] signature.
+    pub fn add_leader_vote_for_block_proposal(
+        &mut self,
+        block: Block,
+        signature: BlsSignature,
+    ) -> Result<()> {
+        if block.view() != self.view_number {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for view {} is not the current view {}",
+                block.view(),
+                self.view_number
+            ));
+        }
+
+        if block.leader != self.leader_id {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for leader {} is not the current leader {}",
+                block.leader,
+                self.leader_id
+            ));
+        }
+
+        if block.parent_block_hash() != self.parent_block_hash {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for parent block hash {} is not the current parent block hash {}",
+                hex::encode(block.parent_block_hash()),
+                hex::encode(self.parent_block_hash)
+            ));
+        }
+
+        self.votes.insert(Vote::new(
+            self.view_number,
+            block.get_hash(),
             signature,
             self.replica_id,
             self.leader_id,
@@ -637,6 +697,8 @@ pub struct CollectedVotesResult {
     /// Whether the current replica should nullify the current view, after receiving enough invalid
     /// votes, that is, strictly more than 2 * F invalid votes.
     pub should_nullify: bool,
+    /// Whether the current replica should vote for the block hash
+    pub should_vote: bool,
 }
 
 /// [`ShouldMNotarize`] is the result of processing a newly received m-notarization for the current
