@@ -385,7 +385,8 @@ mod tests {
             let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
+            let signature = sk.sign(b"block proposal");
+            let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
 
             store.put_finalized_block(&block).unwrap();
             let h = block.get_hash();
@@ -414,7 +415,8 @@ mod tests {
             let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
+            let signature = sk.sign(b"block proposal");
+            let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
 
             store.put_non_finalized_block(&block).unwrap();
             let h = block.get_hash();
@@ -443,7 +445,8 @@ mod tests {
             let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let block = Block::new(5, 0, parent, vec![tx], 123456, false, 1);
+            let signature = sk.sign(b"block proposal");
+            let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
 
             store.put_nullified_block(&block).unwrap();
             let h = block.get_hash();
@@ -534,7 +537,8 @@ mod tests {
             let tx_hash0: [u8; blake3::OUT_LEN] = blake3::hash(b"mbody").into();
             let sig0 = sk0.sign(&tx_hash0);
             let tx0 = Transaction::new(pk0.clone(), [1u8; 32], 1, 0, 1, 0, tx_hash0, sig0);
-            let block = Block::new(6, 0, parent, vec![tx0], 999, false, 1);
+            let signature = sk0.sign(b"block proposal");
+            let block = Block::new(6, 0, parent, vec![tx0], 999, signature, false, 1);
 
             // 3 signers aggregate over block hash
             let (sk1, pk1) = gen_keypair();

@@ -1,7 +1,13 @@
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error};
 use std::{hash::Hash, hash::Hasher};
 
-use crate::{crypto::aggregated::PeerId, state::transaction::Transaction};
+use crate::{
+    crypto::{
+        aggregated::{BlsSignature, PeerId},
+        conversions::ArkSerdeWrapper,
+    },
+    state::transaction::Transaction,
+};
 
 /// [`BlockHeader`] represents the header of a block.
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
@@ -27,6 +33,9 @@ pub struct Block {
     pub leader: PeerId,
     /// The header of the block
     pub header: BlockHeader,
+    /// The signature of the leader's block proposal
+    #[rkyv(with = ArkSerdeWrapper)]
+    pub leader_signature: BlsSignature,
     /// The transactions associated with the block
     pub transactions: Vec<Transaction>,
     /// The hash of the (entire) block
@@ -46,6 +55,7 @@ impl Block {
         parent_block_hash: [u8; blake3::OUT_LEN],
         transactions: Vec<Transaction>,
         timestamp: u64,
+        leader_signature: BlsSignature,
         is_finalized: bool,
         height: u64,
     ) -> Self {
@@ -56,6 +66,7 @@ impl Block {
                 parent_block_hash,
                 timestamp,
             },
+            leader_signature,
             transactions,
             hash: None,
             is_finalized,
@@ -66,7 +77,7 @@ impl Block {
     }
 
     /// Creates the genesis block for the consensus protocol.
-    pub fn genesis() -> Self {
+    pub fn genesis(genesis_block_signature: BlsSignature) -> Self {
         Self {
             leader: 0,
             header: BlockHeader {
@@ -75,6 +86,7 @@ impl Block {
                 timestamp: 0,
             },
             transactions: vec![],
+            leader_signature: genesis_block_signature,
             hash: None,
             is_finalized: false,
             height: 0,
@@ -177,17 +189,37 @@ mod tests {
         parent: [u8; blake3::OUT_LEN],
         tx_bodies: &[&[u8]],
         ts: u64,
+        leader_signature: BlsSignature,
         height: u64,
     ) -> Block {
         let txs = tx_bodies.iter().map(|b| gen_tx(b)).collect::<Vec<_>>();
-        Block::new(view, leader, parent, txs, ts, false, height)
+        Block::new(
+            view,
+            leader,
+            parent,
+            txs,
+            ts,
+            leader_signature,
+            false,
+            height,
+        )
     }
 
     #[test]
     fn hash_is_deterministic_for_same_content() {
         let parent = [1u8; blake3::OUT_LEN];
-        let b1 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, 1);
-        let b2 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, 1);
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+        let b1 = gen_block(
+            5,
+            0,
+            parent,
+            &[b"a", b"b"],
+            123456,
+            leader_signature.clone(),
+            1,
+        );
+        let b2 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, leader_signature, 1);
         assert_eq!(b1.get_hash(), b2.get_hash());
         assert_eq!(b1, b2);
     }
@@ -195,8 +227,18 @@ mod tests {
     #[test]
     fn hash_changes_when_transactions_change() {
         let parent = [2u8; blake3::OUT_LEN];
-        let b1 = gen_block(6, 0, parent, &[b"a", b"b"], 999, 2);
-        let b2 = gen_block(6, 0, parent, &[b"a", b"c"], 999, 2);
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+        let b1 = gen_block(
+            6,
+            0,
+            parent,
+            &[b"a", b"b"],
+            999,
+            leader_signature.clone(),
+            2,
+        );
+        let b2 = gen_block(6, 0, parent, &[b"a", b"c"], 999, leader_signature, 2);
         assert_ne!(b1.get_hash(), b2.get_hash());
         assert_ne!(b1, b2);
     }
@@ -204,15 +246,27 @@ mod tests {
     #[test]
     fn hash_changes_with_order_of_transactions() {
         let parent = [3u8; blake3::OUT_LEN];
-        let b1 = gen_block(7, 0, parent, &[b"x", b"y"], 111, 3);
-        let b2 = gen_block(7, 0, parent, &[b"y", b"x"], 111, 3);
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+        let b1 = gen_block(
+            7,
+            0,
+            parent,
+            &[b"x", b"y"],
+            111,
+            leader_signature.clone(),
+            3,
+        );
+        let b2 = gen_block(7, 0, parent, &[b"y", b"x"], 111, leader_signature, 3);
         assert_ne!(b1.get_hash(), b2.get_hash());
     }
 
     #[test]
     fn getters_return_expected_values() {
         let parent = [9u8; blake3::OUT_LEN];
-        let b = gen_block(42, 0, parent, &[b"a"], 777, 42);
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+        let b = gen_block(42, 0, parent, &[b"a"], 777, leader_signature, 42);
         assert_eq!(b.view(), 42);
         assert_eq!(b.parent_block_hash(), parent);
         assert!(b.is_view_block(42));
@@ -222,7 +276,9 @@ mod tests {
     #[test]
     fn from_block_bytes_recomputes_when_hash_missing() {
         let parent = [4u8; blake3::OUT_LEN];
-        let mut b = gen_block(8, 0, parent, &[b"z"], 222, 8);
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+        let mut b = gen_block(8, 0, parent, &[b"z"], 222, leader_signature.clone(), 8);
         // Simulate an archived block with hash = None
         b.hash = None;
         let bytes = serialize_for_db(&b).expect("serialize");
@@ -231,7 +287,7 @@ mod tests {
         let expected = restored.get_hash();
         let recomputed = {
             // Recompute via creating the same content block again
-            let b2 = gen_block(8, 0, parent, &[b"z"], 222, 8);
+            let b2 = gen_block(8, 0, parent, &[b"z"], 222, leader_signature, 8);
             b2.get_hash()
         };
         assert_eq!(expected, recomputed);

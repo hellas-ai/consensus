@@ -36,7 +36,8 @@ use crate::{
 ///
 /// # Responsibilities
 /// - Route consensus messages to the appropriate view in the chain
-/// - Track view progression via M-notarization (2f+1 votes) or nullification (2f+1 nullify messages)
+/// - Track view progression via M-notarization (2f+1 votes) or nullification (2f+1 nullify
+///   messages)
 /// - Trigger block finalization via L-notarization (n-f votes)
 /// - Manage leader selection and block proposal
 /// - Maintain transaction pool for block proposals
@@ -178,7 +179,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             let view_ctx = self.view_chain.find_view_context(view_number).unwrap();
 
             if current_view.view_number == view_ctx.view_number {
-                // NOTE: In the case of the current view, we should prioritize handling leader block proposal
+                // NOTE: In the case of the current view, we should prioritize handling leader block
+                // proposal
                 continue;
             }
 
@@ -217,7 +219,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
-        // If M-notarization exists for current view and haven't voted/nullified, vote before progressing
+        // If M-notarization exists for current view and haven't voted/nullified, vote before
+        // progressing
         if !current_view.has_voted
             && !current_view.has_nullified
             && current_view.nullification.is_none()

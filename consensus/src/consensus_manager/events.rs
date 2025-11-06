@@ -70,8 +70,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
-    /// If the current replica should vote for a block for the current view, and progress to the next view
-    /// simultaneously.
+    /// If the current replica should vote for a block for the current view, and progress to the
+    /// next view simultaneously.
     ShouldVoteAndProgressToNextView {
         /// Current view number (for which the replica should vote and progress to the next view).
         old_view: u64,
