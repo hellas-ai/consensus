@@ -290,6 +290,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 should_await: true,
                 should_vote: false, /* We don't vote for the block yet, as we are awaiting the
                                      * parent to be notarized */
+                should_nullify: false,
             });
         }
 
@@ -472,7 +473,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         }
 
         // 2. Check that the current view has indeed received a m-notarization.
-        if self.current().m_notarization.is_none() {
+        if self.current().m_notarization.is_none() && self.current().nullification.is_none() {
             return Err(anyhow::anyhow!(
                 "The current view {} has not received a m-notarization, but the view has progressed with a m-notarization",
                 self.current_view
@@ -654,7 +655,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let to_persist_range =
             self.non_finalized_views_until(finalized_view)
                 .ok_or(anyhow::anyhow!(
-                    "View number {} is not an non-finalized view",
+                    "View number {} is not a non-finalized view",
                     finalized_view
                 ))?;
 
@@ -1199,7 +1200,7 @@ mod tests {
         ctx.add_new_view_block(block).unwrap();
 
         // Add votes
-        for i in 0..num_votes {
+        for i in 1..num_votes {
             let vote = create_vote(i, view_number, block_hash, leader_id, setup);
             ctx.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -1258,7 +1259,7 @@ mod tests {
         let mut view_chain =
             ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
 
-        let vote = create_vote(0, 1, block_hash, leader_id, &setup);
+        let vote = create_vote(3, 1, block_hash, leader_id, &setup);
         let result = view_chain.route_vote(vote, &setup.peer_set);
 
         assert!(result.is_ok());
@@ -1270,7 +1271,7 @@ mod tests {
         assert_eq!(view_chain.current_view_number(), 1);
         assert_eq!(view_chain.non_finalized_count(), 1);
         assert_eq!(view_chain.non_finalized_view_numbers_range(), 1..=1);
-        assert_eq!(view_chain.current().votes.len(), 1);
+        assert_eq!(view_chain.current().votes.len(), 2);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -2056,8 +2057,8 @@ mod tests {
         let block_hash_v1 = block_v1.get_hash();
         ctx_v1.add_new_view_block(block_v1).unwrap();
 
-        // Add 2 votes (not enough for M-notarization which needs 3)
-        for i in 0..2 {
+        // Add 1 vote (not enough for M-notarization which needs 3)
+        for i in 1..2 {
             let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2115,8 +2116,8 @@ mod tests {
         let block_hash_v1 = block_v1.get_hash();
         ctx_v1.add_new_view_block(block_v1).unwrap();
 
-        // Add 2 votes (not enough for M-notarization)
-        for i in 0..2 {
+        // Add 1 vote (not enough for M-notarization)
+        for i in 1..2 {
             let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2450,8 +2451,8 @@ mod tests {
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash_v1 = block_v1.get_hash();
         ctx_v1.add_new_view_block(block_v1).unwrap();
-        // Only 2 votes - not enough for M-notarization
-        for i in 0..2 {
+        // Only 1 vote - not enough for M-notarization
+        for i in 1..2 {
             let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2481,7 +2482,7 @@ mod tests {
         ctx_v2.add_new_view_block(block_v2).unwrap();
 
         // Add L-notarization to view 2
-        for i in 0..(N - F) {
+        for i in 1..(N - F) {
             let vote = create_vote(i, 2, block_hash_v2, leader_id, &setup);
             ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2535,7 +2536,7 @@ mod tests {
         let block_v3 = create_test_block(3, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let block_hash_v3 = block_v3.get_hash();
         ctx_v3.add_new_view_block(block_v3).unwrap();
-        for i in 0..(N - F) {
+        for i in 1..(N - F) {
             let vote = create_vote(i, 3, block_hash_v3, leader_id, &setup);
             ctx_v3.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2797,7 +2798,7 @@ mod tests {
         let block_hash_v1 = block_v1.get_hash();
         ctx_v1.add_new_view_block(block_v1).unwrap();
 
-        for i in 0..2 {
+        for i in 1..2 {
             let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
@@ -2944,7 +2945,7 @@ mod tests {
         let block_hash_v1 = block_v1.get_hash();
         ctx_v1.add_new_view_block(block_v1).unwrap();
 
-        for i in 0..2 {
+        for i in 1..2 {
             let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
