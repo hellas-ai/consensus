@@ -160,10 +160,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     ) -> Option<std::ops::RangeInclusive<u64>> {
         let current_view = self.current_view;
         let upper_bound = view_number.min(current_view);
-        let least_non_finalized_view = self
-            .current_view
-            .saturating_sub(self.non_finalized_count() as u64)
-            + 1;
+        let least_non_finalized_view =
+            (self.current_view + 1).saturating_sub(self.non_finalized_count() as u64);
         if least_non_finalized_view > upper_bound {
             return None;
         }

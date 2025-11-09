@@ -246,7 +246,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             }
 
             // If we have ≥2f+1 conflicting messages, we should nullify immediately
-            if conflicting_count >= 2 * F + 1 {
+            if conflicting_count > 2 * F {
                 return Ok(ViewProgressEvent::ShouldNullify {
                     view: current_view.view_number,
                 });
@@ -1890,7 +1890,7 @@ mod tests {
         }
 
         // Now manually add one more nullification to progress to view 2
-        let view1_leader = setup.peer_set.sorted_peer_ids[1 % 6];
+        let view1_leader = setup.peer_set.sorted_peer_ids[1];
         let mut nullify_messages_v1 = HashSet::new();
         for i in 0..3 {
             let peer_id = setup.peer_set.sorted_peer_ids[i];
@@ -1907,7 +1907,7 @@ mod tests {
             .route_nullification(nullification_v1, &setup.peer_set)
             .unwrap();
 
-        let view2_leader = setup.peer_set.sorted_peer_ids[2 % 6];
+        let view2_leader = setup.peer_set.sorted_peer_ids[2];
         let view2_ctx = ViewContext::new(2, view2_leader, replica_id, [0; blake3::OUT_LEN]);
         manager
             .view_chain
@@ -2364,7 +2364,7 @@ mod tests {
         manager.handle_block_proposal(block).unwrap();
 
         // Add votes until threshold (need > 2*F = 2, so 3 votes)
-        for i in 1..=3 {
+        for i in 1..=2 {
             let vote = create_test_vote(i, 0, block_hash, leader_id, &setup);
             let result = manager.handle_vote(vote);
 
@@ -2390,27 +2390,36 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        // Progress to view 1
-        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
-        let replica_id = setup.peer_set.sorted_peer_ids[1];
-        let new_view_ctx = ViewContext::new(1, leader_id_1, replica_id, [0; blake3::OUT_LEN]);
-        manager
-            .view_chain
-            .progress_with_m_notarization(new_view_ctx)
-            .unwrap();
-
-        // Now receive a vote for view 0 (past view)
+        // Set up view 0 with a block and M-notarization first
         let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
-        let block_hash = [1u8; blake3::OUT_LEN];
-        let vote = create_test_vote(2, 0, block_hash, leader_id_0, &setup);
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create and handle M-notarization for view 0
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+        manager.handle_m_notarization(m_not_0).unwrap();
+
+        // Now at view 1
+        assert_eq!(manager.current_view_number(), 1);
+
+        // Now receive a vote for view 0 (past view) from a peer that hasn't voted yet
+        let vote = create_test_vote(3, 0, block_hash_0, leader_id_0, &setup);
 
         let result = manager.handle_vote(vote);
         assert!(result.is_ok());
 
-        // Should process without error (returns Await since no block)
+        // Should process without error and return NoOp or similar
         match result.unwrap() {
-            ViewProgressEvent::Await | ViewProgressEvent::NoOp => {}
-            _ => {}
+            ViewProgressEvent::NoOp => {}
+            other => panic!("Expected NoOp for past view vote, got {:?}", other),
         }
 
         std::fs::remove_file(path).unwrap();
@@ -2427,18 +2436,18 @@ mod tests {
         let block = create_test_block(0, leader_id, [0; blake3::OUT_LEN], leader_sk.clone(), 0);
         let block_hash = block.get_hash();
 
-        // Add block
+        // Add block (leader peer 0 votes)
         manager.handle_block_proposal(block).unwrap();
+        // Now: 1 vote (leader)
 
-        // Add votes one less than M-notarization threshold
-        for i in 2..=3 {
-            let vote = create_test_vote(i, 0, block_hash, leader_id, &setup);
-            manager.handle_vote(vote).unwrap();
-        }
+        // Add one vote to bring us to 2 votes (one short of M-notarization threshold)
+        let vote2 = create_test_vote(2, 0, block_hash, leader_id, &setup);
+        manager.handle_vote(vote2).unwrap();
+        // Now: 2 votes (leader + peer 2)
 
-        // Add the vote that crosses M-notarization threshold
-        let vote = create_test_vote(4, 0, block_hash, leader_id, &setup);
-        let result = manager.handle_vote(vote);
+        // Add the replica's (peer 1) vote, which should cross M-notarization threshold
+        let replica_vote = create_test_vote(1, 0, block_hash, leader_id, &setup);
+        let result = manager.handle_vote(replica_vote);
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -2449,9 +2458,9 @@ mod tests {
                 assert_eq!(view, 0);
             }
             ViewProgressEvent::ShouldMNotarize { .. } => {
-                // Also acceptable if already voted
+                // Also acceptable - depends on implementation details
             }
-            _ => panic!("Expected M-notarization related event"),
+            other => panic!("Expected M-notarization related event, got {:?}", other),
         }
 
         std::fs::remove_file(path).unwrap();
@@ -2478,25 +2487,21 @@ mod tests {
             let result = manager.handle_vote(vote);
 
             // The last vote might trigger nullification
-            if i == 4 {
-                match result.unwrap() {
-                    ViewProgressEvent::ShouldNullify { view } => {
-                        assert_eq!(view, 0);
-                        std::fs::remove_file(path).unwrap();
-                        return;
-                    }
-                    _ => {}
-                }
+            if i == 4
+                && let ViewProgressEvent::ShouldNullify { view } = result.unwrap()
+            {
+                assert_eq!(view, 0);
+                std::fs::remove_file(path).unwrap();
+                return;
             }
         }
 
         // If not triggered in handle_vote, should be detected in tick
         let tick_result = manager.tick();
-        match tick_result.unwrap() {
-            ViewProgressEvent::ShouldNullify { view } => {
-                assert_eq!(view, 0);
-            }
-            _ => {}
+        if let ViewProgressEvent::ShouldNullify { view } = tick_result.unwrap() {
+            assert_eq!(view, 0);
+            std::fs::remove_file(path).unwrap();
+            return;
         }
 
         std::fs::remove_file(path).unwrap();
@@ -2554,7 +2559,7 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        let leader_id_5 = setup.peer_set.sorted_peer_ids[1]; // View 5 % 4 = 1
+        let leader_id_5 = setup.peer_set.sorted_peer_ids[5]; // View 5 % 6 = 5
         let nullify = create_test_nullify(2, 5, leader_id_5, &setup);
 
         let result = manager.handle_nullify(nullify);
@@ -2666,33 +2671,77 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        // Progress to view 2
-        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        // Set up view 0 with a block and M-notarization first
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create and handle M-notarization for view 0
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+        manager.handle_m_notarization(m_not_0).unwrap();
+
+        // Now progress to view 1 and view 2
+        let mut parent_hash = block_hash_0;
         for view_num in 1..=2 {
-            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 4];
-            let new_view_ctx =
-                ViewContext::new(view_num as u64, leader_id, replica_id, [0; blake3::OUT_LEN]);
-            manager
-                .view_chain
-                .progress_with_m_notarization(new_view_ctx)
-                .unwrap();
+            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 6];
+            let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+            let block = create_test_block(
+                view_num as u64,
+                leader_id,
+                parent_hash,
+                leader_sk.clone(),
+                view_num as u64,
+            );
+            let block_hash = block.get_hash();
+            manager.handle_block_proposal(block).unwrap();
+
+            // Create and handle M-notarization
+            let mut m_votes = HashSet::new();
+            for i in 0..=2 {
+                m_votes.insert(create_test_vote(
+                    i,
+                    view_num as u64,
+                    block_hash,
+                    leader_id,
+                    &setup,
+                ));
+            }
+            let m_not = create_test_m_notarization::<6, 1, 3>(
+                &m_votes,
+                view_num as u64,
+                block_hash,
+                leader_id,
+            );
+            manager.handle_m_notarization(m_not).unwrap();
+
+            parent_hash = block_hash;
         }
 
-        // Create M-notarization for view 0 (past view)
-        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
-        let block_hash = [1u8; blake3::OUT_LEN];
+        // Now at view 3
+        assert_eq!(manager.current_view_number(), 3);
+
+        // Create a DUPLICATE M-notarization for view 0 (past view)
         let mut votes = HashSet::new();
-        for i in 1..=3 {
-            votes.insert(create_test_vote(i, 0, block_hash, leader_id_0, &setup));
+        for i in 0..=2 {
+            votes.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
         }
         let m_notarization =
-            create_test_m_notarization::<6, 1, 3>(&votes, 0, block_hash, leader_id_0);
+            create_test_m_notarization::<6, 1, 3>(&votes, 0, block_hash_0, leader_id_0);
 
         let result = manager.handle_m_notarization(m_notarization);
-        assert!(result.is_ok());
+        // assert!(result.is_ok());
+        result.unwrap();
 
         // Should not progress view since it's for a past view
-        assert_eq!(manager.current_view_number(), 2);
+        assert_eq!(manager.current_view_number(), 3);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -2724,7 +2773,7 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        let leader_id_5 = setup.peer_set.sorted_peer_ids[1];
+        let leader_id_5 = setup.peer_set.sorted_peer_ids[5];
         let block_hash = [1u8; blake3::OUT_LEN];
         let mut votes = HashSet::new();
         for i in 1..=3 {
@@ -2788,9 +2837,10 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        let leader_id_5 = setup.peer_set.sorted_peer_ids[1];
+        // Leader for view 5 is at index 5 % 6 = 5
+        let leader_id_5 = setup.peer_set.sorted_peer_ids[5];
         let mut nullify_messages = HashSet::new();
-        for i in 1..=3 {
+        for i in 0..=2 {
             nullify_messages.insert(create_test_nullify(i, 5, leader_id_5, &setup));
         }
         let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 5, leader_id_5);
@@ -2835,22 +2885,39 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        // Progress to view 2
-        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        // Set up view 0 with a nullification first
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+
+        // Create and handle nullification for view 0
+        let mut nullify_messages_0 = HashSet::new();
+        for i in 0..=2 {
+            nullify_messages_0.insert(create_test_nullify(i, 0, leader_id_0, &setup));
+        }
+        let nullification_0 =
+            create_test_nullification::<6, 1, 3>(&nullify_messages_0, 0, leader_id_0);
+        manager.handle_nullification(nullification_0).unwrap();
+
+        // Now progress to view 1 and view 2, each with their nullifications
         for view_num in 1..=2 {
-            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 4];
-            let new_view_ctx =
-                ViewContext::new(view_num as u64, leader_id, replica_id, [0; blake3::OUT_LEN]);
-            manager
-                .view_chain
-                .progress_with_nullification(new_view_ctx)
-                .unwrap();
+            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 6];
+
+            // Create and handle nullification for this view
+            let mut nullify_messages = HashSet::new();
+            for i in 0..=2 {
+                nullify_messages.insert(create_test_nullify(i, view_num as u64, leader_id, &setup));
+            }
+            let nullification =
+                create_test_nullification::<6, 1, 3>(&nullify_messages, view_num as u64, leader_id);
+            manager.handle_nullification(nullification).unwrap();
         }
 
-        // Create nullification for view 0 (past view)
-        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        // Now at view 3
+        assert_eq!(manager.current_view_number(), 3);
+
+        // Create a LATE nullification for view 0 (past view) with different nullify messages
         let mut nullify_messages = HashSet::new();
-        for i in 1..=3 {
+        for i in 3..=5 {
+            // Use different peers to create a different nullification
             nullify_messages.insert(create_test_nullify(i, 0, leader_id_0, &setup));
         }
         let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 0, leader_id_0);
@@ -2859,7 +2926,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Should not progress view since it's for a past view
-        assert_eq!(manager.current_view_number(), 2);
+        assert_eq!(manager.current_view_number(), 3);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -2942,14 +3009,25 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        // Progress to view 1
-        let replica_id = setup.peer_set.sorted_peer_ids[1];
-        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
-        let new_view_ctx = ViewContext::new(1, leader_id_1, replica_id, [0; blake3::OUT_LEN]);
-        manager
-            .view_chain
-            .progress_with_m_notarization(new_view_ctx)
-            .unwrap();
+        // Set up view 0 with a block and M-notarization first
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create and handle M-notarization for view 0
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+        manager.handle_m_notarization(m_not_0).unwrap();
+
+        // Now at view 1
+        assert_eq!(manager.current_view_number(), 1);
 
         // Should still be able to mark vote for view 0 (past view still in chain)
         let result = manager.mark_voted(0);
@@ -3322,7 +3400,7 @@ mod tests {
             create_test_manager(&setup, 1);
 
         // Current view is 0, send nullify for view 2
-        let leader_id_2 = setup.peer_set.sorted_peer_ids[2 % 4];
+        let leader_id_2 = setup.peer_set.sorted_peer_ids[2];
         let nullify = create_test_nullify(1, 2, leader_id_2, &setup);
         let msg = ConsensusMessage::Nullify(nullify);
 
@@ -3490,7 +3568,7 @@ mod tests {
         assert_eq!(manager.current_view_number(), 0);
 
         // Create nullification for view 2 (future)
-        let leader_id_2 = setup.peer_set.sorted_peer_ids[2 % 6];
+        let leader_id_2 = setup.peer_set.sorted_peer_ids[2];
         let mut nullify_messages = HashSet::new();
         for i in 1..=3 {
             nullify_messages.insert(create_test_nullify(i, 2, leader_id_2, &setup));
@@ -3851,7 +3929,8 @@ mod tests {
 
         manager.handle_block_proposal(block_0).unwrap();
 
-        // Add M-notarization votes (>2f = 3)
+        // Add M-notarization votes (>2f = 2), notice the leader's vote is already counted
+        // in the `handle_block_proposal` call.
         for i in 1..=2 {
             let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
             manager.handle_vote(vote).unwrap();
@@ -3870,7 +3949,7 @@ mod tests {
         assert_eq!(manager.current_view_number(), 1);
 
         // Finalize and remove view 0
-        for i in 1..=4 {
+        for i in 3..=4 {
             let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
             manager.handle_vote(vote).unwrap();
         }
@@ -3989,19 +4068,62 @@ mod tests {
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
             create_test_manager(&setup, 1);
 
-        // Progress to view 2
-        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        // Set up view 0 with a block and M-notarization first
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create and handle M-notarization for view 0
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+        manager.handle_m_notarization(m_not_0).unwrap();
+
+        // Progress through views 1 and 2
+        let mut parent_hash = block_hash_0;
         for view_num in 1..=2 {
-            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 4];
-            let new_view_ctx =
-                ViewContext::new(view_num as u64, leader_id, replica_id, [0; blake3::OUT_LEN]);
-            manager
-                .view_chain
-                .progress_with_m_notarization(new_view_ctx)
-                .unwrap();
+            let leader_id = setup.peer_set.sorted_peer_ids[view_num % 6];
+            let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+            let block = create_test_block(
+                view_num as u64,
+                leader_id,
+                parent_hash,
+                leader_sk.clone(),
+                view_num as u64,
+            );
+            let block_hash = block.get_hash();
+            manager.handle_block_proposal(block).unwrap();
+
+            // Create and handle M-notarization
+            let mut m_votes = HashSet::new();
+            for i in 0..=2 {
+                m_votes.insert(create_test_vote(
+                    i,
+                    view_num as u64,
+                    block_hash,
+                    leader_id,
+                    &setup,
+                ));
+            }
+            let m_not = create_test_m_notarization::<6, 1, 3>(
+                &m_votes,
+                view_num as u64,
+                block_hash,
+                leader_id,
+            );
+            manager.handle_m_notarization(m_not).unwrap();
+
+            parent_hash = block_hash;
         }
 
-        assert_eq!(manager.non_finalized_count(), 3); // Views 0, 1, 2
+        assert_eq!(manager.current_view_number(), 3);
+        assert_eq!(manager.non_finalized_count(), 4); // Views 0, 1, 2, 3
 
         let result = manager.shutdown();
         assert!(result.is_ok());
@@ -4023,15 +4145,12 @@ mod tests {
         manager.handle_block_proposal(block).unwrap();
 
         // Add exactly 2f = 2 votes (not enough for M-notarization which requires 2f+1=3)
-        for i in 1..=2 {
+        for i in 1..=1 {
             let vote = create_test_vote(i, 0, block_hash, leader_id, &setup);
             let result = manager.handle_vote(vote);
 
-            match result.unwrap() {
-                ViewProgressEvent::ShouldMNotarize { .. } => {
-                    panic!("Should not M-notarize with only 2f votes");
-                }
-                _ => {}
+            if let ViewProgressEvent::ShouldMNotarize { .. } = result.unwrap() {
+                panic!("Should not M-notarize with only 2f votes");
             }
         }
 
@@ -4051,14 +4170,22 @@ mod tests {
 
         manager.handle_block_proposal(block).unwrap();
 
-        // Add exactly 2f+1 = 3 votes
-        let mut last_result = None;
-        for i in 1..=3 {
-            let vote = create_test_vote(i, 0, block_hash, leader_id, &setup);
-            last_result = Some(manager.handle_vote(vote).unwrap());
-        }
+        // Add exactly 2 more votes to reach 2f+1 = 3 total votes
+        // (leader vote is already counted from block proposal)
+        let vote1 = create_test_vote(1, 0, block_hash, leader_id, &setup);
+        let result1 = manager.handle_vote(vote1).unwrap();
 
-        match last_result.unwrap() {
+        // First vote brings us to 2 votes, not enough yet
+        assert!(
+            !matches!(result1, ViewProgressEvent::ShouldMNotarize { .. }),
+            "Should not trigger M-notarization with only 2 votes"
+        );
+
+        let vote2 = create_test_vote(2, 0, block_hash, leader_id, &setup);
+        let result2 = manager.handle_vote(vote2).unwrap();
+
+        // Second vote brings us to 3 votes (>2F), should trigger M-notarization
+        match result2 {
             ViewProgressEvent::ShouldMNotarize {
                 view,
                 block_hash: _,
@@ -4069,7 +4196,7 @@ mod tests {
             } => {
                 assert_eq!(view, 0);
             }
-            _ => panic!("Expected M-notarization with 2f+1 votes"),
+            other => panic!("Expected M-notarization with 2f+1 votes, got {:?}", other),
         }
 
         std::fs::remove_file(path).unwrap();
@@ -4089,7 +4216,7 @@ mod tests {
         manager.handle_block_proposal(block).unwrap();
 
         // Add exactly n-f-1 = 4 votes (not enough for finalization which requires n-f=5)
-        for i in 1..=4 {
+        for i in 1..=3 {
             let vote = create_test_vote(i, 0, block_hash, leader_id, &setup);
             let result = manager.handle_vote(vote);
 
@@ -4151,10 +4278,7 @@ mod tests {
             assert!(result.is_ok());
 
             // Should return Await since no block yet
-            match result.unwrap() {
-                ViewProgressEvent::Await => {}
-                _ => {}
-            }
+            if let ViewProgressEvent::Await = result.unwrap() {}
         }
 
         // Now receive block
@@ -4351,9 +4475,8 @@ mod tests {
             // Add votes to reach M-notarization threshold (>2F = 3 votes for F=1)
             // We need to collect 3 votes including the leader's vote for the M-notarization object
             let mut votes = HashSet::new();
-            let mut vote_count = 0;
 
-            for i in 0..setup.peer_set.sorted_peer_ids.len() {
+            for (vote_count, i) in (0..setup.peer_set.sorted_peer_ids.len()).enumerate() {
                 if vote_count >= 3 {
                     break;
                 }
@@ -4364,7 +4487,6 @@ mod tests {
                     leader_id,
                     &setup,
                 ));
-                vote_count += 1;
             }
 
             // Create and handle M-notarization, which will progress to next view
@@ -4431,9 +4553,9 @@ mod tests {
         assert_eq!(manager.current_view_number(), 2);
 
         // Finalize view 0 (which has L-notarization)
+        assert_eq!(manager.current_view_number(), 2);
         let result = manager.finalize_view(0);
-        // assert!(result.is_ok());
-        result.unwrap();
+        assert!(result.is_ok());
 
         std::fs::remove_file(path).unwrap();
     }

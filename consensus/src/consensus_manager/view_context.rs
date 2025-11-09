@@ -149,22 +149,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
 
         let block_hash = block.get_hash();
 
-        if let Some(ref m_not) = self.m_notarization {
-            if m_not.block_hash != block_hash {
-                // Byzantine behavior detected: Leader proposed a different block
-                // than what 2f+1 replicas M-notarized
-                // This indicates either a Byzantine leader or fraudulent M-notarization
+        if let Some(ref m_not) = self.m_notarization
+            && m_not.block_hash != block_hash
+        {
+            // Byzantine behavior detected: Leader proposed a different block
+            // than what 2f+1 replicas M-notarized
+            // This indicates either a Byzantine leader or fraudulent M-notarization
 
-                // We should NOT accept this block and should nullify
-                return Ok(LeaderProposalResult {
-                    block_hash,
-                    should_vote: false, // Don't vote for this conflicting block
-                    is_enough_to_m_notarize: false,
-                    is_enough_to_finalize: false,
-                    should_await: false,
-                    should_nullify: true,
-                });
-            }
+            // We should NOT accept this block and should nullify
+            return Ok(LeaderProposalResult {
+                block_hash,
+                should_vote: false, // Don't vote for this conflicting block
+                is_enough_to_m_notarize: false,
+                is_enough_to_finalize: false,
+                should_await: false,
+                should_nullify: true,
+            });
         }
 
         let block_signature = block.leader_signature.clone();
@@ -698,8 +698,9 @@ pub struct LeaderProposalResult {
     /// Whether the current replica should await for the current view's leader
     /// proposed block to be finalized before voting for it
     pub should_await: bool,
-    /// Whether the current replica should nullify the current view, after receiving a block proposal
-    /// for the current view, that is, the block hash is different from the M-notarization block hash
+    /// Whether the current replica should nullify the current view, after receiving a block
+    /// proposal for the current view, that is, the block hash is different from the
+    /// M-notarization block hash
     pub should_nullify: bool,
 }
 
@@ -2579,7 +2580,8 @@ mod tests {
         // as at least one honest replica voted for it, and therefore the leader was Byzantine
         assert!(context.block_hash.is_none());
 
-        // Non-verified M-notarization should NOT be DISCARDED (hash mismatch), but should be nullified
+        // Non-verified M-notarization should NOT be DISCARDED (hash mismatch), but should be
+        // nullified
         assert!(context.m_notarization.is_some());
     }
 
