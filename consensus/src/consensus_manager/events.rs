@@ -70,6 +70,29 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         block_hash: [u8; blake3::OUT_LEN],
     },
 
+    /// If the current replica should vote for a block for the current view, and progress to the
+    /// next view simultaneously.
+    ShouldVoteAndProgressToNextView {
+        /// Current view number (for which the replica should vote and progress to the next view).
+        old_view: u64,
+        /// The hash of the block that the replica should vote and progress to the next view for.
+        block_hash: [u8; blake3::OUT_LEN],
+        /// New view number (for which the replica should progress to).
+        new_view: u64,
+        /// The leader's ID of the new view.
+        leader: PeerId,
+    },
+
+    /// If the current replica should progress to the next view.
+    ProgressToNextView {
+        /// New view number (for which the replica should progress to).
+        new_view: u64,
+        /// The leader's ID of the new view.
+        leader: PeerId,
+        /// The hash of the notarized block that the replica should progress to the next view for.
+        notarized_block_hash: [u8; blake3::OUT_LEN],
+    },
+
     /// If the current replica should finalize the state for the the `view`.
     /// Notice that, `view` does not necessarily correspond to the current view,
     /// as the replica might have already progressed to a later view (in case,
@@ -97,11 +120,13 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
     /// If the current replica should progress to a new view. This happens
     /// whenever the current replica receives either a M-notarization or a nullification
     /// for the current view.
-    ProgressToNextView {
+    ProgressToNextViewOnNullification {
         /// New view number (for which the replica should change).
         new_view: u64,
         /// The leader's ID of the new view.
         leader: PeerId,
+        /// Whether the replica should broadcast a nullification for the new view.
+        should_broadcast_nullification: bool,
     },
 
     /// If the current replica should broadcast a consensus message

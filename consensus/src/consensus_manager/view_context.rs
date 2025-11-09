@@ -69,9 +69,6 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// A m-notarization for the current view (if any)
     pub m_notarization: Option<MNotarization<N, F, M_SIZE>>,
 
-    /// A non-verified m-notarization for the current view (if any)
-    pub non_verified_m_notarization: Option<MNotarization<N, F, M_SIZE>>,
-
     /// Received nullify messages for the current view
     pub nullify_messages: HashSet<Nullify>,
 
@@ -97,7 +94,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             num_invalid_votes: 0,
             replica_id,
             m_notarization: None,
-            non_verified_m_notarization: None,
             nullification: None,
             nullify_messages: HashSet::new(),
             entered_at: Instant::now(),
@@ -153,9 +149,36 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
 
         let block_hash = block.get_hash();
 
+        if let Some(ref m_not) = self.m_notarization
+            && m_not.block_hash != block_hash
+        {
+            // Byzantine behavior detected: Leader proposed a different block
+            // than what 2f+1 replicas M-notarized
+            // This indicates either a Byzantine leader or fraudulent M-notarization
+
+            // We should NOT accept this block and should nullify
+            return Ok(LeaderProposalResult {
+                block_hash,
+                should_vote: false, // Don't vote for this conflicting block
+                is_enough_to_m_notarize: false,
+                is_enough_to_finalize: false,
+                should_await: false,
+                should_nullify: true,
+            });
+        }
+
+        let block_signature = block.leader_signature.clone();
         self.block_hash = Some(block_hash);
         self.block = Some(block);
-        // TODO: We need to add the leader's block proposal as a vote to the votes set.
+
+        let leader_vote = Vote::new(
+            self.view_number,
+            block_hash,
+            block_signature,
+            self.leader_id,
+            self.leader_id,
+        );
+        self.votes.insert(leader_vote);
 
         if !self.non_verified_votes.is_empty() {
             let mut num_matching_votes = 0;
@@ -168,24 +191,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 });
             self.num_invalid_votes += self.non_verified_votes.len() - num_matching_votes;
             self.non_verified_votes.clear();
-        }
-
-        if self.non_verified_m_notarization.is_some() {
-            // NOTE: We need to verify that the non-verified m-notarization is for the same block as
-            // the proposed block.
-            if self
-                .non_verified_m_notarization
-                .as_ref()
-                .unwrap()
-                .block_hash
-                == block_hash
-            {
-                self.m_notarization = self.non_verified_m_notarization.take();
-            } else {
-                // NOTE: The non-verified m-notarization is for a different block, so we can safely
-                // ignore it.
-                self.non_verified_m_notarization = None;
-            }
         }
 
         let is_enough_to_m_notarize = self.votes.len() > 2 * F || self.m_notarization.is_some();
@@ -203,6 +208,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             is_enough_to_m_notarize,
             is_enough_to_finalize,
             should_await: false,
+            should_nullify: false,
         })
     }
 
@@ -258,12 +264,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         if self.block_hash.is_none() {
             // NOTE: In this case, the replica has not yet received the view proposed block hash
             // from the leader, so we need to store the vote in the non-verified votes set.
+            let should_vote = !self.has_voted
+                && !self.has_nullified
+                && self
+                    .non_verified_votes
+                    .iter()
+                    .filter(|v| v.block_hash == vote.block_hash)
+                    .count() + 1 // NOTE: We need to include the current vote in the count
+                    > 2 * F;
             self.non_verified_votes.insert(vote);
+
             return Ok(CollectedVotesResult {
                 should_await: true,
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_nullify: self.should_nullify_after_receiving_new_vote(),
+                should_vote,
             });
         }
 
@@ -277,6 +293,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 is_enough_to_m_notarize: false,
                 is_enough_to_finalize: false,
                 should_nullify,
+                should_vote: false,
             });
         }
 
@@ -305,6 +322,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             is_enough_to_m_notarize,
             is_enough_to_finalize,
             should_nullify,
+            should_vote: false,
         })
     }
 
@@ -319,6 +337,51 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             self.block_hash.unwrap(),
             signature,
             self.replica_id,
+            self.leader_id,
+        ));
+        Ok(())
+    }
+
+    /// Adds a leader vote for a block proposal to the current view's context.
+    ///
+    /// Validates the block's view number, leader, and parent hash match the current view.
+    /// Stores the vote in the votes set.
+    ///
+    /// Returns an error if validation fails.
+    pub fn add_leader_vote_for_block_proposal(
+        &mut self,
+        block: Block,
+        signature: BlsSignature,
+    ) -> Result<()> {
+        if block.view() != self.view_number {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for view {} is not the current view {}",
+                block.view(),
+                self.view_number
+            ));
+        }
+
+        if block.leader != self.leader_id {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for leader {} is not the current leader {}",
+                block.leader,
+                self.leader_id
+            ));
+        }
+
+        if block.parent_block_hash() != self.parent_block_hash {
+            return Err(anyhow::anyhow!(
+                "Leader vote for block proposal for parent block hash {} is not the current parent block hash {}",
+                hex::encode(block.parent_block_hash()),
+                hex::encode(self.parent_block_hash)
+            ));
+        }
+
+        self.votes.insert(Vote::new(
+            self.view_number,
+            block.get_hash(),
+            signature,
+            self.leader_id,
             self.leader_id,
         ));
         Ok(())
@@ -437,7 +500,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
 
         if self.block_hash.is_none() {
             if self.m_notarization.is_none() {
-                self.non_verified_m_notarization = Some(m_notarization);
+                self.m_notarization = Some(m_notarization.clone());
             }
             return Ok(ShouldMNotarize {
                 should_notarize: false,
@@ -459,14 +522,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         }
 
         if self.m_notarization.is_some() {
-            // We already have a m-notarization for the current view, so we can safely ignore this
-            // one.
-            return Ok(ShouldMNotarize {
-                should_notarize: false,
-                should_await: false,
-                should_vote,
-                should_nullify: false,
-            });
+            let existing_m_not = self.m_notarization.as_ref().unwrap();
+
+            // Check if this is a duplicate (same block hash) or a conflict (different block hash)
+            if existing_m_not.block_hash == m_notarization.block_hash {
+                // Duplicate M-notarization for the same block - safely ignore
+                return Ok(ShouldMNotarize {
+                    should_notarize: false,
+                    should_await: false,
+                    should_vote,
+                    should_nullify: false,
+                });
+            } else {
+                // CONFLICTING M-notarization:
+                // Two different M-notarizations for the same view means Byzantine replicas
+                // This is critical evidence that should trigger nullification
+                return Ok(ShouldMNotarize {
+                    should_notarize: false,
+                    should_await: false,
+                    should_vote: false,   // Don't vote if there's conflict
+                    should_nullify: true, // Signal that we should nullify this view
+                });
+            }
         }
 
         self.m_notarization = Some(m_notarization);
@@ -621,6 +698,10 @@ pub struct LeaderProposalResult {
     /// Whether the current replica should await for the current view's leader
     /// proposed block to be finalized before voting for it
     pub should_await: bool,
+    /// Whether the current replica should nullify the current view, after receiving a block
+    /// proposal for the current view, that is, the block hash is different from the
+    /// M-notarization block hash
+    pub should_nullify: bool,
 }
 
 /// [`CollectedVotesResult`] is the result of collecting votes for the current view's block.
@@ -637,6 +718,8 @@ pub struct CollectedVotesResult {
     /// Whether the current replica should nullify the current view, after receiving enough invalid
     /// votes, that is, strictly more than 2 * F invalid votes.
     pub should_nullify: bool,
+    /// Whether the current replica should vote for the block hash
+    pub should_vote: bool,
 }
 
 /// [`ShouldMNotarize`] is the result of processing a newly received m-notarization for the current
@@ -663,6 +746,7 @@ pub struct CollectedNullificationsResult {
     /// nullification
     pub should_broadcast_nullification: bool,
 }
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -689,6 +773,7 @@ mod tests {
         view: u64,
         leader: PeerId,
         parent_hash: [u8; blake3::OUT_LEN],
+        leader_sk: BlsSecretKey,
         height: u64,
     ) -> Block {
         let transactions = vec![gen_tx()];
@@ -698,6 +783,7 @@ mod tests {
             parent_hash,
             transactions,
             1234567890,
+            leader_sk.sign(b"block proposal"),
             false,
             height,
         )
@@ -819,7 +905,8 @@ mod tests {
         let parent_hash = [1u8; blake3::OUT_LEN];
         let mut context = create_test_view_context(5, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(5, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(5, leader_id, parent_hash, leader_sk.clone(), 1);
         let expected_hash = block.get_hash();
 
         let result = context.add_new_view_block(block.clone());
@@ -847,7 +934,8 @@ mod tests {
         // Mark as already voted
         context.has_voted = true;
 
-        let block = create_test_block(5, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(5, leader_id, parent_hash, leader_sk.clone(), 1);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_ok());
@@ -868,7 +956,8 @@ mod tests {
         // Mark as already nullified
         context.has_nullified = true;
 
-        let block = create_test_block(5, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(5, leader_id, parent_hash, leader_sk.clone(), 1);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_ok());
@@ -887,7 +976,8 @@ mod tests {
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
         // Create the block first to get its actual hash
-        let block = create_test_block(10, leader_id, parent_hash, 2);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 2);
         let block_hash = block.get_hash();
 
         // Add a non-verified vote with the actual block hash
@@ -902,7 +992,7 @@ mod tests {
 
         assert!(result.is_ok());
         // Non-verified votes should be moved to verified votes
-        assert_eq!(context.votes.len(), 1);
+        assert_eq!(context.votes.len(), 2);
         assert_eq!(context.non_verified_votes.len(), 0);
         assert!(context.votes.contains(&vote));
     }
@@ -926,7 +1016,8 @@ mod tests {
         assert_eq!(context.num_invalid_votes, 0);
 
         // Add the actual leader's block with a different hash
-        let block = create_test_block(10, leader_id, parent_hash, 2);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 2);
         let actual_block_hash = block.get_hash();
         assert_ne!(actual_block_hash, wrong_block_hash); // Verify they're different
 
@@ -937,7 +1028,7 @@ mod tests {
         assert_eq!(context.non_verified_votes.len(), 0);
 
         // Vote with wrong hash should NOT be in verified votes
-        assert_eq!(context.votes.len(), 0);
+        assert_eq!(context.votes.len(), 1);
 
         // Vote with wrong hash should be counted as invalid
         assert_eq!(context.num_invalid_votes, 1);
@@ -953,7 +1044,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Add 3 non-verified votes (2f+1 = 3 for M-notarization)
@@ -981,7 +1073,8 @@ mod tests {
         let mut context = create_test_view_context(15, leader_id, replica_id, parent_hash);
 
         // Create block with wrong view number
-        let block = create_test_block(20, leader_id, parent_hash, 3);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(20, leader_id, parent_hash, leader_sk.clone(), 3);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_err());
@@ -1003,11 +1096,12 @@ mod tests {
         let mut context = create_test_view_context(8, leader_id, replica_id, parent_hash);
 
         // Add first block
-        let block1 = create_test_block(8, leader_id, parent_hash, 4);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block1 = create_test_block(8, leader_id, parent_hash, leader_sk.clone(), 4);
         assert!(context.add_new_view_block(block1).is_ok());
 
         // Try to add second block (should fail - only one block per view)
-        let block2 = create_test_block(8, leader_id, parent_hash, 5);
+        let block2 = create_test_block(8, leader_id, parent_hash, leader_sk.clone(), 5);
         let result = context.add_new_view_block(block2);
 
         assert!(result.is_err());
@@ -1030,7 +1124,8 @@ mod tests {
         let mut context = create_test_view_context(12, correct_leader, replica_id, parent_hash);
 
         // Create block with wrong leader
-        let block = create_test_block(12, wrong_leader, parent_hash, 6);
+        let leader_sk = setup.peer_id_to_secret_key.get(&wrong_leader).unwrap();
+        let block = create_test_block(12, wrong_leader, parent_hash, leader_sk.clone(), 6);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_err());
@@ -1051,7 +1146,8 @@ mod tests {
         let mut context = create_test_view_context(18, leader_id, replica_id, correct_parent);
 
         // Create block with wrong parent hash
-        let block = create_test_block(18, leader_id, wrong_parent, 7);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(18, leader_id, wrong_parent, leader_sk.clone(), 7);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_err());
@@ -1064,74 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_new_view_block_with_non_verified_m_notarization_matching_hash() {
-        let setup = create_test_peer_setup(6);
-        let peers = &setup.peer_set;
-        let leader_id = peers.sorted_peer_ids[0];
-        let replica_id = peers.sorted_peer_ids[1];
-        let parent_hash = [50u8; blake3::OUT_LEN];
-        let mut context =
-            create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
-
-        let block = create_test_block(10, leader_id, parent_hash, 1);
-        let block_hash = block.get_hash();
-
-        // Create and add non-verified M-notarization
-        let mut votes = HashSet::new();
-        for i in 1..=3 {
-            let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
-            votes.insert(vote);
-        }
-        let m_notarization =
-            create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
-        context.non_verified_m_notarization = Some(m_notarization);
-
-        let result = context.add_new_view_block(block);
-        assert!(result.is_ok());
-
-        // Non-verified M-notarization should be moved to verified
-        assert!(context.m_notarization.is_some());
-        assert!(context.non_verified_m_notarization.is_none());
-
-        let proposal_result = result.unwrap();
-        assert!(proposal_result.is_enough_to_m_notarize);
-    }
-
-    #[test]
-    fn test_add_new_view_block_with_non_verified_m_notarization_wrong_hash() {
-        let setup = create_test_peer_setup(6);
-        let peers = &setup.peer_set;
-        let leader_id = peers.sorted_peer_ids[0];
-        let replica_id = peers.sorted_peer_ids[1];
-        let parent_hash = [51u8; blake3::OUT_LEN];
-        let mut context =
-            create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
-
-        let block = create_test_block(10, leader_id, parent_hash, 1);
-
-        // Create M-notarization for DIFFERENT block hash
-        let wrong_hash = [99u8; blake3::OUT_LEN];
-        let mut votes = HashSet::new();
-        for i in 1..=3 {
-            let vote = create_test_vote(i, 10, wrong_hash, leader_id, &setup);
-            votes.insert(vote);
-        }
-        let m_notarization =
-            create_test_m_notarization::<6, 1, 3>(&votes, 10, wrong_hash, leader_id);
-        context.non_verified_m_notarization = Some(m_notarization);
-
-        let result = context.add_new_view_block(block);
-        assert!(result.is_ok());
-
-        // Non-verified M-notarization with wrong hash should be discarded
-        assert!(context.m_notarization.is_none());
-        assert!(context.non_verified_m_notarization.is_none());
-
-        let proposal_result = result.unwrap();
-        assert!(!proposal_result.is_enough_to_m_notarize);
-    }
-
-    #[test]
     fn test_add_new_view_block_detects_l_notarization() {
         let setup = create_test_peer_setup(6); // N=6, F=1, so N-F=5 for L-notarization
         let peers = &setup.peer_set;
@@ -1141,7 +1169,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Add 5 non-verified votes (N-F = 5 for L-notarization where N=6, F=1)
@@ -1185,7 +1214,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Add exactly N-F votes
@@ -1212,7 +1242,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Add only 4 votes (below N-F = 5)
@@ -1240,7 +1271,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         let wrong_hash = [98u8; blake3::OUT_LEN];
 
@@ -1278,7 +1310,8 @@ mod tests {
         let parent_hash = [56u8; blake3::OUT_LEN];
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_ok());
@@ -1302,13 +1335,14 @@ mod tests {
         // Ensure non_verified_votes is empty
         assert!(context.non_verified_votes.is_empty());
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let result = context.add_new_view_block(block);
 
         assert!(result.is_ok());
 
         // Should work fine with no non-verified votes
-        assert_eq!(context.votes.len(), 0);
+        assert_eq!(context.votes.len(), 1);
         assert_eq!(context.num_invalid_votes, 0);
     }
 
@@ -1322,7 +1356,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Add non-verified M-notarization
@@ -1333,7 +1368,7 @@ mod tests {
         }
         let m_notarization =
             create_test_m_notarization::<6, 1, 3>(&m_votes, 10, block_hash, leader_id);
-        context.non_verified_m_notarization = Some(m_notarization);
+        context.m_notarization = Some(m_notarization);
 
         // Also add additional non-verified votes (different from M-notarization votes)
         for i in 3..5 {
@@ -1350,7 +1385,7 @@ mod tests {
         assert!(proposal_result.is_enough_to_m_notarize);
 
         // Additional votes should be added
-        assert_eq!(context.votes.len(), 2);
+        assert_eq!(context.votes.len(), 3);
 
         // With M-notarization already present, it should indicate M-notarization
         assert!(proposal_result.is_enough_to_m_notarize);
@@ -1366,7 +1401,8 @@ mod tests {
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
         // Set a block hash first
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1393,7 +1429,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1425,7 +1462,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1476,7 +1514,8 @@ mod tests {
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
         // Set a block hash first
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1533,7 +1572,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1616,7 +1656,8 @@ mod tests {
         let parent_hash = [24u8; blake3::OUT_LEN];
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1639,7 +1680,8 @@ mod tests {
         let parent_hash = [25u8; blake3::OUT_LEN];
         let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1695,7 +1737,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1727,7 +1770,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1760,7 +1804,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1789,7 +1834,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1819,7 +1865,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1856,7 +1903,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1885,7 +1933,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -1914,7 +1963,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
         context.has_voted = true;
@@ -1945,7 +1995,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
         context.has_voted = true;
@@ -1987,7 +2038,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2021,7 +2073,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2056,7 +2109,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2090,7 +2144,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2144,7 +2199,7 @@ mod tests {
         assert!(!notarize_result.should_await);
 
         // M-notarization stored for later verification when block arrives
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
     }
 
     #[test]
@@ -2157,7 +2212,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let correct_hash = block.get_hash();
         context.block_hash = Some(correct_hash);
 
@@ -2191,7 +2247,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2228,7 +2285,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2266,7 +2324,8 @@ mod tests {
             parent_hash,
         );
 
-        let block = create_test_block(10, correct_leader, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&correct_leader).unwrap();
+        let block = create_test_block(10, correct_leader, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2297,7 +2356,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2322,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_m_notarization_replaces_non_verified() {
+    fn test_add_m_notarization_should_not_replace_non_verified() {
         // Per implementation: only stores if m_notarization.is_none()
         // But what if non_verified_m_notarization already exists?
         let setup = create_test_peer_setup(6);
@@ -2344,7 +2404,7 @@ mod tests {
 
         let result1 = context.add_m_notarization(m_not1, peers);
         assert!(result1.is_ok());
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
 
         let block_hash2 = [65u8; blake3::OUT_LEN];
         let mut votes2 = HashSet::new();
@@ -2358,19 +2418,15 @@ mod tests {
         assert!(result2.is_ok());
 
         // Should replace the non-verified M-notarization
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
         assert_eq!(
-            context
-                .non_verified_m_notarization
-                .as_ref()
-                .unwrap()
-                .block_hash,
-            block_hash2
+            context.m_notarization.as_ref().unwrap().block_hash,
+            block_hash1
         );
     }
 
     #[test]
-    fn test_add_m_notarization_non_verified_replaced_by_newer() {
+    fn test_add_m_notarization_non_verified_non_replaced_by_newer() {
         // Test what happens when multiple M-notarizations arrive before block
         let setup = create_test_peer_setup(6);
         let peers = &setup.peer_set;
@@ -2393,13 +2449,9 @@ mod tests {
 
         let result1 = context.add_m_notarization(m_not1, peers);
         assert!(result1.is_ok());
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
         assert_eq!(
-            context
-                .non_verified_m_notarization
-                .as_ref()
-                .unwrap()
-                .block_hash,
+            context.m_notarization.as_ref().unwrap().block_hash,
             block_hash1
         );
 
@@ -2417,20 +2469,11 @@ mod tests {
         let result2 = context.add_m_notarization(m_not2, peers);
         assert!(result2.is_ok());
 
-        // The second M-notarization should REPLACE the first one
-        // (because line 434 doesn't check if non_verified already exists)
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
         assert_eq!(
-            context
-                .non_verified_m_notarization
-                .as_ref()
-                .unwrap()
-                .block_hash,
-            block_hash2 // Should be the newer one
+            context.m_notarization.as_ref().unwrap().block_hash,
+            block_hash1 // Should be the first one, no replacement should happen
         );
-
-        // No verified M-notarization yet
-        assert!(context.m_notarization.is_none());
     }
 
     #[test]
@@ -2444,7 +2487,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // Step 1: Create the block first to get its hash
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Step 2: Create M-notarization for this block hash
@@ -2462,14 +2506,9 @@ mod tests {
         assert!(result1.is_ok());
 
         // Verify M-notarization is stored as non-verified
-        assert!(context.non_verified_m_notarization.is_some());
-        assert!(context.m_notarization.is_none());
+        assert!(context.m_notarization.is_some());
         assert_eq!(
-            context
-                .non_verified_m_notarization
-                .as_ref()
-                .unwrap()
-                .block_hash,
+            context.m_notarization.as_ref().unwrap().block_hash,
             block_hash
         );
 
@@ -2484,7 +2523,6 @@ mod tests {
 
         // Non-verified M-notarization should be moved to verified
         assert!(context.m_notarization.is_some());
-        assert!(context.non_verified_m_notarization.is_none());
 
         // Should detect M-notarization (since we moved it to verified)
         assert!(proposal_result.is_enough_to_m_notarize);
@@ -2518,10 +2556,11 @@ mod tests {
 
         let result1 = context.add_m_notarization(m_notarization, peers);
         assert!(result1.is_ok());
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
 
         // Step 2: Block arrives with DIFFERENT hash
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let actual_block_hash = block.get_hash();
         assert_ne!(actual_block_hash, wrong_block_hash); // Verify they're different
 
@@ -2530,15 +2569,20 @@ mod tests {
 
         let proposal_result = result2.unwrap();
 
-        // Block hash should be set
-        assert_eq!(context.block_hash, Some(actual_block_hash));
-
-        // Non-verified M-notarization should be DISCARDED (hash mismatch)
-        assert!(context.m_notarization.is_none());
-        assert!(context.non_verified_m_notarization.is_none());
-
-        // Should NOT detect M-notarization (discarded due to mismatch)
+        // should_nullify should be true
+        assert!(proposal_result.should_nullify);
+        assert!(!proposal_result.should_vote);
         assert!(!proposal_result.is_enough_to_m_notarize);
+        assert!(!proposal_result.is_enough_to_finalize);
+        assert!(!proposal_result.should_await);
+
+        // Block hash should be set to the one of the M-notarization block hash
+        // as at least one honest replica voted for it, and therefore the leader was Byzantine
+        assert!(context.block_hash.is_none());
+
+        // Non-verified M-notarization should NOT be DISCARDED (hash mismatch), but should be
+        // nullified
+        assert!(context.m_notarization.is_some());
     }
 
     #[test]
@@ -2551,7 +2595,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.block_hash = Some(block_hash);
 
@@ -2588,7 +2633,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // Create block first to get its actual hash
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // Create M-notarization with the actual block hash
@@ -2832,7 +2878,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // Add a block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         context.block = Some(block.clone());
         context.block_hash = Some(block.get_hash());
 
@@ -2994,7 +3041,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // Add a block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         context.block = Some(block.clone());
         context.block_hash = Some(block.get_hash());
 
@@ -3332,7 +3380,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block proposal
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         let proposal_result = context.add_new_view_block(block).unwrap();
         assert!(proposal_result.should_vote);
@@ -3343,16 +3392,18 @@ mod tests {
             let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
             let vote_result = context.add_vote(vote, peers).unwrap();
 
-            if i < 3 {
+            if i < 2 {
                 assert!(!vote_result.is_enough_to_m_notarize);
-            } else {
+            } else if i == 2 {
                 assert!(vote_result.is_enough_to_m_notarize);
+            } else {
+                assert!(!vote_result.is_enough_to_finalize);
             }
         }
 
         // 3. Verify M-notarization was created
         assert!(context.m_notarization.is_some());
-        assert_eq!(context.votes.len(), 3);
+        assert_eq!(context.votes.len(), 4);
     }
 
     #[test]
@@ -3389,7 +3440,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Receive block and vote for it
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.add_new_view_block(block).unwrap();
 
@@ -3402,7 +3454,7 @@ mod tests {
             let result = context.add_vote(vote, peers).unwrap();
             assert!(!result.should_nullify);
         }
-        assert_eq!(context.votes.len(), 2);
+        assert_eq!(context.votes.len(), 3);
         assert_eq!(context.num_invalid_votes, 0);
 
         // 3. Add 3 invalid votes (different block hash) from peers 4, 5, 6 - should trigger
@@ -3434,7 +3486,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Receive block and vote
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.add_new_view_block(block).unwrap();
         context.has_voted = true;
@@ -3442,7 +3495,7 @@ mod tests {
         // 2. Add 1 valid vote
         let vote = create_test_vote(2, 10, block_hash, leader_id, &setup);
         context.add_vote(vote, peers).unwrap();
-        assert_eq!(context.votes.len(), 1);
+        assert_eq!(context.votes.len(), 2);
 
         // 3. Add nullify messages (conflicting with our vote)
         for i in 3..=5 {
@@ -3470,7 +3523,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Create and send M-notarization before block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         let mut votes = HashSet::new();
@@ -3486,15 +3540,13 @@ mod tests {
             .add_m_notarization(m_notarization.clone(), peers)
             .unwrap();
         assert!(!result1.should_notarize);
-        assert!(context.m_notarization.is_none());
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
 
         // 2. Now block arrives - should process non-verified M-notarization
         let result2 = context.add_new_view_block(block).unwrap();
         assert!(result2.should_vote);
         assert!(result2.is_enough_to_m_notarize); // Should detect M-notarization
         assert!(context.m_notarization.is_some()); // Promoted to verified
-        assert!(context.non_verified_m_notarization.is_none()); // Cleared
     }
 
     #[test]
@@ -3509,7 +3561,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Create block (but don't add to context yet)
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // 2. Add votes before block (stored as non-verified)
@@ -3524,7 +3577,7 @@ mod tests {
         // 3. Block arrives - should process non-verified votes
         let result = context.add_new_view_block(block).unwrap();
         assert!(result.should_vote);
-        assert_eq!(context.votes.len(), 2); // Non-verified votes promoted
+        assert_eq!(context.votes.len(), 3); // Non-verified votes promoted
         assert_eq!(context.non_verified_votes.len(), 0);
 
         // 4. One more vote should trigger M-notarization
@@ -3546,7 +3599,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.add_new_view_block(block).unwrap();
 
@@ -3568,7 +3622,7 @@ mod tests {
         // Both can coexist - indicates network partition or Byzantine behavior
         assert!(context.m_notarization.is_some());
         assert!(context.nullification.is_some());
-        assert_eq!(context.votes.len(), 3);
+        assert_eq!(context.votes.len(), 4);
         assert_eq!(context.nullify_messages.len(), 3);
     }
 
@@ -3584,25 +3638,26 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         let proposal_result = context.add_new_view_block(block).unwrap();
         assert!(proposal_result.should_vote);
 
         // 2. Add votes progressively to M-notarization then L-notarization
-        for i in 1..=5 {
+        for i in 1..=4 {
             let vote = create_test_vote(i, 10, block_hash, leader_id, &setup);
             let vote_result = context.add_vote(vote, peers).unwrap();
 
-            if i < 3 {
+            if i < 2 {
                 assert!(!vote_result.is_enough_to_m_notarize);
                 assert!(!vote_result.is_enough_to_finalize);
-            } else if i == 3 {
+            } else if i == 2 {
                 // M-notarization threshold
                 assert!(vote_result.is_enough_to_m_notarize);
                 assert!(!vote_result.is_enough_to_finalize);
                 assert!(context.m_notarization.is_some());
-            } else if i < 5 {
+            } else if i < 4 {
                 assert!(!vote_result.is_enough_to_finalize);
             } else {
                 // L-notarization threshold (i == 5)
@@ -3625,7 +3680,8 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
 
         // 1. Add non-verified votes (block hasn't arrived)
@@ -3644,17 +3700,16 @@ mod tests {
         let m_notarization =
             create_test_m_notarization::<6, 1, 3>(&votes, 10, block_hash, leader_id);
         context.add_m_notarization(m_notarization, peers).unwrap();
-        assert!(context.non_verified_m_notarization.is_some());
+        assert!(context.m_notarization.is_some());
 
         // 3. Block arrives - should process both non-verified votes and M-notarization
         let result = context.add_new_view_block(block).unwrap();
         assert!(result.should_vote);
         assert!(result.is_enough_to_m_notarize);
 
-        assert_eq!(context.votes.len(), 2); // Non-verified votes promoted
+        assert_eq!(context.votes.len(), 3); // Non-verified votes promoted
         assert!(context.m_notarization.is_some()); // M-notarization promoted
         assert_eq!(context.non_verified_votes.len(), 0);
-        assert!(context.non_verified_m_notarization.is_none());
     }
 
     #[test]
@@ -3669,7 +3724,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.add_new_view_block(block).unwrap();
 
@@ -3680,7 +3736,7 @@ mod tests {
             context.add_vote(wrong_vote, peers).unwrap();
         }
         assert_eq!(context.num_invalid_votes, 2);
-        assert_eq!(context.votes.len(), 0);
+        assert_eq!(context.votes.len(), 1);
 
         // 3. Valid M-notarization arrives (for correct block)
         let mut valid_votes = HashSet::new();
@@ -3709,7 +3765,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block and vote
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         context.add_new_view_block(block).unwrap();
         context.has_voted = true;
 
@@ -3746,7 +3803,8 @@ mod tests {
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
         // 1. Add block and vote
-        let block = create_test_block(10, leader_id, parent_hash, 1);
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash = block.get_hash();
         context.add_new_view_block(block).unwrap();
         context.has_voted = true;
