@@ -294,7 +294,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         }
 
         // Add block to the view context
-        ctx.add_new_view_block(block, &peers)
+        ctx.add_new_view_block(block, peers)
     }
 
     /// Routes a vote to the appropriate non-finalized view context.
