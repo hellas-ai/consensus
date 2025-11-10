@@ -203,7 +203,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     leader
                 );
                 self.create_and_broadcast_m_notarization(
-                    new_view - 1, // NOTE: The M-notarization is for the previous view (new_view - 1)
+                    new_view - 1, /* NOTE: The M-notarization is for the previous view (new_view
+                                   * - 1) */
                     notarized_block_hash,
                     should_forward_m_notarization,
                 )?;

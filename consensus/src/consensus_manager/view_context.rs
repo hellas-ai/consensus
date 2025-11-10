@@ -563,7 +563,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                     should_await: false,
                     should_vote: false,    // Don't vote if there's conflict
                     should_nullify: true,  // Signal that we should nullify this view
-                    should_forward: false, // TODO: should we forward the conflicting M-notarization to the network layer?
+                    should_forward: false, /* TODO: should we forward the conflicting
+                                            * M-notarization to the network layer? */
                 });
             }
         }
