@@ -133,6 +133,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         new_view: u64,
         /// The leader's ID of the new view.
         leader: PeerId,
+        /// The hash of the parent block that the replica should progress to the next view for.
+        parent_block_hash: [u8; blake3::OUT_LEN],
         /// Whether the replica should broadcast a nullification for the new view.
         should_broadcast_nullification: bool,
     },

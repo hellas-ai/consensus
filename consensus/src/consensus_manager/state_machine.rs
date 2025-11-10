@@ -203,7 +203,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     leader
                 );
                 self.create_and_broadcast_m_notarization(
-                    new_view,
+                    new_view - 1, // NOTE: The M-notarization is for the previous view (new_view - 1)
                     notarized_block_hash,
                     should_forward_m_notarization,
                 )?;
@@ -218,7 +218,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             } => {
                 self.vote_for_block(old_view, block_hash)?;
                 self.create_and_broadcast_m_notarization(
-                    new_view,
+                    old_view, // NOTE: The M-notarization is for the previous view (new_view - 1)
                     block_hash,
                     should_forward_m_notarization,
                 )?;
@@ -228,17 +228,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             ViewProgressEvent::ProgressToNextViewOnNullification {
                 new_view,
                 leader,
+                parent_block_hash,
                 should_broadcast_nullification,
             } => {
                 if should_broadcast_nullification {
-                    // Already handled by the nullification broadcast logic
+                    self.broadcast_nullification(new_view - 1)?; // NOTE: The nullification is for the previous view (new_view - 1)
                 }
-                slog::info!(
-                    self.logger,
-                    "Progressed to view {} on nullification (leader: {:?})",
-                    new_view,
-                    leader
-                );
+                self.progress_to_next_view(new_view, leader, parent_block_hash)?;
                 Ok(())
             }
             ViewProgressEvent::ShouldUpdateView { new_view, leader } => {

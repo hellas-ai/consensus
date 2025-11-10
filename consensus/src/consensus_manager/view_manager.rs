@@ -463,7 +463,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             should_nullify,
         } = self
             .view_chain
-            .add_block_proposal(block_view_number, block)?;
+            .add_block_proposal(block_view_number, block, &self.peers)?;
 
         if should_await {
             return Ok(ViewProgressEvent::Await);
@@ -790,6 +790,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             return Ok(ViewProgressEvent::ProgressToNextViewOnNullification {
                 new_view,
                 leader: new_leader,
+                parent_block_hash: parent_hash,
                 should_broadcast_nullification,
             });
         }
@@ -882,13 +883,29 @@ mod tests {
         height: u64,
     ) -> Block {
         let transactions = vec![create_test_transaction()];
+
+        // First, create a temporary block to compute its hash
+        let temp_block = Block::new(
+            view,
+            leader,
+            parent_hash,
+            transactions.clone(),
+            1234567890,
+            leader_sk.sign(b"temp"), // Temporary signature
+            false,
+            height,
+        );
+
+        // Get the block hash
+        let block_hash = temp_block.get_hash();
+
         Block::new(
             view,
             leader,
             parent_hash,
             transactions,
             1234567890,
-            leader_sk.sign(b"block proposal"),
+            leader_sk.sign(&block_hash),
             false,
             height,
         )
@@ -2859,8 +2876,10 @@ mod tests {
                 new_view,
                 leader: _,
                 should_broadcast_nullification: _,
+                parent_block_hash,
             } => {
                 assert_eq!(new_view, 1);
+                assert_eq!(parent_block_hash, [0; blake3::OUT_LEN]);
             }
             _ => panic!("Expected ProgressToNextViewOnNullification event"),
         }
@@ -3574,12 +3593,14 @@ mod tests {
                 new_view,
                 leader,
                 should_broadcast_nullification,
+                parent_block_hash,
             } => {
                 assert_eq!(new_view, 1);
                 assert!(should_broadcast_nullification); // First time receiving it
                 // Verify leader is correct
                 let expected_leader = setup.peer_set.sorted_peer_ids[1];
                 assert_eq!(leader, expected_leader);
+                assert_eq!(parent_block_hash, [0; blake3::OUT_LEN]);
             }
             other => panic!(
                 "Expected ProgressToNextViewOnNullification, got {:?}",
@@ -4863,6 +4884,190 @@ mod tests {
             view_3_context.parent_block_hash, block_hash_1,
             "View 3 should have view 1's block (the greatest M-notarized view < 3) as parent"
         );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_m_notarization_forwards_new_m_notarization() {
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(0, leader_id, [0; blake3::OUT_LEN], leader_sk.clone(), 0);
+        let block_hash = block.get_hash();
+
+        // Add block first
+        manager.handle_block_proposal(block).unwrap();
+
+        // Create M-notarization
+        let mut votes = HashSet::new();
+        for i in 1..=3 {
+            votes.insert(create_test_vote(i, 0, block_hash, leader_id, &setup));
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 0, block_hash, leader_id);
+
+        // First M-notarization should have should_forward_m_notarization = true
+        let result = manager.handle_m_notarization(m_notarization);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ProgressToNextView {
+                should_forward_m_notarization,
+                ..
+            } => {
+                assert!(
+                    should_forward_m_notarization,
+                    "New M-notarization should be forwarded"
+                );
+            }
+            ViewProgressEvent::ShouldVoteAndProgressToNextView {
+                should_forward_m_notarization,
+                ..
+            } => {
+                assert!(
+                    should_forward_m_notarization,
+                    "New M-notarization should be forwarded"
+                );
+            }
+            other => panic!("Expected view progression event, got {:?}", other),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_m_notarization_does_not_forward_duplicate() {
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(0, leader_id, [0; blake3::OUT_LEN], leader_sk.clone(), 0);
+        let block_hash = block.get_hash();
+
+        manager.handle_block_proposal(block).unwrap();
+
+        // Mark replica as voted (simulate the voting action)
+        manager.mark_voted(0).unwrap();
+
+        // Create M-notarization
+        let mut votes = HashSet::new();
+        for i in 2..=4 {
+            votes.insert(create_test_vote(i, 0, block_hash, leader_id, &setup));
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&votes, 0, block_hash, leader_id);
+
+        // First call - should progress to view 1 with should_forward = true
+        let first_result = manager
+            .handle_m_notarization(m_notarization.clone())
+            .unwrap();
+        match first_result {
+            ViewProgressEvent::ProgressToNextView {
+                should_forward_m_notarization,
+                ..
+            } => {
+                assert!(
+                    should_forward_m_notarization,
+                    "First M-notarization should be forwarded"
+                );
+            }
+            other => panic!("Expected ProgressToNextView, got {:?}", other),
+        }
+
+        assert_eq!(manager.current_view_number(), 1);
+
+        // Second call (duplicate) for past view - should have should_forward = false internally
+        let result = manager.handle_m_notarization(m_notarization);
+        assert!(result.is_ok());
+
+        // For duplicate past view M-notarization, expect NoOp (already voted and progressed)
+        match result.unwrap() {
+            ViewProgressEvent::NoOp => {
+                // Correct - duplicate M-notarization for past view where we already voted
+            }
+            other => panic!(
+                "Expected NoOp for duplicate past M-notarization, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_nullification_broadcasts_new_nullification() {
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+
+        // Create nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            nullify_messages.insert(create_test_nullify(i, 0, leader_id, &setup));
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 0, leader_id);
+
+        // First nullification should trigger broadcast
+        let result = manager.handle_nullification(nullification);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ProgressToNextViewOnNullification {
+                should_broadcast_nullification,
+                ..
+            } => {
+                assert!(
+                    should_broadcast_nullification,
+                    "New nullification should be broadcast"
+                );
+            }
+            other => panic!(
+                "Expected ProgressToNextViewOnNullification, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_nullification_does_not_broadcast_duplicate() {
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+
+        // Create nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            nullify_messages.insert(create_test_nullify(i, 0, leader_id, &setup));
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 0, leader_id);
+
+        // Add first time
+        manager.handle_nullification(nullification.clone()).unwrap();
+
+        // Now in view 1
+        assert_eq!(manager.current_view_number(), 1);
+
+        // Add same nullification again for past view - should not broadcast
+        let result = manager.handle_nullification(nullification);
+        assert!(result.is_ok());
+
+        // For past view duplicate, should return NoOp or ShouldNullify (without broadcast)
+        match result.unwrap() {
+            ViewProgressEvent::NoOp | ViewProgressEvent::ShouldNullify { .. } => {}
+            other => panic!("Expected NoOp/ShouldNullify for duplicate, got {:?}", other),
+        }
 
         std::fs::remove_file(path).unwrap();
     }
