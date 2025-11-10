@@ -114,6 +114,7 @@ impl Block {
                 .concat(),
         );
         hasher.update(&self.header.timestamp.to_le_bytes());
+        hasher.update(&self.header.view.to_le_bytes());
         hasher.finalize().into()
     }
 

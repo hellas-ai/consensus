@@ -286,6 +286,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         self.view_chain.current_view_number()
     }
 
+    /// Returns a mutable reference to the view context for a given view.
+    pub fn view_context_mut(&mut self, view: u64) -> Result<&mut ViewContext<N, F, M_SIZE>> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+        Ok(view_ctx)
+    }
+
     /// Returns the replica's peer ID.
     pub fn replica_id(&self) -> PeerId {
         self.replica_id
@@ -294,6 +303,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     /// Returns the number of non-finalized views in the chain.
     pub fn non_finalized_count(&self) -> usize {
         self.view_chain.non_finalized_count()
+    }
+
+    pub fn leader_for_view(&self, view: u64) -> Result<PeerId> {
+        let view_ctx = self
+            .view_chain
+            .find_view_context(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+        Ok(view_ctx.leader_id)
     }
 
     /// Finalizes a view with L-notarization.
@@ -469,6 +486,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: block_view_number,
                 block_hash,
+                should_forward_m_notarization: true,
             });
         }
 
@@ -483,6 +501,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: block_view_number,
                 block_hash,
+                should_forward_m_notarization: true,
             });
         }
 
@@ -534,13 +553,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
-        if is_enough_to_m_notarize && should_vote {
-            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
-                view: vote_view_number,
-                block_hash: vote_block_hash,
-            });
-        }
-
         if is_enough_to_finalize && should_vote {
             return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
                 view: vote_view_number,
@@ -548,10 +560,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
+        if is_enough_to_m_notarize && should_vote {
+            return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
+                should_forward_m_notarization: true,
+            });
+        }
+
         if is_enough_to_m_notarize {
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: vote_view_number,
                 block_hash: vote_block_hash,
+                should_forward_m_notarization: true,
             });
         }
 
@@ -645,6 +666,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             should_await,
             should_vote,
             should_nullify,
+            should_forward,
         } = self
             .view_chain
             .route_m_notarization(m_notarization, &self.peers)?;
@@ -676,12 +698,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                     block_hash: m_notarization_block_hash,
                     new_view,
                     leader: new_leader,
+                    should_forward_m_notarization: should_forward,
                 });
             } else {
                 return Ok(ViewProgressEvent::ProgressToNextView {
                     new_view,
                     leader: new_leader,
                     notarized_block_hash: m_notarization_block_hash,
+                    should_forward_m_notarization: should_forward,
                 });
             }
         }
@@ -690,6 +714,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: m_notarization_view_number,
                 block_hash: m_notarization_block_hash,
+                should_forward_m_notarization: should_forward,
             });
         }
 
@@ -699,6 +724,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: m_notarization_view_number,
                 block_hash: m_notarization_block_hash,
+                should_forward_m_notarization: should_forward,
             });
         }
 
@@ -755,7 +781,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             let new_leader = self.leader_manager.leader_for_view(new_view)?.peer_id();
 
             // With nullification, parent hash stays the same (no progress)
-            let parent_hash = self.view_chain.current().parent_block_hash;
+            let parent_hash = self.view_chain.select_parent(new_view);
             let new_view_context =
                 ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
             self.view_chain
@@ -1513,10 +1539,12 @@ mod tests {
                 block_hash: hash,
                 new_view,
                 leader: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(old_view, 0);
                 assert_eq!(hash, block_hash);
                 assert_eq!(new_view, 1);
+                assert!(should_forward_m_notarization);
             }
             other => panic!("Expected ShouldVoteAndProgressToNextView, got {:?}", other),
         }
@@ -1561,9 +1589,11 @@ mod tests {
                 new_view,
                 leader: _,
                 notarized_block_hash,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(new_view, 1);
                 assert_eq!(notarized_block_hash, block_hash);
+                assert!(should_forward_m_notarization);
             }
             other => panic!("Expected ProgressToNextView, got {:?}", other),
         }
@@ -2188,8 +2218,10 @@ mod tests {
             ViewProgressEvent::ShouldVoteAndMNotarize {
                 view,
                 block_hash: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(view, 0);
+                assert!(should_forward_m_notarization);
             }
             _ => panic!("Expected ShouldVoteAndMNotarize event"),
         }
@@ -2259,8 +2291,10 @@ mod tests {
             ViewProgressEvent::ShouldMNotarize {
                 view,
                 block_hash: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(view, 0);
+                assert!(should_forward_m_notarization);
             }
             _ => panic!("Expected ShouldMNotarize event"),
         }
@@ -2373,8 +2407,10 @@ mod tests {
                     ViewProgressEvent::ShouldMNotarize {
                         view,
                         block_hash: _,
+                        should_forward_m_notarization,
                     } => {
                         assert_eq!(view, 0);
+                        assert!(should_forward_m_notarization);
                     }
                     _ => panic!("Expected ShouldMNotarize event"),
                 }
@@ -2454,8 +2490,10 @@ mod tests {
             ViewProgressEvent::ShouldVoteAndMNotarize {
                 view,
                 block_hash: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(view, 0);
+                assert!(should_forward_m_notarization);
             }
             ViewProgressEvent::ShouldMNotarize { .. } => {
                 // Also acceptable - depends on implementation details
@@ -2650,8 +2688,10 @@ mod tests {
                 new_view,
                 leader: _,
                 notarized_block_hash: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(new_view, 1);
+                assert!(should_forward_m_notarization);
             }
             ViewProgressEvent::ShouldVoteAndProgressToNextView { new_view, .. } => {
                 assert_eq!(new_view, 1);
@@ -4189,12 +4229,15 @@ mod tests {
             ViewProgressEvent::ShouldMNotarize {
                 view,
                 block_hash: _,
+                should_forward_m_notarization,
             }
             | ViewProgressEvent::ShouldVoteAndMNotarize {
                 view,
                 block_hash: _,
+                should_forward_m_notarization,
             } => {
                 assert_eq!(view, 0);
+                assert!(should_forward_m_notarization);
             }
             other => panic!("Expected M-notarization with 2f+1 votes, got {:?}", other),
         }
@@ -4612,5 +4655,215 @@ mod tests {
 
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn test_select_parent_with_multiple_nullified_views() {
+        // This test verifies that when multiple views are nullified in sequence,
+        // the next view correctly uses SelectParent to build on the last M-notarized block,
+        // not on the intermediate nullified views.
+        //
+        // Scenario:
+        // - View 0: M-notarized with block B0
+        // - View 1: Nullified (no block)
+        // - View 2: Nullified (no block)
+        // - View 3: Should build on B0 (the last M-notarized block)
+
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        // View 0: Create and M-notarize a block
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        // Add block proposal for view 0
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create M-notarization for view 0 (need >2F = 2, so 3 votes including leader)
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+
+        let result = manager.handle_m_notarization(m_not_0);
+        assert!(result.is_ok());
+        assert_eq!(manager.current_view_number(), 1);
+
+        // View 1: Nullify (no block proposed)
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let mut nullify_messages_1 = HashSet::new();
+        for i in 0..=2 {
+            nullify_messages_1.insert(create_test_nullify(i, 1, leader_id_1, &setup));
+        }
+        let nullification_1 =
+            create_test_nullification::<6, 1, 3>(&nullify_messages_1, 1, leader_id_1);
+
+        let result = manager.handle_nullification(nullification_1);
+        assert!(result.is_ok());
+        assert_eq!(manager.current_view_number(), 2);
+
+        // View 2: Nullify (no block proposed)
+        let leader_id_2 = setup.peer_set.sorted_peer_ids[2];
+        let mut nullify_messages_2 = HashSet::new();
+        for i in 0..=2 {
+            nullify_messages_2.insert(create_test_nullify(i, 2, leader_id_2, &setup));
+        }
+        let nullification_2 =
+            create_test_nullification::<6, 1, 3>(&nullify_messages_2, 2, leader_id_2);
+
+        let result = manager.handle_nullification(nullification_2);
+        assert!(result.is_ok());
+        assert_eq!(manager.current_view_number(), 3);
+
+        // View 3: Verify parent is block_hash_0 (from view 0)
+        // Check that view 3's parent_block_hash is correctly set to the last M-notarized block
+        let view_3_context = manager.view_chain.current();
+        assert_eq!(
+            view_3_context.parent_block_hash, block_hash_0,
+            "View 3 should have view 0's block (the last M-notarized block) as parent, \
+         not an undefined hash from the nullified intermediate views"
+        );
+
+        // Additional verification: Leader of view 3 can propose a valid block
+        let leader_id_3 = setup.peer_set.sorted_peer_ids[3];
+        let leader_sk_3 = setup.peer_id_to_secret_key.get(&leader_id_3).unwrap();
+
+        // This block should have block_hash_0 as parent
+        let block_3 = create_test_block(3, leader_id_3, block_hash_0, leader_sk_3.clone(), 1);
+
+        let result = manager.handle_block_proposal(block_3);
+        assert!(
+            result.is_ok(),
+            "Leader of view 3 should be able to propose a block with view 0's block as parent"
+        );
+
+        // Verify that replicas can vote for this block (it passes validation)
+        match result.unwrap() {
+            ViewProgressEvent::ShouldVote {
+                view,
+                block_hash: _,
+            } => {
+                assert_eq!(view, 3);
+            }
+            other => panic!("Expected ShouldVote event, got {:?}", other),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_select_parent_with_no_m_notarization_in_non_finalized_views() {
+        // This test verifies that when no M-notarization exists in non-finalized views,
+        // select_parent correctly falls back to the previously_committed_block_hash.
+        //
+        // Scenario:
+        // - Genesis block is finalized (previously_committed_block_hash = genesis)
+        // - View 0: Nullified (no block, no M-notarization)
+        // - View 1: Should build on genesis (previously_committed_block_hash)
+
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        // Nullify view 0 immediately (no block proposed)
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let mut nullify_messages_0 = HashSet::new();
+        for i in 0..=2 {
+            nullify_messages_0.insert(create_test_nullify(i, 0, leader_id_0, &setup));
+        }
+        let nullification_0 =
+            create_test_nullification::<6, 1, 3>(&nullify_messages_0, 0, leader_id_0);
+
+        let result = manager.handle_nullification(nullification_0);
+        assert!(result.is_ok());
+        assert_eq!(manager.current_view_number(), 1);
+
+        // View 1's parent should be the genesis/previously committed block (all zeros in this test)
+        let view_1_context = manager.view_chain.current();
+        assert_eq!(
+            view_1_context.parent_block_hash,
+            [0; blake3::OUT_LEN],
+            "View 1 should have genesis block as parent when no M-notarization exists in non-finalized views"
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_select_parent_skips_nullified_views() {
+        // This test verifies that select_parent correctly finds the greatest view
+        // with M-notarization, even when there's a complex pattern of M-notarized
+        // and nullified views.
+        //
+        // Scenario:
+        // - View 0: M-notarized with block B0
+        // - View 1: M-notarized with block B1
+        // - View 2: Nullified
+        // - View 3: Should build on B1 (greatest M-notarized view < 3)
+
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        // View 0: M-notarize
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        manager.handle_block_proposal(block_0).unwrap();
+
+        let mut m_votes_0 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_0.insert(create_test_vote(i, 0, block_hash_0, leader_id_0, &setup));
+        }
+        let m_not_0 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_0, 0, block_hash_0, leader_id_0);
+        manager.handle_m_notarization(m_not_0).unwrap();
+        assert_eq!(manager.current_view_number(), 1);
+
+        // View 1: M-notarize
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        manager.handle_block_proposal(block_1).unwrap();
+
+        let mut m_votes_1 = HashSet::new();
+        for i in 0..=2 {
+            m_votes_1.insert(create_test_vote(i, 1, block_hash_1, leader_id_1, &setup));
+        }
+        let m_not_1 =
+            create_test_m_notarization::<6, 1, 3>(&m_votes_1, 1, block_hash_1, leader_id_1);
+        manager.handle_m_notarization(m_not_1).unwrap();
+        assert_eq!(manager.current_view_number(), 2);
+
+        // View 2: Nullify
+        let leader_id_2 = setup.peer_set.sorted_peer_ids[2];
+        let mut nullify_messages_2 = HashSet::new();
+        for i in 0..=2 {
+            nullify_messages_2.insert(create_test_nullify(i, 2, leader_id_2, &setup));
+        }
+        let nullification_2 =
+            create_test_nullification::<6, 1, 3>(&nullify_messages_2, 2, leader_id_2);
+        manager.handle_nullification(nullification_2).unwrap();
+        assert_eq!(manager.current_view_number(), 3);
+
+        // View 3: Should use B1 as parent (greatest M-notarized view < 3)
+        let view_3_context = manager.view_chain.current();
+        assert_eq!(
+            view_3_context.parent_block_hash, block_hash_1,
+            "View 3 should have view 1's block (the greatest M-notarized view < 3) as parent"
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 }

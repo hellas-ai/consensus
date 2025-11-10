@@ -328,6 +328,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "validator",
+ "zeroize",
 ]
 
 [[package]]

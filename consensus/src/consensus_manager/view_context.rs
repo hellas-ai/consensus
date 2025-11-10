@@ -499,14 +499,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         let should_vote = !self.has_voted && !self.has_nullified;
 
         if self.block_hash.is_none() {
-            if self.m_notarization.is_none() {
+            let should_forward = if self.m_notarization.is_none() {
                 self.m_notarization = Some(m_notarization.clone());
-            }
+                true
+            } else {
+                false
+            };
             return Ok(ShouldMNotarize {
                 should_notarize: false,
                 should_await: false,
                 should_vote,
                 should_nullify: false,
+                should_forward,
             });
         }
 
@@ -532,6 +536,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                     should_await: false,
                     should_vote,
                     should_nullify: false,
+                    should_forward: false,
                 });
             } else {
                 // CONFLICTING M-notarization:
@@ -540,8 +545,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                 return Ok(ShouldMNotarize {
                     should_notarize: false,
                     should_await: false,
-                    should_vote: false,   // Don't vote if there's conflict
-                    should_nullify: true, // Signal that we should nullify this view
+                    should_vote: false,    // Don't vote if there's conflict
+                    should_nullify: true,  // Signal that we should nullify this view
+                    should_forward: false, // TODO: should we forward the conflicting M-notarization to the network layer?
                 });
             }
         }
@@ -554,6 +560,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             should_await: false,
             should_vote,
             should_nullify: false,
+            should_forward: true,
         })
     }
 
@@ -736,6 +743,8 @@ pub struct ShouldMNotarize {
     /// In case the replica receives a M-notarization for a different block hash than that
     /// of the leader proposed block, it should broadcast a nullify block
     pub should_nullify: bool,
+    /// Whether the current replica should forward the m-notarization to the network layer
+    pub should_forward: bool,
 }
 
 /// [`CollectedNullificationsResult`] is the result of collecting nullifications for the current

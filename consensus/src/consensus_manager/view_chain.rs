@@ -997,6 +997,52 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
+    /// Selects the parent block for a new view according to the Minimmit SelectParent function.
+    ///
+    /// This implements the SelectParent(S, v) function from the Minimmit paper (Section 4):
+    /// "If v' < v is the greatest view such that S contains an M-notarization for some b
+    /// with b.view = v', and if b is the lexicographically least such block, the function
+    /// outputs b."
+    ///
+    /// # Arguments
+    /// * `new_view` - The view number for which we're selecting a parent
+    ///
+    /// # Returns
+    /// * The block hash to use as parent for the new view
+    ///
+    /// # Logic
+    /// 1. Search all non-finalized views < new_view in descending order
+    /// 2. Find the greatest view with an M-notarization
+    /// 3. Return that M-notarization's block_hash
+    /// 4. If no M-notarization found in non-finalized views, return previously_committed_block_hash
+    pub fn select_parent(&self, new_view: u64) -> [u8; blake3::OUT_LEN] {
+        // Find the greatest view v' < new_view that has an M-notarization
+        let mut greatest_view_with_m_not: Option<(u64, [u8; blake3::OUT_LEN])> = None;
+
+        for (view_num, ctx) in &self.non_finalized_views {
+            if *view_num < new_view
+                && let Some(ref m_not) = ctx.m_notarization
+            {
+                // Update if this is a greater view number than we've seen
+                match greatest_view_with_m_not {
+                    None => {
+                        greatest_view_with_m_not = Some((*view_num, m_not.block_hash));
+                    }
+                    Some((prev_view, _)) if *view_num > prev_view => {
+                        greatest_view_with_m_not = Some((*view_num, m_not.block_hash));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Return the block hash from the greatest view with M-notarization,
+        // or the previously committed (finalized) block hash if none found
+        greatest_view_with_m_not
+            .map(|(_, block_hash)| block_hash)
+            .unwrap_or(self.previously_committed_block_hash)
+    }
+
     /// Finds the view number for a given parent block hash in the non-finalized chain.
     ///
     /// Searches through all non-finalized views to locate which view contains a block

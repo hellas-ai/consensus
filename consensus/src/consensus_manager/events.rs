@@ -59,6 +59,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         view: u64,
         /// The hash of the block that the replica should notarize.
         block_hash: [u8; blake3::OUT_LEN],
+        /// Whether the replica should forward the M-notarization to the network layer.
+        should_forward_m_notarization: bool,
     },
 
     /// If the current replica should notarize a block for the current view, and vote for it
@@ -68,6 +70,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         view: u64,
         /// The hash of the block that the replica should notarize and vote for.
         block_hash: [u8; blake3::OUT_LEN],
+        /// Whether the replica should forward the M-notarization to the network layer.
+        should_forward_m_notarization: bool,
     },
 
     /// If the current replica should vote for a block for the current view, and progress to the
@@ -81,6 +85,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         new_view: u64,
         /// The leader's ID of the new view.
         leader: PeerId,
+        /// Whether the replica should forward the M-notarization to the network layer.
+        should_forward_m_notarization: bool,
     },
 
     /// If the current replica should progress to the next view.
@@ -91,6 +97,8 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         leader: PeerId,
         /// The hash of the notarized block that the replica should progress to the next view for.
         notarized_block_hash: [u8; blake3::OUT_LEN],
+        /// Whether the replica should forward the M-notarization to the network layer.
+        should_forward_m_notarization: bool,
     },
 
     /// If the current replica should finalize the state for the the `view`.

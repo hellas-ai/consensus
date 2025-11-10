@@ -2,7 +2,6 @@ pub mod config;
 pub mod events;
 pub mod leader_manager;
 pub mod state_machine;
-pub mod traits;
 pub mod utils;
 pub mod view_chain;
 pub mod view_context;

@@ -4,6 +4,7 @@ use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective, G2Affine, G2Projectiv
 use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, pairing::Pairing};
 use ark_ff::{PrimeField, UniformRand, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::crypto::BLS_SIGNATURE_COMPRESSED_SIZE;
 
@@ -15,7 +16,7 @@ pub struct BlsPublicKey(pub G2Affine);
 #[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
 pub struct BlsSignature(pub G1Affine);
 
-#[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize)]
+#[derive(Clone, Debug, CanonicalDeserialize, CanonicalSerialize, Zeroize, ZeroizeOnDrop)]
 pub struct BlsSecretKey(pub Fr);
 
 impl BlsSecretKey {
