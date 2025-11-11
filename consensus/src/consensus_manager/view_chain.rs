@@ -67,7 +67,7 @@ use crate::{
 /// routing messages to the appropriate view context, and managing finalization.
 pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The current active view number
-    current_view: u64,
+    pub(crate) current_view: u64,
 
     /// Map of non-finalized view contexts, keyed by view number
     ///
@@ -76,7 +76,7 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
     /// collecting votes for potential finalization.
     ///
     /// This map contains at least one entry, namely that corresponding to the current view number.
-    non_finalized_views: HashMap<u64, ViewContext<N, F, M_SIZE>>,
+    pub(crate) non_finalized_views: HashMap<u64, ViewContext<N, F, M_SIZE>>,
 
     /// The persistence storage for the consensus protocol
     /// This is used to persist the view contexts and the votes/nullifications/notarizations

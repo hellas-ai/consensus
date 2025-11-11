@@ -483,6 +483,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if is_enough_to_m_notarize && should_vote {
+            // Process pending child blocks that were waiting for this parent
+            self.process_all_pending_blocks()?;
+
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: block_view_number,
                 block_hash,
@@ -561,6 +564,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if is_enough_to_m_notarize && should_vote {
+            // Process pending child blocks that were waiting for this parent
+            self.process_all_pending_blocks()?;
+
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: vote_view_number,
                 block_hash: vote_block_hash,
@@ -569,6 +575,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if is_enough_to_m_notarize {
+            // Process pending child blocks that were waiting for this parent
+            self.process_all_pending_blocks()?;
+
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: vote_view_number,
                 block_hash: vote_block_hash,
@@ -711,6 +720,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if should_notarize && should_vote {
+            // Process pending child blocks that were waiting for this parent
+            self.process_all_pending_blocks()?;
+
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: m_notarization_view_number,
                 block_hash: m_notarization_block_hash,
@@ -719,7 +731,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if should_notarize {
-            // Process pending child blocks
+            // Process pending child blocks that were waiting for this parent
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: m_notarization_view_number,
@@ -804,6 +817,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(ViewProgressEvent::ShouldNullify {
             view: nullification_view_number,
         })
+    }
+
+    /// Process pending child blocks recursively until no more can be processed.
+    /// This handles cascading scenarios where processing a pending block causes it to reach
+    /// M-notarization, which then allows its own pending children to be processed.
+    fn process_all_pending_blocks(&mut self) -> Result<()> {
+        loop {
+            let mut made_progress = false;
+
+            // Collect all views that have M-notarization
+            let views_with_m_not: Vec<u64> = self
+                .view_chain
+                .non_finalized_views
+                .iter()
+                .filter(|(_, ctx)| ctx.m_notarization.is_some())
+                .map(|(v, _)| *v)
+                .collect();
+
+            // Try to process pending children for each M-notarized view
+            for view in views_with_m_not {
+                let results = self
+                    .view_chain
+                    .process_pending_child_proposals(view, &self.peers)?;
+                if !results.is_empty() {
+                    made_progress = true;
+                }
+            }
+
+            // If no pending blocks were processed this iteration, we're done
+            if !made_progress {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     fn _try_update_view(&mut self, view: u64) -> Result<()> {
@@ -5068,6 +5116,434 @@ mod tests {
             ViewProgressEvent::NoOp | ViewProgressEvent::ShouldNullify { .. } => {}
             other => panic!("Expected NoOp/ShouldNullify for duplicate, got {:?}", other),
         }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_stored_when_parent_not_m_notarized() {
+        // Test: Block for view V+1 arrives before view V has M-notarization -> stored as pending
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        // Add block for view 0 (leader vote is automatically added, but NO M-notarization yet -
+        // only 1 vote)
+        manager.handle_block_proposal(block_0).unwrap();
+        assert_eq!(manager.current_view_number(), 0);
+
+        // Create block for view 1
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        // First call returns ShouldUpdateView
+        let result = manager.handle_block_proposal(block_1.clone());
+        assert!(result.is_ok());
+        match result.unwrap() {
+            ViewProgressEvent::ShouldUpdateView { new_view, leader } => {
+                assert_eq!(new_view, 1);
+                assert_eq!(leader, leader_id_1);
+            }
+            other => panic!("Expected ShouldUpdateView, got {:?}", other),
+        }
+
+        // Manually create view 1 context (simulating what happens after ShouldUpdateView)
+        let view_ctx_1 = ViewContext::new(1, leader_id_1, manager.replica_id, block_hash_0);
+        manager.view_chain.non_finalized_views.insert(1, view_ctx_1);
+        manager.view_chain.current_view = 1; // <-- ADD THIS LINE
+
+        // Now process the block again
+        let result = manager.handle_block_proposal(block_1.clone());
+        assert!(result.is_ok());
+
+        // Should return Await since parent doesn't have M-notarization
+        match result.unwrap() {
+            ViewProgressEvent::Await => {}
+            other => panic!("Expected Await, got {:?}", other),
+        }
+
+        // Verify block is stored as pending
+        let view_1_ctx = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_ctx.pending_block.is_some());
+        assert!(view_1_ctx.block.is_none());
+        assert_eq!(
+            view_1_ctx.pending_block.as_ref().unwrap().get_hash(),
+            block_hash_1
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_processed_after_parent_m_notarization() {
+        // Test: When parent gets M-notarization, pending block is processed
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        // Add block for view 0 (only leader's vote - no M-notarization)
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create block for view 1
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        // Manually create view 1 context WITHOUT progressing current_view
+        // This simulates receiving a block for a future view
+        let view_ctx_1 = ViewContext::new(1, leader_id_1, manager.replica_id, block_hash_0);
+        manager.view_chain.non_finalized_views.insert(1, view_ctx_1);
+        // NOTE: Do NOT set current_view = 1, keep it at 0
+
+        // Add the block directly to view 1 using view_chain (bypassing handle_block_proposal)
+        let result = manager
+            .view_chain
+            .add_block_proposal(1, block_1, &manager.peers);
+        assert!(result.is_ok());
+        assert!(result.unwrap().should_await); // Should await parent M-notarization
+
+        // Verify block is pending in view 1
+        let view_1_before = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_before.pending_block.is_some());
+        assert!(view_1_before.block.is_none());
+
+        // Now add 2 more votes to view 0 to reach M-notarization (3 total: leader + 2)
+        for i in 1..=2 {
+            let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
+            manager.handle_vote(vote).unwrap();
+        }
+
+        // The last vote should trigger M-notarization and process pending blocks
+        // Verify that pending block was processed
+        let view_1_after = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_after.pending_block.is_none());
+        assert!(view_1_after.block.is_some());
+        assert_eq!(
+            view_1_after.block.as_ref().unwrap().get_hash(),
+            block_hash_1
+        );
+
+        // Verify leader's vote was automatically added
+        assert_eq!(view_1_after.votes.len(), 1);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_triggers_vote_after_processing() {
+        // Test: After pending block is processed, replica should vote
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 2); // Use replica at index 2, NOT index 1
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create block for view 1 (leader is at index 1, replica is at index 2)
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        // Manually create view 1 context WITHOUT progressing current_view
+        let view_ctx_1 = ViewContext::new(1, leader_id_1, manager.replica_id, block_hash_0);
+        manager.view_chain.non_finalized_views.insert(1, view_ctx_1);
+
+        // Add the block as pending using view_chain directly
+        manager
+            .view_chain
+            .add_block_proposal(1, block_1, &manager.peers)
+            .unwrap();
+
+        // Verify block is pending
+        let view_1_before = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_before.pending_block.is_some());
+        assert!(view_1_before.block.is_none());
+
+        // M-notarize view 0 (triggers pending block processing)
+        for i in 1..=2 {
+            let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
+            manager.handle_vote(vote).unwrap();
+        }
+
+        // Verify pending block was processed
+        let view_1_after = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_after.pending_block.is_none());
+        assert!(view_1_after.block.is_some());
+
+        // Now manually progress to view 1 (simulating what would happen after M-notarization)
+        manager.view_chain.current_view = 1;
+
+        // Now tick should discover the processed block and trigger vote
+        let tick_result = manager.tick();
+        assert!(tick_result.is_ok());
+
+        match tick_result.unwrap() {
+            ViewProgressEvent::ShouldVote { view, block_hash } => {
+                assert_eq!(view, 1);
+                assert_eq!(block_hash, block_hash_1);
+            }
+            other => panic!(
+                "Expected ShouldVote after pending block processed, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_pending_blocks_cascade() {
+        // Test: Multiple pending blocks are processed in sequence
+        // View 0: Has block, gets M-notarized
+        // View 1: Pending (waiting for view 0)
+        // View 2: Pending (waiting for view 1)
+        // When view 0 gets M-notarized -> view 1 processed
+        // When view 1 gets M-notarized -> view 2 processed
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create view 1 context and add pending block
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        // Manually create view 1 context
+        let view_ctx_1 = ViewContext::new(1, leader_id_1, manager.replica_id, block_hash_0);
+        manager.view_chain.non_finalized_views.insert(1, view_ctx_1);
+
+        // Add block 1 as pending
+        manager
+            .view_chain
+            .add_block_proposal(1, block_1, &manager.peers)
+            .unwrap();
+
+        // Verify block 1 is pending
+        assert!(
+            manager
+                .view_chain
+                .find_view_context(1)
+                .unwrap()
+                .pending_block
+                .is_some()
+        );
+
+        // M-notarize view 0 - this will process pending block_1
+        for i in 1..=2 {
+            let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
+            manager.handle_vote(vote).unwrap();
+        }
+
+        // View 1 should now be processed (no longer pending)
+        let view_1 = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1.pending_block.is_none());
+        assert!(view_1.block.is_some());
+
+        // NOW create view 2 context and add pending block (after view 1 is processed)
+        let leader_id_2 = setup.peer_set.sorted_peer_ids[2];
+        let leader_sk_2 = setup.peer_id_to_secret_key.get(&leader_id_2).unwrap();
+        let block_2 = create_test_block(2, leader_id_2, block_hash_1, leader_sk_2.clone(), 2);
+        let block_hash_2 = block_2.get_hash();
+
+        // Manually create view 2 context
+        let view_ctx_2 = ViewContext::new(2, leader_id_2, manager.replica_id, block_hash_1);
+        manager.view_chain.non_finalized_views.insert(2, view_ctx_2);
+
+        // Add block 2 as pending (parent view 1 has block but no M-notarization)
+        manager
+            .view_chain
+            .add_block_proposal(2, block_2, &manager.peers)
+            .unwrap();
+
+        // View 2 should be pending (waiting for view 1 M-notarization)
+        let view_2_before = manager.view_chain.find_view_context(2).unwrap();
+        assert!(view_2_before.pending_block.is_some());
+        assert!(view_2_before.block.is_none());
+
+        // Manually add votes and M-notarization to view 1
+        // View 1 already has leader vote, add 2 more to reach threshold (3 total)
+        let mut votes_view_1 = HashSet::new();
+        // Collect leader vote (already exists)
+        votes_view_1.extend(
+            manager
+                .view_chain
+                .find_view_context(1)
+                .unwrap()
+                .votes
+                .clone(),
+        );
+        // Add 2 more votes
+        for i in 2..=3 {
+            let vote = create_test_vote(i, 1, block_hash_1, leader_id_1, &setup);
+            votes_view_1.insert(vote);
+        }
+
+        // Manually create M-notarization for view 1
+        let m_not_1 =
+            create_test_m_notarization::<6, 1, 3>(&votes_view_1, 1, block_hash_1, leader_id_1);
+        let view_1_mut = manager.view_chain.non_finalized_views.get_mut(&1).unwrap();
+        view_1_mut.m_notarization = Some(m_not_1);
+
+        // Verify view 1 has M-notarization
+        let view_1_after = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_after.m_notarization.is_some());
+
+        // Manually trigger pending block processing for view 1's children
+        manager
+            .view_chain
+            .process_pending_child_proposals(1, &manager.peers)
+            .unwrap();
+
+        // Now view 2 should be processed
+        let view_2_after = manager.view_chain.find_view_context(2).unwrap();
+        assert!(view_2_after.pending_block.is_none());
+        assert!(view_2_after.block.is_some());
+        assert_eq!(
+            view_2_after.block.as_ref().unwrap().get_hash(),
+            block_hash_2
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_with_immediate_m_notarization() {
+        // Test: Pending block reaches M-notarization threshold immediately after being processed
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Create view 1 context and add pending block
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+        let block_hash_1 = block_1.get_hash();
+
+        // Manually create view 1 context
+        let view_ctx_1 = ViewContext::new(1, leader_id_1, manager.replica_id, block_hash_0);
+        manager.view_chain.non_finalized_views.insert(1, view_ctx_1);
+
+        // Add block 1 as pending
+        manager
+            .view_chain
+            .add_block_proposal(1, block_1, &manager.peers)
+            .unwrap();
+
+        // Verify block is pending
+        let view_1_before = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_before.pending_block.is_some());
+        assert!(view_1_before.block.is_none());
+
+        // M-notarize view 0 (triggers pending block processing)
+        for i in 1..=2 {
+            let vote = create_test_vote(i, 0, block_hash_0, leader_id_0, &setup);
+            manager.handle_vote(vote).unwrap();
+        }
+
+        // View 1 should be processed with leader vote
+        let view_1_after = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_after.pending_block.is_none());
+        assert!(view_1_after.block.is_some());
+        assert_eq!(view_1_after.votes.len(), 1); // Just leader vote
+
+        // Now manually add votes and M-notarization to show it can reach threshold
+        let mut votes_view_1 = HashSet::new();
+        votes_view_1.extend(view_1_after.votes.clone()); // Include leader vote
+
+        // Add 2 more votes to reach threshold
+        for i in 2..=3 {
+            let vote = create_test_vote(i, 1, block_hash_1, leader_id_1, &setup);
+            votes_view_1.insert(vote);
+        }
+
+        // Manually create and insert M-notarization
+        let m_not_1 =
+            create_test_m_notarization::<6, 1, 3>(&votes_view_1, 1, block_hash_1, leader_id_1);
+        let view_1_mut = manager.view_chain.non_finalized_views.get_mut(&1).unwrap();
+        view_1_mut.m_notarization = Some(m_not_1);
+
+        // Verify view 1 has M-notarization
+        let view_1_final = manager.view_chain.find_view_context(1).unwrap();
+        assert!(view_1_final.m_notarization.is_some());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_pending_block_cannot_use_nullified_parent() {
+        // Test: Block with nullified parent view is rejected, not stored as pending
+        let setup = create_test_peer_setup(6);
+        let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
+            create_test_manager(&setup, 1);
+
+        let leader_id_0 = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk_0 = setup.peer_id_to_secret_key.get(&leader_id_0).unwrap();
+        let block_0 =
+            create_test_block(0, leader_id_0, [0; blake3::OUT_LEN], leader_sk_0.clone(), 0);
+        let block_hash_0 = block_0.get_hash();
+
+        manager.handle_block_proposal(block_0).unwrap();
+
+        // Nullify view 0
+        let mut nullify_messages = HashSet::new();
+        for i in 1..=3 {
+            nullify_messages.insert(create_test_nullify(i, 0, leader_id_0, &setup));
+        }
+        let nullification = create_test_nullification::<6, 1, 3>(&nullify_messages, 0, leader_id_0);
+        manager.handle_nullification(nullification).unwrap();
+
+        // Now try to add block for view 1 with parent = block_hash_0
+        // This should ERROR because view 0 is nullified
+        let leader_id_1 = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
+        let block_1 = create_test_block(1, leader_id_1, block_hash_0, leader_sk_1.clone(), 1);
+
+        let result = manager.handle_block_proposal(block_1);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Block proposal for parent view 0 is nullified")
+        );
 
         std::fs::remove_file(path).unwrap();
     }
