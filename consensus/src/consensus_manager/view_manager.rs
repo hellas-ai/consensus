@@ -484,9 +484,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if is_enough_to_m_notarize && should_vote {
             // Process pending child blocks that were waiting for this parent
-            let _ = self
-                .view_chain
-                .process_pending_child_proposals(block_view_number, &self.peers)?;
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: block_view_number,
@@ -567,9 +565,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if is_enough_to_m_notarize && should_vote {
             // Process pending child blocks that were waiting for this parent
-            let _ = self
-                .view_chain
-                .process_pending_child_proposals(vote_view_number, &self.peers)?;
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: vote_view_number,
@@ -580,9 +576,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if is_enough_to_m_notarize {
             // Process pending child blocks that were waiting for this parent
-            let _ = self
-                .view_chain
-                .process_pending_child_proposals(vote_view_number, &self.peers)?;
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: vote_view_number,
@@ -727,9 +721,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if should_notarize && should_vote {
             // Process pending child blocks that were waiting for this parent
-            let _ = self
-                .view_chain
-                .process_pending_child_proposals(m_notarization_view_number, &self.peers)?;
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldVoteAndMNotarize {
                 view: m_notarization_view_number,
@@ -740,9 +732,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if should_notarize {
             // Process pending child blocks that were waiting for this parent
-            let _ = self
-                .view_chain
-                .process_pending_child_proposals(m_notarization_view_number, &self.peers)?;
+            self.process_all_pending_blocks()?;
 
             return Ok(ViewProgressEvent::ShouldMNotarize {
                 view: m_notarization_view_number,
@@ -827,6 +817,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(ViewProgressEvent::ShouldNullify {
             view: nullification_view_number,
         })
+    }
+
+    /// Process pending child blocks recursively until no more can be processed.
+    /// This handles cascading scenarios where processing a pending block causes it to reach
+    /// M-notarization, which then allows its own pending children to be processed.
+    fn process_all_pending_blocks(&mut self) -> Result<()> {
+        loop {
+            let mut made_progress = false;
+
+            // Collect all views that have M-notarization
+            let views_with_m_not: Vec<u64> = self
+                .view_chain
+                .non_finalized_views
+                .iter()
+                .filter(|(_, ctx)| ctx.m_notarization.is_some())
+                .map(|(v, _)| *v)
+                .collect();
+
+            // Try to process pending children for each M-notarized view
+            for view in views_with_m_not {
+                let results = self
+                    .view_chain
+                    .process_pending_child_proposals(view, &self.peers)?;
+                if !results.is_empty() {
+                    made_progress = true;
+                }
+            }
+
+            // If no pending blocks were processed this iteration, we're done
+            if !made_progress {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     fn _try_update_view(&mut self, view: u64) -> Result<()> {
