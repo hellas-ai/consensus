@@ -648,16 +648,36 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         !self.has_nullified && !self.has_voted && self.entered_at.elapsed() >= timeout_duration
     }
 
-    /// Creates a nullify message for the current view when timeout occurs.
-    /// This should be called by ViewProgressManager when should_timeout_nullify returns true.
+    /// Creates a nullify message for timeout.
+    /// This should be called when a replica times out waiting for a block proposal.
+    /// The replica must NOT have voted yet.
     pub fn create_nullify_for_timeout(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
         if self.has_nullified {
             return Err(anyhow::anyhow!("Already nullified in this view"));
         }
         if self.has_voted {
-            return Err(anyhow::anyhow!("Already voted in this view"));
+            return Err(anyhow::anyhow!(
+                "Cannot nullify for timeout after voting - use create_nullify_for_byzantine if conflicting evidence detected"
+            ));
         }
 
+        self.create_nullify_message(secret_key)
+    }
+
+    /// Creates a nullify message for Byzantine/conflicting evidence.
+    /// This can be called BEFORE or AFTER voting when >2F conflicting messages are detected
+    /// (invalid votes or other nullify messages).
+    /// This is distinct from timeout nullification, which only occurs before voting.
+    pub fn create_nullify_for_byzantine(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
+        if self.has_nullified {
+            return Err(anyhow::anyhow!("Already nullified in this view"));
+        }
+
+        self.create_nullify_message(secret_key)
+    }
+
+    /// Internal helper to create the actual nullify message
+    fn create_nullify_message(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
         let message =
             blake3::hash(&[self.view_number.to_le_bytes(), self.leader_id.to_le_bytes()].concat());
         let signature = secret_key.sign(message.as_bytes());
@@ -3251,7 +3271,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Already voted in this view")
+                .contains("Cannot nullify for timeout after voting - use create_nullify_for_byzantine if conflicting evidence detected")
         );
     }
 
@@ -3954,5 +3974,198 @@ mod tests {
         let result = context.add_nullification(nullification, peers);
         assert!(result.is_ok());
         assert!(!result.unwrap().should_broadcast_nullification);
+    }
+
+    #[test]
+    fn test_create_nullify_for_byzantine_success_before_voting() {
+        // Test: Byzantine nullification can happen BEFORE voting if conflicting evidence detected
+        let setup = create_test_peer_setup(4);
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Replica has NOT voted yet
+        assert!(!context.has_voted);
+
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let result = context.create_nullify_for_byzantine(secret_key);
+
+        assert!(result.is_ok());
+        let nullify = result.unwrap();
+        assert_eq!(nullify.view, 10);
+        assert_eq!(nullify.leader_id, leader_id);
+        assert!(context.has_nullified);
+    }
+
+    #[test]
+    fn test_create_nullify_for_byzantine_success_after_voting() {
+        // Test: Byzantine nullification can happen AFTER voting if conflicting evidence detected
+        let setup = create_test_peer_setup(4);
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Replica HAS voted
+        context.has_voted = true;
+
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let result = context.create_nullify_for_byzantine(secret_key);
+
+        assert!(result.is_ok());
+        let nullify = result.unwrap();
+        assert_eq!(nullify.view, 10);
+        assert_eq!(nullify.leader_id, leader_id);
+        assert!(context.has_nullified);
+    }
+
+    #[test]
+    fn test_create_nullify_for_byzantine_fails_if_already_nullified() {
+        let setup = create_test_peer_setup(4);
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        context.has_nullified = true;
+
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let result = context.create_nullify_for_byzantine(secret_key);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Already nullified")
+        );
+    }
+
+    #[test]
+    fn test_timeout_nullify_vs_byzantine_nullify_distinction() {
+        // Test: Timeout nullify requires !has_voted, Byzantine nullify allows any state
+        let setup = create_test_peer_setup(4);
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+
+        // Scenario 1: Before voting - both methods should work
+        let mut context1 = create_test_view_context(10, leader_id, replica_id, parent_hash);
+        assert!(context1.create_nullify_for_timeout(secret_key).is_ok());
+
+        let mut context2 = create_test_view_context(10, leader_id, replica_id, parent_hash);
+        assert!(context2.create_nullify_for_byzantine(secret_key).is_ok());
+
+        // Scenario 2: After voting - only Byzantine method should work
+        let mut context3 = create_test_view_context(10, leader_id, replica_id, parent_hash);
+        context3.has_voted = true;
+        assert!(context3.create_nullify_for_timeout(secret_key).is_err());
+
+        let mut context4 = create_test_view_context(10, leader_id, replica_id, parent_hash);
+        context4.has_voted = true;
+        assert!(context4.create_nullify_for_byzantine(secret_key).is_ok());
+    }
+
+    #[test]
+    fn test_integration_byzantine_detection_before_voting() {
+        // Integration test: Replica receives conflicting votes before voting, should use Byzantine
+        // nullify
+        let setup = create_test_peer_setup(6); // N=6, F=1, need >2 conflicting
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context =
+            create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Add a block
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 10);
+        context.add_new_view_block(block, &setup.peer_set).unwrap();
+
+        // Replica has NOT voted yet
+        assert!(!context.has_voted);
+
+        // Receive 3 votes for DIFFERENT blocks (Byzantine behavior)
+        let wrong_hash = [1u8; blake3::OUT_LEN];
+        for i in 2..=4 {
+            let vote = create_test_vote(i, 10, wrong_hash, leader_id, &setup);
+            context.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        // Should have 3 invalid votes
+        assert_eq!(context.num_invalid_votes, 3);
+
+        // Replica hasn't voted but detected Byzantine behavior
+        assert!(!context.has_voted);
+
+        // Byzantine nullification should work (even before voting)
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let result = context.create_nullify_for_byzantine(secret_key);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_integration_byzantine_detection_after_voting() {
+        // Integration test: Replica votes, then receives conflicting evidence, should use Byzantine
+        // nullify
+        let setup = create_test_peer_setup(6); // N=6, F=1, need >2 conflicting
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context =
+            create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
+
+        // Add a block
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 10);
+        let block_hash = block.get_hash();
+        context.add_new_view_block(block, &setup.peer_set).unwrap();
+
+        // Replica votes for the block
+        let replica_sk = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let vote_sig = replica_sk.sign(&block_hash);
+        context.add_own_vote(vote_sig).unwrap();
+        assert!(context.has_voted);
+
+        // Then receive 3 votes for a DIFFERENT block (Byzantine behavior)
+        let wrong_hash = [1u8; blake3::OUT_LEN];
+        for i in 2..=4 {
+            let vote = create_test_vote(i, 10, wrong_hash, leader_id, &setup);
+            context.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        // Should have 3 invalid votes
+        assert_eq!(context.num_invalid_votes, 3);
+
+        // Replica has voted and detected Byzantine behavior
+        assert!(context.has_voted);
+
+        // Byzantine nullification should work (after voting)
+        let result = context.create_nullify_for_byzantine(replica_sk);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_timeout_nullification_scenario() {
+        // Test: Timeout nullification only works before voting and without Byzantine evidence
+        let setup = create_test_peer_setup(4);
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let replica_id = setup.peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let mut context = create_test_view_context(10, leader_id, replica_id, parent_hash);
+
+        // Replica hasn't voted, no block received, no conflicting evidence
+        assert!(!context.has_voted);
+        assert!(context.block.is_none());
+        assert_eq!(context.num_invalid_votes, 0);
+        assert_eq!(context.nullify_messages.len(), 0);
+
+        // Timeout nullification should work
+        let secret_key = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
+        let result = context.create_nullify_for_timeout(secret_key);
+        assert!(result.is_ok());
+        assert!(context.has_nullified);
     }
 }

@@ -373,7 +373,24 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // Get view context to create nullify message
         let view_ctx = self.view_manager.view_context_mut(view)?;
 
-        let nullify = view_ctx.create_nullify_for_timeout(&self.secret_key)?;
+        let nullify = if view_ctx.has_voted {
+            // NOTE: After voting, the current replica must have conflicting evidence,
+            // so in this case, the view is under Byzantine behavior.
+            view_ctx.create_nullify_for_byzantine(&self.secret_key)?
+        } else {
+            // NOTE: If the current replica attempts to nullify a message before voting, it could be
+            // timeout OR Byzantine We can't distinguish here, so we check if there's
+            // conflicting evidence
+            let conflicting_count = view_ctx.nullify_messages.len() + view_ctx.num_invalid_votes;
+
+            if conflicting_count > 2 * F {
+                // Byzantine behavior detected before voting
+                view_ctx.create_nullify_for_byzantine(&self.secret_key)?
+            } else {
+                // Timeout
+                view_ctx.create_nullify_for_timeout(&self.secret_key)?
+            }
+        };
 
         // Broadcast the nullify message to the network layer (to be received by other replicas)
         self.broadcast_consensus_message(ConsensusMessage::Nullify(nullify))?;
