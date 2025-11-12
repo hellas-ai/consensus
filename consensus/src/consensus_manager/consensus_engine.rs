@@ -124,7 +124,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Consumer, Producer};
 
 use crate::{
     consensus::ConsensusMessage,
