@@ -1,3 +1,209 @@
+//! Consensus State Machine - Core Protocol Logic for Minimmit BFT
+//!
+//! This module implements the [`ConsensusStateMachine`], which contains the core logic
+//! for executing the Minimmit Byzantine Fault Tolerant (BFT) consensus protocol. The state
+//! machine runs in a dedicated thread (spawned by [`ConsensusEngine`]) and processes
+//! consensus messages, transactions, and timer events to drive view progression and
+//! maintain protocol invariants.
+//!
+//! ## Architecture
+//!
+//! The state machine follows an event-driven architecture, continuously polling lock-free
+//! ring buffers for incoming messages and periodically triggering timeout events:
+//!
+//!
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │              ConsensusStateMachine (Event Loop)                 │
+//! │                                                                 │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  1. Poll message_consumer (ConsensusMessages)            │  │
+//! │  │     - BlockProposal, Vote, MNotarization, LNotarization  │  │
+//! │  │     - Nullify, Nullification                             │  │
+//! │  └────────────────────┬─────────────────────────────────────┘  │
+//! │                       │                                         │
+//! │                       ▼                                         │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  2. Poll transaction_consumer (Transactions)             │  │
+//! │  │     - Client transactions to include in blocks           │  │
+//! │  └────────────────────┬─────────────────────────────────────┘  │
+//! │                       │                                         │
+//! │                       ▼                                         │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  3. Periodic Tick (every tick_interval)                  │  │
+//! │  │     - Check view timeout                                 │  │
+//! │  │     - Trigger nullification if needed                    │  │
+//! │  └────────────────────┬─────────────────────────────────────┘  │
+//! │                       │                                         │
+//! │                       ▼                                         │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  4. Process Event (ViewProgressEvent)                    │  │
+//! │  │     - ViewProgressManager returns events based on state  │  │
+//! │  └────────────────────┬─────────────────────────────────────┘  │
+//! │                       │                                         │
+//! │                       ▼                                         │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  5. Handle Event (take action)                           │  │
+//! │  │     - Propose block, vote, create notarizations          │  │
+//! │  │     - Broadcast messages, progress views                 │  │
+//! │  └────────────────────┬─────────────────────────────────────┘  │
+//! │                       │                                         │
+//! │                       ▼                                         │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │  6. Broadcast via broadcast_producer                     │  │
+//! │  │     - Send messages to network layer                     │  │
+//! │  └──────────────────────────────────────────────────────────┘  │
+//! │                                                                 │
+//! │  Loop continues until shutdown_signal is set                   │
+//! └─────────────────────────────────────────────────────────────────┘
+//! //!
+//! ## Responsibilities
+//!
+//! The `ConsensusStateMachine` is responsible for:
+//!
+//! - **Message Processing**: Consuming and validating incoming consensus messages (block proposals,
+//!   votes, M-notarizations, L-notarizations, nullifications)
+//! - **Transaction Management**: Collecting client transactions for inclusion in blocks
+//! - **View Progression**: Advancing through views based on M-notarizations or nullifications
+//! - **Leader Duties**: Proposing blocks when this replica is the leader
+//! - **Voting**: Casting votes for valid block proposals
+//! - **Notarization**: Creating and broadcasting M-notarizations (2F+1 votes) and L-notarizations
+//!   (N-F votes)
+//! - **Nullification**: Detecting Byzantine behavior or timeouts and creating nullify messages
+//! - **Message Broadcasting**: Forwarding messages to other replicas exactly once (per protocol)
+//! - **Cryptographic Operations**: Signing blocks, votes, and nullifications with BLS signatures
+//! - **State Persistence**: Delegating to `ViewProgressManager` for durable state
+//!
+//! ## Minimmit Protocol Overview
+//!
+//! The Minimmit protocol organizes consensus into numbered **views**, each with a designated
+//! **leader** (determined by round-robin or other strategies). The protocol proceeds as follows:
+//!
+//! 1. **Block Proposal**: The leader for view V proposes a block extending the most recent
+//!    M-notarized block
+//! 2. **Voting**: Replicas vote for the leader's block if it's valid
+//! 3. **M-Notarization** (2F+1 votes): Once 2F+1 votes are collected, an M-notarization is created,
+//!    allowing view progression (but not finalization)
+//! 4. **L-Notarization** (N-F votes): Once N-F votes are collected, an L-notarization is created,
+//!    finalizing the block permanently
+//! 5. **Nullification**: If a view times out or Byzantine behavior is detected (>2F conflicting
+//!    messages), replicas create nullify messages. When 2F+1 nullifications are collected, the view
+//!    is nullified and progression occurs using `SelectParent`
+//! 6. **View Progression**: After M-notarization or nullification, replicas move to the next view
+//!    and the new leader proposes
+//!
+//! ### Byzantine Fault Tolerance
+//!
+//! The protocol tolerates up to F Byzantine (arbitrarily malicious) replicas out of N total,
+//! where N ≥ 5F+1. Byzantine behavior includes:
+//! - Leaders proposing multiple conflicting blocks
+//! - Replicas casting multiple votes
+//! - Invalid signatures or messages
+//! - Timeouts
+//!
+//! When >2F conflicting messages are detected, honest replicas nullify the view to make progress.
+//!
+//! ## Event-Driven Design
+//!
+//! The state machine doesn't directly implement consensus logic. Instead, it:
+//! 1. Calls `ViewProgressManager` methods (e.g., `process_consensus_msg`, `tick`)
+//! 2. Receives a [`ViewProgressEvent`] indicating what action to take
+//! 3. Executes the action (propose, vote, broadcast, etc.)
+//! 4. Returns to polling
+//!
+//! This separation keeps the state machine thin and delegates complex protocol logic to
+//! `ViewProgressManager`, `ViewChain`, and `ViewContext`.
+//!
+//! ## Supported Events
+//!
+//! The state machine handles these [`ViewProgressEvent`] variants:
+//!
+//! - **`NoOp`**: No action needed
+//! - **`Await`**: Waiting for more messages
+//! - **`ShouldProposeBlock`**: Leader should propose a block for the current view
+//! - **`ShouldVote`**: Replica should vote for a valid block
+//! - **`ShouldMNotarize`**: Create and broadcast M-notarization (2F+1 votes collected)
+//! - **`ShouldFinalize`**: Finalize a block (N-F votes collected)
+//! - **`ShouldNullify`**: Create and broadcast nullify message (timeout or Byzantine)
+//! - **`ShouldBroadcastNullification`**: Forward an aggregated nullification (2F+1 nullifies)
+//! - **`ShouldVoteAndMNotarize`**: Vote crosses M-notarization threshold
+//! - **`ShouldVoteAndFinalize`**: Vote crosses L-notarization threshold
+//! - **`ProgressToNextView`**: Progress to next view after M-notarization
+//! - **`ShouldVoteAndProgressToNextView`**: Vote, M-notarize, and progress atomically
+//! - **`ProgressToNextViewOnNullification`**: Progress after nullification (2F+1 nullifies)
+//! - **`ShouldUpdateView`**: Replica is behind and needs to catch up
+//! - **`BroadcastConsensusMessage`**: Forward a message to all replicas
+//!
+//! ## Performance Characteristics
+//!
+//! - **Lock-Free Communication**: Uses [`rtrb`](https://docs.rs/rtrb) ring buffers for
+//!   zero-allocation, wait-free message passing between threads
+//! - **Non-Blocking Polls**: The event loop uses non-blocking `pop()` calls and spin hints to
+//!   minimize latency while avoiding busy-waiting
+//! - **Batching**: Processes all available messages before yielding, maximizing throughput
+//! - **Retry Logic**: Broadcasts retry up to 10 times if the ring buffer is full, with 1ms backoff
+//!   between attempts
+//! - **Configurable Tick Interval**: Default 10ms tick interval balances timeout detection with CPU
+//!   usage
+//!
+//! ## Security Considerations
+//!
+//! - **Secret Key Handling**: The `secret_key` field (`BlsSecretKey`) contains sensitive
+//!   cryptographic material. Its inner field (`Fr` from `ark-ff`) implements `Zeroize`, ensuring
+//!   memory is cleared on drop
+//! - **Signature Operations**: All blocks, votes, and nullifications are signed with BLS
+//!   signatures, ensuring authenticity and non-repudiation
+//! - **Validation**: The `ViewProgressManager` validates all incoming messages (signatures, view
+//!   numbers, block hashes) before processing
+//!
+//! ## Usage
+//!
+//! The state machine is typically created by [`ConsensusEngine`] and should not be
+//! instantiated directly in production code. For testing, use [`ConsensusStateMachineBuilder`]:
+//!
+//!rust,ignore
+//! use consensus::consensus_manager::state_machine::ConsensusStateMachineBuilder;
+//! use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
+//!
+//! # fn example() -> anyhow::Result<()> {
+//!     let mut state_machine = ConsensusStateMachineBuilder::<6, 1, 3>::new()
+//!         .with_view_manager(view_manager)
+//!         .with_secret_key(secret_key)
+//!         .with_message_consumer(message_consumer)
+//!         .with_broadcast_producer(broadcast_producer)
+//!         .with_transaction_consumer(transaction_consumer)
+//!         .with_tick_interval(Duration::from_millis(10))
+//!         .with_shutdown_signal(Arc::new(AtomicBool::new(false)))
+//!         .with_logger(logger)
+//!         .build()?;
+//!
+//!     // Run the state machine (blocks until shutdown)
+//!     state_machine.run()?;
+//!     Ok(())
+//! # }
+//! //!
+//! ## Thread Safety
+//!
+//! The state machine is **not** thread-safe and should only be accessed from the thread
+//! that runs it. Communication with other threads occurs exclusively through the ring
+//! buffers (`message_consumer`, `broadcast_producer`, `transaction_consumer`), which
+//! are lock-free and thread-safe.
+//!
+//! ## Relation to Minimmit Paper
+//!
+//! This implementation follows "Minimmit: A Minimal Byzantine Fault Tolerant Consensus
+//! Protocol" with the following key correspondences:
+//!
+//! - **Algorithm 1 (Minimmit Processor)**: The `run()` event loop and `handle_event()` method
+//!   implement the main processor logic
+//! - **M-Notarization (2F+1)**: Handled in `create_and_broadcast_m_notarization()`
+//! - **L-Notarization (N-F)**: Handled in `finalize_view()`
+//! - **Nullification**: Handled in `nullify_view()`, with distinction between timeout and
+//!   Byzantine-triggered nullifications
+//! - **SelectParent**: Implemented in `ViewChain::select_parent()`, called by `ViewProgressManager`
+//!   when progressing on nullification
+//! - **Automatic Forwarding**: M-notarizations and nullifications are broadcast exactly once when
+//!   first created, as per Algorithm 1 lines 2-3
+
 use std::{
     sync::{
         Arc,
@@ -82,8 +288,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         let mut last_tick = Instant::now();
 
         while !self.shutdown_signal.load(Ordering::Relaxed) {
+            let mut did_work = false;
+
             // Process all available consensus messages from the network
             while let Ok(message) = self.message_consumer.pop() {
+                did_work = true;
                 if let Err(e) = self.handle_consensus_message(message) {
                     slog::error!(self.logger, "Error handling consensus message: {}", e);
                 }
@@ -91,11 +300,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
             // Process all available transactions from the application
             while let Ok(transaction) = self.transaction_consumer.pop() {
+                did_work = true;
                 self.view_manager.add_transaction(transaction);
             }
 
             // Periodic tick
             if last_tick.elapsed() >= self.tick_interval {
+                did_work = true;
                 if let Err(e) = self.view_manager.tick() {
                     slog::error!(self.logger, "Error ticking view manager: {}", e);
                 }
@@ -103,7 +314,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             }
 
             // Spin loop to prevent busy waiting
-            std::hint::spin_loop();
+            if !did_work {
+                std::thread::sleep(Duration::from_micros(500));
+            }
         }
 
         slog::info!(

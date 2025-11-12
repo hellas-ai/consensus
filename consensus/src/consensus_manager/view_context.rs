@@ -1,3 +1,271 @@
+//! View Context - Single-View State Management for Minimmit Consensus
+//!
+//! This module implements the [`ViewContext`], which encapsulates all consensus-related state
+//! for a single view in the Minimmit Byzantine Fault Tolerant (BFT) consensus protocol. Each
+//! view represents one round of consensus with a designated leader who proposes a block, and
+//! replicas vote on the proposal or send nullify messages if consensus cannot be reached.
+//!
+//! ## Overview
+//!
+//! In the Minimmit protocol, consensus progresses through numbered **views**. Each view has:
+//! - A **leader** (determined by a leader selection strategy, typically round-robin)
+//! - A **block proposal** from the leader
+//! - **Votes** from replicas (including the leader's implicit vote)
+//! - **M-notarization** (2F+1 votes) allowing view progression
+//! - **L-notarization** (N-F votes) finalizing the block permanently
+//! - **Nullification** (2F+1 nullify messages) for timeouts or Byzantine behavior
+//!
+//! The `ViewContext` manages all this state and provides methods to:
+//! - Add and validate block proposals, votes, and nullifications
+//! - Detect when thresholds are reached (M-notarization, L-notarization, nullification)
+//! - Track Byzantine behavior (conflicting votes, multiple proposals)
+//! - Manage non-verified messages that arrive before the block proposal
+//! - Determine when the replica should vote, nullify, or progress views
+//!
+//! ## Architecture
+//!
+//!
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │                      ViewContext                                 │
+//! │                   (State for View V)                             │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Block Proposal State                                  │    │
+//! │  │  - block: Option<Block>                                │    │
+//! │  │  - block_hash: Option<[u8; 32]>                        │    │
+//! │  │  - pending_block: Option<Block> (awaiting parent)      │    │
+//! │  └────────────────────────────────────────────────────────┘    │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Vote Tracking                                         │    │
+//! │  │  - votes: HashSet<Vote> (verified, matching block)     │    │
+//! │  │  - non_verified_votes: HashSet<Vote> (no block yet)    │    │
+//! │  │  - num_invalid_votes: usize (conflicting votes)        │    │
+//! │  └────────────────────────────────────────────────────────┘    │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Notarization State                                    │    │
+//! │  │  - m_notarization: Option<MNotarization> (>2F votes)   │    │
+//! │  │  - (L-notarization created by ViewProgressManager)     │    │
+//! │  └────────────────────────────────────────────────────────┘    │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Nullification State                                   │    │
+//! │  │  - nullify_messages: HashSet<Nullify>                  │    │
+//! │  │  - nullification: Option<Nullification> (>2F nullifies)│    │
+//! │  └────────────────────────────────────────────────────────┘    │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Replica Participation Status                          │    │
+//! │  │  - has_voted: bool                                     │    │
+//! │  │  - has_nullified: bool                                 │    │
+//! │  │  - has_proposed: bool (if leader)                      │    │
+//! │  │  - entered_at: Instant (for timeout detection)         │    │
+//! │  └────────────────────────────────────────────────────────┘    │
+//! └──────────────────────────────────────────────────────────────────┘
+//! //!
+//! ## State Transitions
+//!
+//! A typical view progresses through these states:
+//!
+//!
+//! 1. VIEW_START ↓
+//! 2. BLOCK_PROPOSED (leader proposes, gets implicit vote) ↓
+//! 3. VOTING (replicas cast votes) ↓
+//! 4. M_NOTARIZATION (>2F votes collected) ↓
+//! 5. L_NOTARIZATION (≥N-F votes collected, block finalized) ↓
+//! 6. VIEW_END (progress to next view)
+//! //!
+//! Alternatively, if consensus fails:
+//!
+//!
+//! 1. VIEW_START ↓
+//! 2. TIMEOUT or BYZANTINE_DETECTED ↓
+//! 3. NULLIFY_MESSAGES (replicas send nullifications) ↓
+//! 4. NULLIFICATION (>2F nullify messages collected) ↓
+//! 5. VIEW_END (progress to next view without finalizing block)
+//! //!
+//! ## Key Concepts
+//!
+//! ### Leader's Implicit Vote
+//!
+//! Per the Minimmit protocol, when a leader proposes a block, they implicitly vote for it.
+//! This implicit vote is automatically added to the vote set when `add_new_view_block` is called,
+//! using the leader's block signature as the vote signature.
+//!
+//! ### Non-Verified Messages
+//!
+//! Due to network asynchrony, votes or M-notarizations may arrive before the block proposal.
+//! These are stored in `non_verified_votes` or as a non-verified `m_notarization` until the
+//! block arrives. Once the block is received, messages are verified:
+//! - Matching votes are moved to the verified `votes` set
+//! - Non-matching votes are counted as `num_invalid_votes`
+//!
+//! ### Byzantine Behavior Detection
+//!
+//! The `ViewContext` tracks several types of Byzantine behavior:
+//!
+//! 1. **Invalid Votes**: Votes for a different block hash than the leader proposed
+//! 2. **Conflicting M-notarizations**: Multiple M-notarizations with different block hashes
+//! 3. **Nullify Messages**: Explicit statements that a replica detected problems
+//!
+//! When >2F conflicting messages are detected (invalid votes + nullify messages), the
+//! `should_nullify` flag is set, indicating the replica should create a nullification.
+//!
+//! ### Nullification Types
+//!
+//! There are two distinct types of nullification:
+//!
+//! 1. **Timeout Nullification** (`create_nullify_for_timeout`):
+//!    - Occurs when a replica times out waiting for a block proposal
+//!    - Can ONLY be called BEFORE voting
+//!    - Indicates network delay or inactive leader, not necessarily Byzantine behavior
+//!
+//! 2. **Byzantine Nullification** (`create_nullify_for_byzantine`):
+//!    - Occurs when >2F conflicting messages are detected
+//!    - Can be called BEFORE or AFTER voting
+//!    - Indicates definite Byzantine behavior in the system
+//!
+//! ## Thresholds
+//!
+//! For N replicas with F Byzantine faults (N ≥ 3F+1):
+//!
+//! - **M-notarization**: Requires >2F votes (e.g., 3 votes when N=6, F=1)
+//!   - Allows view progression but does NOT finalize the block
+//! - **L-notarization**: Requires ≥N-F votes (e.g., 5 votes when N=6, F=1)
+//!   - Finalizes the block permanently (cannot be reverted)
+//! - **Nullification**: Requires >2F nullify messages
+//!   - Allows view progression without finalizing any block
+//! - **Byzantine Detection**: Triggered by >2F conflicting messages
+//!   - Prompts honest replicas to nullify the view
+//!
+//! ## Validation Rules
+//!
+//! The `ViewContext` enforces strict validation:
+//!
+//! - **View Number**: All messages must match the context's view number
+//! - **Leader ID**: All messages must reference the correct leader
+//! - **Peer Membership**: All signers must be in the `PeerSet`
+//! - **Signatures**: All BLS signatures must be valid
+//! - **No Duplicates**: At most one vote/nullify per peer per view
+//! - **Minimmit Invariants**:
+//!   - Cannot vote after nullifying
+//!   - Cannot timeout-nullify after voting (but can Byzantine-nullify)
+//!   - Only one block per view
+//!
+//! ## Result Types
+//!
+//! Methods return specialized result types indicating what action the replica should take:
+//!
+//! - [`LeaderProposalResult`]: After adding a block proposal
+//!   - `should_vote`: Replica should vote for the block
+//!   - `is_enough_to_m_notarize`: M-notarization threshold reached
+//!   - `is_enough_to_finalize`: L-notarization threshold reached
+//!   - `should_nullify`: Byzantine behavior detected
+//!
+//! - [`CollectedVotesResult`]: After adding a vote
+//!   - `should_await`: Wait for block proposal
+//!   - `is_enough_to_m_notarize`: M-notarization threshold reached
+//!   - `is_enough_to_finalize`: L-notarization threshold reached
+//!   - `should_nullify`: Byzantine behavior detected
+//!   - `should_vote`: Replica should vote (for non-verified scenario)
+//!
+//! - [`ShouldMNotarize`]: After adding an M-notarization
+//!   - `should_notarize`: Should create/broadcast M-notarization
+//!   - `should_vote`: Should vote for the M-notarization's block
+//!   - `should_nullify`: Conflicting M-notarization detected
+//!   - `should_forward`: Should forward M-notarization to other replicas (exactly once)
+//!
+//! - [`CollectedNullificationsResult`]: After adding a nullification
+//!   - `should_broadcast_nullification`: Should broadcast to other replicas (exactly once)
+//!
+//! ## Usage Example
+//!
+//!,no_run
+//! use consensus::consensus_manager::view_context::ViewContext;
+//! use consensus::state::peer::PeerSet;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! // Create context for view 5 with leader 0
+//! let view_number = 5;
+//! let leader_id = 0;
+//! let replica_id = 1; // This replica's ID
+//! let parent_hash = [0u8; 32];
+//! let mut context = ViewContext::<6, 1, 3>::new(
+//!     view_number,
+//!     leader_id,
+//!     replica_id,
+//!     parent_hash,
+//! );
+//!
+//! // Leader proposes a block
+//! let result = context.add_new_view_block(block, &peers)?;
+//! if result.should_vote {
+//!     // Replica should vote for this block
+//!     let vote = create_vote(block.get_hash());
+//!     context.add_own_vote(vote_signature)?;
+//! }
+//!
+//! // Receive votes from other replicas
+//! let vote_result = context.add_vote(incoming_vote, &peers)?;
+//! if vote_result.is_enough_to_m_notarize {
+//!     // M-notarization threshold reached - can progress view
+//!     let m_not = context.m_notarization.as_ref().unwrap();
+//!     broadcast_m_notarization(m_not);
+//! }
+//! if vote_result.should_nullify {
+//!     // Byzantine behavior detected - create nullification
+//!     let nullify = context.create_nullify_for_byzantine(&secret_key)?;
+//!     broadcast_nullify(nullify);
+//! }
+//!
+//! // Check for timeout
+//! if context.should_timeout_nullify(timeout_duration) {
+//!     let nullify = context.create_nullify_for_timeout(&secret_key)?;
+//!     broadcast_nullify(nullify);
+//! }
+//! # Ok(())
+//! # }
+//! //!
+//! ## Minimmit Paper Correspondence
+//!
+//! This implementation follows the Minimmit research paper:
+//!
+//! - **Algorithm 1, Lines 4-8**: Block proposal and leader implicit vote → `add_new_view_block`
+//! - **Algorithm 1, Lines 9-10**: Voting logic → `add_vote`, `add_own_vote`
+//! - **Algorithm 1, Lines 11-14**: M-notarization creation → automatic in `add_vote`
+//! - **Algorithm 1, Lines 15-17**: L-notarization → detected via `is_enough_to_finalize`
+//! - **Algorithm 1, Lines 18-20**: Timeout nullification → `create_nullify_for_timeout`
+//! - **Algorithm 1, Lines 21-25**: Byzantine nullification → `create_nullify_for_byzantine`
+//! - **Algorithm 1, Lines 26-28**: Nullification aggregation → `add_nullify`, automatic creation
+//! - **Section 3 (Validity)**: Signature verification enforced in all `add_*` methods
+//! - **Section 4 (Safety)**: Vote-once, nullify-once enforced via state flags
+//!
+//! ## Thread Safety
+//!
+//! `ViewContext` is **not** thread-safe and should only be accessed from the consensus state
+//! machine thread. It is typically owned by a [`ViewChain`](super::view_chain::ViewChain) which
+//! manages multiple view contexts.
+//!
+//! ## Performance Considerations
+//!
+//! - **Vote Storage**: Uses `HashSet` for O(1) duplicate detection
+//! - **Signature Verification**: BLS signatures are verified on every message add
+//! - **M-notarization Creation**: Automatically created when threshold is reached, uses BLS
+//!   signature aggregation (constant size regardless of vote count)
+//! - **Memory**: Each view context stores all votes, nullify messages, and the block
+//!
+//! ## Testing
+//!
+//! The module includes comprehensive unit tests covering:
+//! - Normal voting flows (M-notarization, L-notarization)
+//! - Byzantine scenarios (conflicting votes, multiple blocks)
+//! - Timeout handling
+//! - Non-verified message handling
+//! - Nullification flows (both timeout and Byzantine)
+//! - Edge cases (duplicate messages, wrong view numbers, invalid signatures)
+//! - Integration scenarios (concurrent M-notarization and nullification, message ordering)
+
 use std::{
     collections::HashSet,
     time::{Duration, Instant},

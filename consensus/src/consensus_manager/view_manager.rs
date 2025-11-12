@@ -1,3 +1,347 @@
+//! View Progress Manager - Orchestrator for Minimmit Consensus Protocol
+//!
+//! This module implements the [`ViewProgressManager`], which serves as the central orchestrator
+//! for the Minimmit Byzantine Fault Tolerant (BFT) consensus protocol. It coordinates view
+//! progression, message processing, timeout detection, and interaction between multiple
+//! non-finalized views to maintain protocol correctness and liveness.
+//!
+//! ## Overview
+//!
+//! The `ViewProgressManager` is the "brain" of the consensus system. It:
+//! - Receives incoming consensus messages from the network (via [`ConsensusStateMachine`])
+//! - Routes messages to the appropriate [`ViewContext`] in the [`ViewChain`]
+//! - Detects when thresholds are reached (M-notarization, L-notarization, nullification)
+//! - Determines what actions the replica should take (vote, nullify, progress view)
+//! - Returns [`ViewProgressEvent`]s instructing the state machine how to proceed
+//! - Manages view timeouts and triggers nullification when needed
+//! - Handles pending blocks that arrive before their parent is M-notarized
+//! - Persists non-finalized views to durable storage
+//!
+//! ## Architecture
+//!
+//!
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │                   ConsensusStateMachine                        │
+//! │                   (runs in dedicated thread)                   │
+//! └─────────────────────────┬──────────────────────────────────────┘
+//!                           │
+//!                           │ process_consensus_msg(msg)
+//!                           │ tick()
+//!                           │
+//!                           ▼
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │               ViewProgressManager                              │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  Message Routing                                     │    │
+//! │  │  - handle_block_proposal()                           │    │
+//! │  │  - handle_vote()                                     │    │
+//! │  │  - handle_nullify()                                  │    │
+//! │  │  - handle_m_notarization()                           │    │
+//! │  │  - handle_nullification()                            │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  View Chain Management                               │    │
+//! │  │  - Current view tracking                             │    │
+//! │  │  - Non-finalized views storage                       │    │
+//! │  │  - View progression logic                            │    │
+//! │  │  - Parent selection (SelectParent)                   │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  Timeout & Nullification                             │    │
+//! │  │  - Periodic tick() calls                             │    │
+//! │  │  - Timeout detection per view                        │    │
+//! │  │  - Byzantine behavior detection                      │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  Pending Block Management                            │    │
+//! │  │  - Store blocks awaiting parent M-notarization      │    │
+//! │  │  - Process cascade when parent is M-notarized       │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  Transaction Pool                                    │    │
+//! │  │  - Collect transactions from clients                 │    │
+//! │  │  - Provide to leader for block proposal             │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────┐    │
+//! │  │  Persistence                                         │    │
+//! │  │  - Store non-finalized views to disk                │    │
+//! │  │  - Recover after crash/restart                       │    │
+//! │  └──────────────────────────────────────────────────────┘    │
+//! └────────────────────────────────────────────────────────────────┘
+//!                           │
+//!                           │ returns ViewProgressEvent
+//!                           │
+//!                           ▼
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │             ConsensusStateMachine                              │
+//! │  (executes actions: propose, vote, broadcast, etc.)           │
+//! └────────────────────────────────────────────────────────────────┘
+//! //!
+//! ## Core Responsibilities
+//!
+//! ### 1. Message Processing
+//!
+//! The manager receives all consensus messages and routes them appropriately:
+//!
+//! - **Block Proposals**: Validates leader, view number, parent hash, and signature
+//! - **Votes**: Aggregates votes and detects M-notarization/L-notarization thresholds
+//! - **Nullify Messages**: Tracks nullifications and detects nullification threshold
+//! - **M-notarizations**: Validates and triggers view progression
+//! - **Nullifications**: Validates and triggers view progression
+//!
+//! Each message is routed to the correct view in the `ViewChain`. Messages for past views
+//! are processed if the view is still non-finalized. Messages for future views trigger
+//! a "catch-up" signal.
+//!
+//! ### 2. View Progression
+//!
+//! View progression can occur in two ways:
+//!
+//! **Via M-notarization (normal path)**:
+//!
+//! 1. Leader proposes block for view V
+//! 2. Replicas vote (need >2F votes)
+//! 3. M-notarization created automatically
+//! 4. View progresses to V+1 with M-notarized block as parent
+//! 5. New leader proposes for V+1
+//! //!
+//! **Via Nullification (failure path)**:
+//!
+//! 1. View V times out or Byzantine behavior detected
+//! 2. Replicas send nullify messages (need >2F)
+//! 3. Nullification created automatically
+//! 4. View progresses to V+1 using SelectParent to find parent
+//! 5. New leader proposes for V+1
+//! //!
+//! The manager ensures that views only progress when proper thresholds are met and that
+//! the Minimmit protocol invariants are maintained.
+//!
+//! ### 3. Timeout Detection
+//!
+//! The `tick()` method is called periodically (typically every 10ms) to:
+//! - Check if the current view has timed out
+//! - Trigger nullification for timed-out views (if not voted/nullified)
+//! - Check if M-notarization or L-notarization thresholds are reached
+//! - Process pending blocks after parent M-notarization
+//!
+//! Timeout behavior follows Minimmit Algorithm 1, line 18:
+//! - **Before voting**: Timeout triggers nullification (timeout nullify)
+//! - **After voting**: Timeout does nothing (only Byzantine evidence triggers nullify)
+//!
+//! ### 4. Pending Block Management
+//!
+//! Blocks can arrive before their parent is M-notarized. The manager:
+//! - Stores such blocks as "pending" in the appropriate view's context
+//! - When a view is M-notarized, processes all pending child blocks
+//! - Validates that pending blocks have correct parent hashes
+//! - Ensures intermediate views (between parent and child) are nullified if skipped
+//!
+//! ### 5. Leader Selection
+//!
+//! The manager uses a pluggable `LeaderManager` (typically `RoundRobinLeaderManager`) to:
+//! - Determine the leader for each view
+//! - Validate that block proposals come from the correct leader
+//! - Ensure consistent leader selection across all replicas
+//!
+//! ### 6. SelectParent Algorithm
+//!
+//! When progressing via nullification, the manager uses the `SelectParent` algorithm
+//! (from Minimmit Section 3) to find the parent block:
+//! - Finds the greatest view V' < V that has an M-notarization
+//! - Uses that M-notarized block as the parent for the new view
+//! - Ensures safety even when views are skipped due to nullification
+//!
+//! ## Event-Driven Design
+//!
+//! The manager returns [`ViewProgressEvent`]s that instruct the state machine on what to do:
+//!
+//! ### Voting Events
+//! - `ShouldVote`: Replica should vote for a block
+//! - `ShouldVoteAndMNotarize`: Vote crosses M-notarization threshold
+//! - `ShouldVoteAndFinalize`: Vote crosses L-notarization threshold
+//! - `ShouldVoteAndProgressToNextView`: Vote, M-notarize, and progress atomically
+//!
+//! ### Notarization Events
+//! - `ShouldMNotarize`: Create and broadcast M-notarization
+//! - `ShouldFinalize`: Block has reached L-notarization (N-F votes)
+//!
+//! ### Nullification Events
+//! - `ShouldNullify`: Create and send nullify message
+//! - `ShouldBroadcastNullification`: Broadcast aggregated nullification (>2F nullifies)
+//!
+//! ### View Progression Events
+//! - `ProgressToNextView`: Progress after M-notarization
+//! - `ProgressToNextViewOnNullification`: Progress after nullification
+//! - `ShouldUpdateView`: Replica is behind, needs to catch up
+//!
+//! ### Proposal Events
+//! - `ShouldProposeBlock`: Leader should propose for current view
+//!
+//! ### Other Events
+//! - `NoOp`: No action needed
+//! - `Await`: Waiting for more messages
+//! - `BroadcastConsensusMessage`: Forward a message to all replicas
+//!
+//! ## Message Forwarding (Exactly Once)
+//!
+//! Per Minimmit Algorithm 1 (lines 2-3), the manager ensures M-notarizations and
+//! nullifications are broadcast exactly once when first created:
+//!
+//! - **M-notarizations**: `should_forward` flag set to `true` when first received
+//! - **Nullifications**: `should_broadcast_nullification` flag set to `true` when first received
+//! - **Duplicates**: Subsequent identical messages have flags set to `false`
+//!
+//! This prevents message amplification while ensuring all replicas receive critical messages.
+//!
+//! ## State Persistence
+//!
+//! The manager persists non-finalized views to durable storage (`ConsensusStore`):
+//! - When views are finalized, they're removed from non-finalized storage
+//! - On restart, the manager recovers from the last finalized state
+//! - The `shutdown()` method ensures all pending state is flushed
+//!
+//! ## Protocol Invariants Enforced
+//!
+//! The manager enforces key Minimmit protocol invariants:
+//!
+//! 1. **Vote Once**: Replicas vote at most once per view
+//! 2. **Nullify Once**: Replicas send at most one nullify message per view
+//! 3. **View Progression**: Views only progress with M-notarization or nullification (>2F)
+//! 4. **Leader Uniqueness**: Only the designated leader can propose blocks
+//! 5. **Parent Chaining**: Blocks must extend M-notarized parents (or SelectParent)
+//! 6. **No Voting After Nullification**: Cannot vote after sending nullify message
+//! 7. **Byzantine Detection**: >2F conflicting messages trigger nullification
+//! 8. **Finalization Irreversibility**: L-notarized blocks cannot be reverted
+//!
+//! ## Byzantine Fault Tolerance
+//!
+//! The manager detects and responds to Byzantine behavior:
+//!
+//! - **Conflicting Votes**: Multiple votes for different blocks from same replica
+//! - **Invalid Signatures**: Messages with invalid BLS signatures
+//! - **Wrong Leader**: Block proposals from non-leaders
+//! - **Conflicting M-notarizations**: Multiple M-notarizations with different block hashes
+//! - **Double Proposing**: Leader proposing multiple blocks for same view
+//!
+//! When >2F conflicting messages are detected, honest replicas nullify the view.
+//!
+//! ## Usage Example
+//!
+//!,no_run
+//! use consensus::consensus_manager::view_manager::ViewProgressManager;
+//! use consensus::consensus::ConsensusMessage;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! // Create manager (typically done by ConsensusEngine)
+//! let mut manager = ViewProgressManager::<6, 1, 3>::new(
+//!     config,
+//!     replica_id,
+//!     storage,
+//!     leader_manager,
+//! )?;
+//!
+//! // Process incoming messages from network
+//! let event = manager.process_consensus_msg(incoming_message)?;
+//! match event {
+//!     ViewProgressEvent::ShouldVote { view, block_hash } => {
+//!         // Create and broadcast vote
+//!         let vote = create_vote(view, block_hash);
+//!         broadcast(vote);
+//!         manager.mark_voted(view)?;
+//!     }
+//!     ViewProgressEvent::ShouldMNotarize { view, block_hash, should_forward } => {
+//!         // Get M-notarization and broadcast if new
+//!         if should_forward {
+//!             let m_not = manager.get_m_notarization(view)?;
+//!             broadcast(m_not);
+//!         }
+//!     }
+//!     ViewProgressEvent::ProgressToNextView { new_view, leader, .. } => {
+//!         // View progressed, check if we're the new leader
+//!         if leader == replica_id {
+//!             let txs = manager.take_pending_transactions();
+//!             let block = create_block(new_view, txs);
+//!             broadcast(block);
+//!             manager.mark_proposed(new_view)?;
+//!         }
+//!     }
+//!     // ... handle other events
+//! }
+//!
+//! // Periodic tick for timeout detection
+//! let event = manager.tick()?;
+//! match event {
+//!     ViewProgressEvent::ShouldNullify { view } => {
+//!         // Timeout occurred, create nullify message
+//!         let nullify = create_nullify(view);
+//!         broadcast(nullify);
+//!         manager.mark_nullified(view)?;
+//!     }
+//!     // ... handle other events
+//! }
+//!
+//! // Add client transactions
+//! manager.add_transaction(tx);
+//!
+//! // Graceful shutdown
+//! manager.shutdown()?;
+//! # Ok(())
+//! # }
+//! //!
+//! ## Interaction with Other Components
+//!
+//! ### ViewChain
+//! - Manages the chain of non-finalized views
+//! - Handles view context creation and retrieval
+//! - Implements SelectParent logic for nullification-based progression
+//!
+//! ### ViewContext
+//! - Manages state for a single view
+//! - Tracks votes, nullifications, and notarizations
+//! - Detects threshold crossings and Byzantine behavior
+//!
+//! ### ConsensusStateMachine
+//! - Calls `process_consensus_msg()` for each incoming message
+//! - Calls `tick()` periodically for timeout detection
+//! - Executes actions based on returned `ViewProgressEvent`s
+//!
+//! ### ConsensusStore
+//! - Persists non-finalized views to disk
+//! - Enables crash recovery
+//! - Stores peer set and configuration
+//!
+//! ## Thread Safety
+//!
+//! The `ViewProgressManager` is **not** thread-safe and should only be accessed from
+//! the consensus state machine thread. All external interaction occurs through message
+//! passing via the state machine.
+//!
+//! ## Performance Considerations
+//!
+//! - **Message Validation**: All signatures are verified synchronously
+//! - **View Context Lookup**: O(1) for current view, O(n) for past non-finalized views
+//! - **Pending Block Processing**: Cascades can trigger multiple view transitions
+//! - **Persistence**: Non-finalized views are persisted on shutdown, not per-message
+//!
+//! ## Testing
+//!
+//! The module includes extensive unit tests covering:
+//! - Normal voting and notarization flows
+//! - Nullification scenarios (timeout and Byzantine)
+//! - View progression (M-notarization and nullification)
+//! - Pending block handling and cascades
+//! - Message forwarding (exactly once semantics)
+//! - SelectParent logic with multiple nullified views
+//! - Timeout detection and prioritization
+//! - Byzantine behavior detection
+//! - Edge cases (duplicates, wrong leaders, invalid signatures)
+
 use std::str::FromStr;
 
 use anyhow::Result;

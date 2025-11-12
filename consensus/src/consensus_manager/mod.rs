@@ -1,4 +1,5 @@
 pub mod config;
+pub mod consensus_engine;
 pub mod events;
 pub mod leader_manager;
 pub mod state_machine;
