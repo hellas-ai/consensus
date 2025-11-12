@@ -606,3 +606,310 @@ fn compute_block_hash(
     hasher.update(&view.to_le_bytes());
     hasher.finalize().into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        consensus::ConsensusMessage,
+        consensus_manager::{
+            config::{ConsensusConfig, Network},
+            leader_manager::{LeaderSelectionStrategy, RoundRobinLeaderManager},
+            view_manager::ViewProgressManager,
+        },
+        crypto::aggregated::BlsSecretKey,
+        state::{peer::PeerSet, transaction::Transaction},
+        storage::store::ConsensusStore,
+    };
+    use ark_serialize::CanonicalSerialize;
+    use rand::thread_rng;
+    use rtrb::RingBuffer;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use tempfile::tempdir;
+
+    // Test constants matching Minimmit assumptions: n >= 5f + 1
+    const N: usize = 6; // 6 processors
+    const F: usize = 1; // 1 Byzantine fault
+    const M_SIZE: usize = 3; // M-notarization threshold: 2f + 1 = 3
+
+    struct TestSetup {
+        state_machines: Vec<ConsensusStateMachine<N, F, M_SIZE>>,
+        peer_set: PeerSet,
+        broadcast_consumers: Vec<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
+        shutdown_signals: Vec<Arc<AtomicBool>>,
+    }
+
+    fn create_test_peer_setup(
+        size: usize,
+    ) -> (
+        PeerSet,
+        HashMap<crate::crypto::aggregated::PeerId, BlsSecretKey>,
+    ) {
+        let mut rng = thread_rng();
+        let mut public_keys = vec![];
+        let mut peer_id_to_secret_key = HashMap::new();
+
+        for _ in 0..size {
+            let sk = BlsSecretKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let peer_id = pk.to_peer_id();
+            peer_id_to_secret_key.insert(peer_id, sk);
+            public_keys.push(pk);
+        }
+
+        (PeerSet::new(public_keys), peer_id_to_secret_key)
+    }
+
+    fn create_test_transaction(nonce: u64) -> Transaction {
+        let mut rng = thread_rng();
+        let sk = BlsSecretKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let mut tx_data = Vec::new();
+        tx_data.extend_from_slice(&nonce.to_le_bytes());
+        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(&tx_data).into();
+        let sig = sk.sign(&tx_hash);
+        Transaction::new(pk, [7u8; 32], 42, nonce, 1_000, 3, tx_hash, sig)
+    }
+
+    fn create_test_config(n: usize, f: usize, peer_strs: Vec<String>) -> ConsensusConfig {
+        ConsensusConfig {
+            n,
+            f,
+            view_timeout: Duration::from_secs(10),
+            leader_manager: LeaderSelectionStrategy::RoundRobin,
+            network: Network::Local,
+            peers: peer_strs,
+        }
+    }
+
+    fn create_test_setup() -> TestSetup {
+        let (peer_set, peer_id_to_secret_key) = create_test_peer_setup(N);
+        let secret_keys: Vec<_> = peer_set
+            .sorted_peer_ids
+            .iter()
+            .map(|id| peer_id_to_secret_key.get(id).unwrap().clone())
+            .collect();
+
+        let mut state_machines = Vec::with_capacity(N);
+        let mut message_producers = Vec::with_capacity(N);
+        let mut broadcast_consumers = Vec::with_capacity(N);
+        let mut tx_producers = Vec::with_capacity(N);
+        let mut shutdown_signals = Vec::with_capacity(N);
+        let mut temp_dirs = Vec::with_capacity(N);
+
+        for (i, sk) in secret_keys.iter().enumerate() {
+            let replica_id = peer_set.sorted_peer_ids[i];
+
+            // Create message channel (for incoming consensus messages)
+            let (msg_prod, msg_cons) = RingBuffer::new(1000);
+            message_producers.push(msg_prod);
+
+            // Create broadcast channel (for outgoing consensus messages)
+            let (bc_prod, bc_cons) = RingBuffer::new(1000);
+            broadcast_consumers.push(bc_cons);
+
+            // Create transaction channel
+            let (tx_prod, tx_cons) = RingBuffer::new(1000);
+            tx_producers.push(tx_prod);
+
+            // Create shutdown signal
+            let shutdown = Arc::new(AtomicBool::new(false));
+            shutdown_signals.push(shutdown.clone());
+
+            // Create config
+            let mut peer_strs = Vec::with_capacity(peer_set.sorted_peer_ids.len());
+            for peer_id in &peer_set.sorted_peer_ids {
+                let pk = peer_set.id_to_public_key.get(peer_id).unwrap();
+                let mut buf = Vec::new();
+                pk.0.serialize_compressed(&mut buf).unwrap();
+                let peer_str = hex::encode(buf);
+                peer_strs.push(peer_str);
+            }
+            let config = create_test_config(N, F, peer_strs);
+
+            // Create leader manager
+            let leader_manager = Box::new(RoundRobinLeaderManager::new(
+                N,
+                peer_set.sorted_peer_ids.clone(),
+            ));
+
+            // Create persistence storage
+            let temp_dir = tempdir().unwrap();
+            let path = temp_dir.path().join(format!("state_machine_{}", i));
+            let storage = ConsensusStore::open(&path).unwrap();
+            temp_dirs.push(temp_dir);
+
+            // Create view manager
+            let view_manager =
+                ViewProgressManager::new(config, replica_id, storage, leader_manager).unwrap();
+
+            // Create logger
+            let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+            // Create state machine
+            let state_machine = ConsensusStateMachine::new(
+                view_manager,
+                sk.clone(),
+                msg_cons,
+                bc_prod,
+                tx_cons,
+                Duration::from_millis(100),
+                shutdown,
+                logger,
+            )
+            .unwrap();
+
+            state_machines.push(state_machine);
+        }
+
+        TestSetup {
+            state_machines,
+            peer_set,
+            broadcast_consumers,
+            shutdown_signals,
+        }
+    }
+
+    #[test]
+    fn test_minimmit_protocol_invariants() {
+        // Test that key Minimmit invariants hold:
+        // 1. M-notarization requires 2f+1 = 3 votes (with N=6, F=1)
+        // 2. L-notarization requires n-f = 5 votes
+        // 3. Nullification requires 2f+1 = 3 nullify messages
+        assert_eq!(2 * F + 1, M_SIZE);
+        assert_eq!(N - F, 5);
+    }
+
+    #[test]
+    fn test_block_hash_computation_is_consistent() {
+        let parent_hash = [0u8; blake3::OUT_LEN];
+        let txs = vec![create_test_transaction(1), create_test_transaction(2)];
+        let timestamp = 1234567890;
+        let view = 1;
+
+        let hash1 = compute_block_hash(parent_hash, &txs, timestamp, view);
+        let hash2 = compute_block_hash(parent_hash, &txs, timestamp, view);
+
+        // Same inputs should produce same hash
+        assert_eq!(hash1, hash2);
+
+        // Different timestamp should produce different hash
+        let hash3 = compute_block_hash(parent_hash, &txs, timestamp + 1, view);
+        assert_ne!(hash1, hash3);
+
+        // Different view should produce different hash
+        let hash4 = compute_block_hash(parent_hash, &txs, timestamp, view + 1);
+        assert_ne!(hash1, hash4);
+    }
+
+    #[test]
+    fn test_state_machine_creation() {
+        // Test that we can create N state machines successfully
+        let setup = create_test_setup();
+        assert_eq!(setup.state_machines.len(), N);
+        assert_eq!(setup.broadcast_consumers.len(), N);
+        assert_eq!(setup.shutdown_signals.len(), N);
+        assert_eq!(setup.peer_set.sorted_peer_ids.len(), N);
+    }
+
+    #[test]
+    fn test_shutdown_stops_state_machine() {
+        let mut setup = create_test_setup();
+        let replica_idx = 0;
+
+        // Shutdown should succeed
+        let result = setup.state_machines[replica_idx].shutdown();
+        assert!(result.is_ok());
+
+        // Shutdown signal should be set
+        assert!(setup.shutdown_signals[replica_idx].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_no_op_event_does_nothing() {
+        let mut setup = create_test_setup();
+        let replica_idx = 0;
+
+        // NoOp event should succeed
+        let event = ViewProgressEvent::NoOp;
+        let result = setup.state_machines[replica_idx].handle_event(event);
+        assert!(result.is_ok());
+
+        // No messages should be broadcast
+        let broadcast = setup.broadcast_consumers[replica_idx].pop();
+        assert!(broadcast.is_err());
+    }
+
+    #[test]
+    fn test_await_event_does_nothing() {
+        let mut setup = create_test_setup();
+        let replica_idx = 0;
+
+        // Await event should succeed
+        let event = ViewProgressEvent::Await;
+        let result = setup.state_machines[replica_idx].handle_event(event);
+        assert!(result.is_ok());
+
+        // No messages should be broadcast
+        let broadcast = setup.broadcast_consumers[replica_idx].pop();
+        assert!(broadcast.is_err());
+    }
+
+    #[test]
+    fn test_transaction_creation_has_valid_signature() {
+        let tx = create_test_transaction(1);
+        // Transaction should have valid signature
+        assert!(tx.verify());
+
+        // Different nonces should produce different transactions
+        let tx2 = create_test_transaction(2);
+        assert_ne!(tx.tx_hash, tx2.tx_hash);
+    }
+
+    #[test]
+    fn test_peer_setup_creates_correct_number_of_peers() {
+        let (peer_set, peer_id_to_secret_key) = create_test_peer_setup(N);
+
+        assert_eq!(peer_set.sorted_peer_ids.len(), N);
+        assert_eq!(peer_id_to_secret_key.len(), N);
+
+        // All peer IDs should have corresponding secret keys
+        for peer_id in &peer_set.sorted_peer_ids {
+            assert!(peer_id_to_secret_key.contains_key(peer_id));
+        }
+    }
+
+    #[test]
+    fn test_consensus_config_creation() {
+        let peers = vec!["peer1".to_string(), "peer2".to_string()];
+        let config = create_test_config(N, F, peers.clone());
+
+        assert_eq!(config.n, N);
+        assert_eq!(config.f, F);
+        assert_eq!(config.peers, peers);
+        assert_eq!(config.view_timeout, Duration::from_secs(10));
+        assert!(matches!(config.network, Network::Local));
+        assert!(matches!(
+            config.leader_manager,
+            LeaderSelectionStrategy::RoundRobin
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_channels_are_independent() {
+        let mut setup = create_test_setup();
+
+        // Each state machine should have its own broadcast channel
+        // Verify we can access all of them
+        for i in 0..N {
+            assert!(setup.broadcast_consumers[i].pop().is_err()); // All empty initially
+        }
+    }
+}
