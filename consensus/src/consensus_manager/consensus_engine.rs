@@ -139,12 +139,6 @@ use crate::{
     storage::store::ConsensusStore,
 };
 
-/// Default capacity for internal ring buffers
-const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
-
-/// Default tick interval for the consensus state machine
-const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(10);
-
 /// [`ConsensusEngine`] is the high-level interface for running the Minimmit consensus protocol.
 ///
 /// It spawns a dedicated thread to run the consensus state machine and provides methods
@@ -176,6 +170,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
     /// # Returns
     /// A new `ConsensusEngine` instance that immediately starts running the consensus protocol
     /// in a dedicated thread.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ConsensusConfig,
         replica_id: PeerId,
@@ -363,6 +358,7 @@ mod tests {
     use crate::state::peer::PeerSet;
     use ark_serialize::CanonicalSerialize;
     use rand::thread_rng;
+    use rtrb::RingBuffer;
     use tempfile::tempdir;
 
     const N: usize = 6;
@@ -408,14 +404,33 @@ mod tests {
 
         // Create storage
         let temp_dir = tempdir().unwrap();
-        let storage = ConsensusStore::open(temp_dir.path()).unwrap();
+        let db_path = temp_dir.path().join("consensus.redb");
+        let storage = ConsensusStore::open(&db_path).unwrap();
 
         // Create logger
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
+        // Create message consumer
+        let (_message_producer, message_consumer) = RingBuffer::new(1000);
+        // Create broadcast producer
+        let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
+        // Create transaction consumer
+        let (_transaction_producer, transaction_consumer) = RingBuffer::new(1000);
+        // Create tick interval
+        let tick_interval = Duration::from_millis(10);
+
         // Create consensus engine
-        let engine =
-            ConsensusEngine::<N, F, M_SIZE>::new(config, replica_id, secret_key, storage, logger);
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            config,
+            replica_id,
+            secret_key,
+            storage,
+            message_consumer,
+            broadcast_producer,
+            transaction_consumer,
+            tick_interval,
+            logger,
+        );
 
         assert!(engine.is_ok());
         let engine = engine.unwrap();
@@ -452,12 +467,31 @@ mod tests {
         let config = create_test_config(peer_strs);
 
         let temp_dir = tempdir().unwrap();
-        let storage = ConsensusStore::open(temp_dir.path()).unwrap();
+        let db_path = temp_dir.path().join("consensus.redb");
+        let storage = ConsensusStore::open(&db_path).unwrap();
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let engine =
-            ConsensusEngine::<N, F, M_SIZE>::new(config, replica_id, secret_key, storage, logger)
-                .unwrap();
+        // Create message consumer
+        let (_message_producer, message_consumer) = RingBuffer::new(1000);
+        // Create broadcast producer
+        let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
+        // Create transaction consumer
+        let (_transaction_producer, transaction_consumer) = RingBuffer::new(1000);
+        // Create tick interval
+        let tick_interval = Duration::from_millis(10);
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            config,
+            replica_id,
+            secret_key,
+            storage,
+            message_consumer,
+            broadcast_producer,
+            transaction_consumer,
+            tick_interval,
+            logger,
+        )
+        .unwrap();
 
         assert!(engine.is_running());
 

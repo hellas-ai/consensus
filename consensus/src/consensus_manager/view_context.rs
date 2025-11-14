@@ -75,7 +75,7 @@
 //! 4. M_NOTARIZATION (>2F votes collected) ↓
 //! 5. L_NOTARIZATION (≥N-F votes collected, block finalized) ↓
 //! 6. VIEW_END (progress to next view)
-//! //!
+//!
 //! Alternatively, if consensus fails:
 //!
 //!
@@ -84,7 +84,7 @@
 //! 3. NULLIFY_MESSAGES (replicas send nullifications) ↓
 //! 4. NULLIFICATION (>2F nullify messages collected) ↓
 //! 5. VIEW_END (progress to next view without finalizing block)
-//! //!
+//!
 //! ## Key Concepts
 //!
 //! ### Leader's Implicit Vote

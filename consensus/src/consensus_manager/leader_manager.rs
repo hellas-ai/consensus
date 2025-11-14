@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// This is crucial for the safety of the consensus protocol, and to make sure
 /// that replicas are always able to agree on the leader for a view, given its past
 /// state.
-pub trait LeaderManager {
+pub trait LeaderManager: Send {
     /// Selects the leader for a given view.
     fn leader_for_view(&self, view: u64) -> Result<Leader>;
 }

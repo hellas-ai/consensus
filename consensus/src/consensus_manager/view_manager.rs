@@ -110,17 +110,17 @@
 //! 3. M-notarization created automatically
 //! 4. View progresses to V+1 with M-notarized block as parent
 //! 5. New leader proposes for V+1
-//! //!
-//! **Via Nullification (failure path)**:
+//!
+//!    **Via Nullification (failure path)**:
 //!
 //! 1. View V times out or Byzantine behavior detected
 //! 2. Replicas send nullify messages (need >2F)
 //! 3. Nullification created automatically
 //! 4. View progresses to V+1 using SelectParent to find parent
 //! 5. New leader proposes for V+1
-//! //!
-//! The manager ensures that views only progress when proper thresholds are met and that
-//! the Minimmit protocol invariants are maintained.
+//!
+//!    The manager ensures that views only progress when proper thresholds are met and that
+//!    the Minimmit protocol invariants are maintained.
 //!
 //! ### 3. Timeout Detection
 //!
