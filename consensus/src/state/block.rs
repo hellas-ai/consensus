@@ -78,20 +78,41 @@ impl Block {
     }
 
     /// Creates the genesis block for the consensus protocol.
-    pub fn genesis(genesis_block_signature: BlsSignature) -> Self {
+    pub fn genesis(leader: PeerId, genesis_block_signature: BlsSignature) -> Self {
         Self {
-            leader: 0,
+            leader,
             header: BlockHeader {
                 view: 0,
                 parent_block_hash: [0; blake3::OUT_LEN],
                 timestamp: 0,
             },
-            transactions: vec![],
             leader_signature: genesis_block_signature,
-            hash: None,
-            is_finalized: false,
+            transactions: vec![],
+            hash: Some(Self::genesis_hash()),
+            is_finalized: true,
             height: 0,
         }
+    }
+
+    /// Computes the deterministic genesis block hash.
+    ///
+    /// This hash is the same across all replicas since genesis has fixed parameters:
+    /// - parent_block_hash: [0; 32]
+    /// - transactions: []
+    /// - timestamp: 0
+    /// - view: 0
+    ///
+    /// All replicas sign this hash to create their genesis signatures.
+    ///
+    /// # Returns
+    /// The 32-byte blake3 hash of the genesis block
+    pub fn genesis_hash() -> [u8; blake3::OUT_LEN] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[0u8; blake3::OUT_LEN]); // parent_block_hash = [0; 32]
+        // No transactions to hash (empty vec)
+        hasher.update(&0u64.to_le_bytes()); // timestamp = 0
+        hasher.update(&0u64.to_le_bytes()); // view = 0
+        hasher.finalize().into()
     }
 
     /// Computes the hash of the block, as a concatenation of the hash of the parent block,

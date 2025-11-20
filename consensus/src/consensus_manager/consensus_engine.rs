@@ -55,7 +55,7 @@
 //!
 //! ## Usage Example
 //!
-//!rust,ignore
+//! ```rust,ignore
 //! use consensus::{
 //!     consensus_manager::{
 //!         consensus_engine::ConsensusEngine,
@@ -88,7 +88,7 @@
 //!     engine.shutdown_and_wait(Duration::from_secs(10))?;
 //!     Ok(())
 //! # }
-//! //!
+//! ```
 //! ## Thread Safety
 //!
 //! The `ConsensusEngine` is designed for single-threaded ownership in the main application

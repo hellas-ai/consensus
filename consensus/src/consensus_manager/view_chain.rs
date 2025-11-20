@@ -98,12 +98,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         initial_view: ViewContext<N, F, M_SIZE>,
         persistence_storage: ConsensusStore,
         view_timeout: Duration,
+        genesis_hash: [u8; blake3::OUT_LEN],
     ) -> Self {
+        let current_view = initial_view.view_number;
+        let mut non_finalized_views = HashMap::new();
+        non_finalized_views.insert(current_view, initial_view);
+
         Self {
-            current_view: initial_view.view_number,
-            non_finalized_views: HashMap::from([(initial_view.view_number, initial_view)]),
+            current_view,
+            non_finalized_views,
             persistence_storage,
-            previously_committed_block_hash: Default::default(),
+            previously_committed_block_hash: genesis_hash,
             _view_timeout: view_timeout,
         }
     }

@@ -359,7 +359,7 @@ use crate::{
             ShouldMNotarize, ViewContext,
         },
     },
-    crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId},
+    crypto::aggregated::{BlsPublicKey, BlsSecretKey, BlsSignature, PeerId},
     state::{
         block::Block,
         notarizations::{MNotarization, Vote},
@@ -417,7 +417,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         persistence_storage: ConsensusStore,
         leader_manager: Box<dyn LeaderManager>,
     ) -> Result<Self> {
-        let leader_id = leader_manager.leader_for_view(0)?.peer_id();
         let peers = PeerSet::new(
             config
                 .peers
@@ -425,8 +424,38 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .map(|p| BlsPublicKey::from_str(p).expect("Failed to parse BlsPublicKey"))
                 .collect(),
         );
-        let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
-        let view_chain = ViewChain::new(view_context, persistence_storage, config.view_timeout);
+
+        // Create Genesis block
+        let genesis_leader = leader_manager.leader_for_view(0)?.peer_id();
+        let genesis_block_hash = Block::genesis_hash();
+        let genesis_block = Block::genesis(
+            genesis_leader,
+            BlsSignature(ark_bls12_381::G1Affine::default()),
+        );
+        debug_assert_eq!(genesis_block.get_hash(), genesis_block_hash);
+
+        persistence_storage.put_finalized_block(&genesis_block)?;
+
+        let mut genesis_context: ViewContext<N, F, M_SIZE> =
+            ViewContext::new(0, genesis_leader, replica_id, [0; blake3::OUT_LEN]);
+        genesis_context.block = Some(genesis_block.clone());
+        genesis_context.block_hash = Some(genesis_block_hash);
+        genesis_context.has_voted = true;
+
+        // 3. Initialize ViewChain starting at View 1
+        // The parent of View 1 is the Genesis Hash.
+        let view1_leader = leader_manager.leader_for_view(1)?.peer_id();
+
+        // We create the context for View 1 directly
+        let view1_context = ViewContext::new(
+            1, // Start at View 1
+            view1_leader,
+            replica_id,
+            genesis_block_hash, // Parent is Genesis
+        );
+
+        let view_chain = ViewChain::new(view1_context, persistence_storage, config.view_timeout);
+
         Ok(Self {
             config,
             leader_manager,
@@ -483,6 +512,47 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             peers,
             pending_txs: Vec::new(),
         })
+    }
+
+    /// Returns true if the current view is genesis (view 0) and not yet voted
+    /// and not yet nullified.
+    pub fn should_vote_for_genesis(&self) -> bool {
+        let current_view = self.view_chain.current();
+        current_view.view_number == 0 && !current_view.has_voted && !current_view.has_nullified
+    }
+
+    /// Creates a genesis vote for this replica
+    pub fn create_genesis_vote(&mut self, secret_key: &BlsSecretKey) -> Result<Vote> {
+        let current_view = self.view_chain.current_view_mut();
+
+        if current_view.view_number != 0 {
+            return Err(anyhow::anyhow!("Can only create genesis vote at view 0"));
+        }
+
+        if current_view.has_voted {
+            return Err(anyhow::anyhow!("Already voted for genesis"));
+        }
+
+        let genesis_hash = current_view
+            .block_hash
+            .ok_or_else(|| anyhow::anyhow!("Genesis block not set"))?;
+
+        // Create the vote
+        let signature = secret_key.sign(&genesis_hash);
+
+        let vote = Vote::new(
+            0, // view 0
+            genesis_hash,
+            signature,
+            self.replica_id,
+            current_view.leader_id,
+        );
+
+        // Mark as voted and add our own vote
+        current_view.has_voted = true;
+        current_view.votes.insert(vote.clone());
+
+        Ok(vote)
     }
 
     /// Main driver of the state machine replication algorithm.

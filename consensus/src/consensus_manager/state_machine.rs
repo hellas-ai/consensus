@@ -160,7 +160,7 @@
 //! The state machine is typically created by [`ConsensusEngine`] and should not be
 //! instantiated directly in production code. For testing, use [`ConsensusStateMachineBuilder`]:
 //!
-//!rust,ignore
+//! ```rust,ignore
 //! use consensus::consensus_manager::state_machine::ConsensusStateMachineBuilder;
 //! use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
 //!
@@ -180,7 +180,7 @@
 //!     state_machine.run()?;
 //!     Ok(())
 //! # }
-//! //!
+//! ```
 //! ## Thread Safety
 //!
 //! The state machine is **not** thread-safe and should only be accessed from the thread
