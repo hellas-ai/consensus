@@ -810,13 +810,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
     /// Adds the current replica's vote for a block in a view.
     /// Should be called by the state machine after creating and broadcasting a vote.
-    pub fn add_own_vote(&mut self, view: u64, signature: BlsSignature) -> Result<()> {
+    pub fn add_own_vote(
+        &mut self,
+        view: u64,
+        block_hash: [u8; blake3::OUT_LEN],
+        signature: BlsSignature,
+    ) -> Result<()> {
         let view_ctx = self
             .view_chain
             .find_view_context_mut(view)
             .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
 
-        view_ctx.add_own_vote(signature)?;
+        view_ctx.add_own_vote(block_hash, signature)?;
         Ok(())
     }
 
@@ -1010,6 +1015,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if is_enough_to_finalize {
+            if vote_view_number == self.view_chain.current_view_number() {
+                return Ok(ViewProgressEvent::NoOp);
+            }
             return Ok(ViewProgressEvent::ShouldFinalize {
                 view: vote_view_number,
                 block_hash: vote_block_hash,
@@ -1124,6 +1132,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
             self.view_chain
                 .progress_with_m_notarization(new_view_context)?;
+
+            // Try to finalize the old view now that we have progressed
+            self.finalize_view(m_notarization_view_number)?;
 
             if should_vote {
                 return Ok(ViewProgressEvent::ShouldVoteAndProgressToNextView {
@@ -3620,7 +3631,7 @@ mod tests {
         let sk = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
         let signature = sk.sign(&block_hash);
 
-        let result = manager.add_own_vote(1, signature);
+        let result = manager.add_own_vote(1, block_hash, signature);
         assert!(result.is_ok());
 
         std::fs::remove_file(path).unwrap();
@@ -3789,7 +3800,7 @@ mod tests {
         let block_hash = [1u8; blake3::OUT_LEN];
         let signature = sk.sign(&block_hash);
 
-        let result = manager.add_own_vote(99, signature);
+        let result = manager.add_own_vote(99, block_hash, signature);
         assert!(result.is_err());
 
         std::fs::remove_file(path).unwrap();
@@ -3853,7 +3864,7 @@ mod tests {
         let sk = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
         let signature = sk.sign(&block_hash);
 
-        let result = manager.add_own_vote(1, signature);
+        let result = manager.add_own_vote(1, block_hash, signature);
         assert!(result.is_ok());
 
         std::fs::remove_file(path).unwrap();

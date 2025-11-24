@@ -563,7 +563,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // self.view_manager.mark_voted(view)?;
 
         // Add the vote to the view context
-        self.view_manager.add_own_vote(view, vote_signature)?;
+        self.view_manager
+            .add_own_vote(view, block_hash, vote_signature)?;
 
         Ok(())
     }

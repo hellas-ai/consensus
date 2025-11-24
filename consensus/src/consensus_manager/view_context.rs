@@ -607,9 +607,24 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
     }
 
     /// Adds the current replica's own vote to the current view's context.
-    pub fn add_own_vote(&mut self, signature: BlsSignature) -> Result<()> {
+    pub fn add_own_vote(
+        &mut self,
+        block_hash: [u8; blake3::OUT_LEN],
+        signature: BlsSignature,
+    ) -> Result<()> {
         if self.has_voted {
             return Err(anyhow::anyhow!("Replica has already voted"));
+        }
+        if let Some(current_hash) = self.block_hash {
+            if current_hash != block_hash {
+                return Err(anyhow::anyhow!(
+                    "Replica trying to vote for block hash {:?} but context already has block hash {:?}",
+                    block_hash,
+                    current_hash
+                ));
+            }
+        } else {
+            self.block_hash = Some(block_hash);
         }
         self.has_voted = true;
         self.votes.insert(Vote::new(
@@ -4395,7 +4410,7 @@ mod tests {
         // Replica votes for the block
         let replica_sk = setup.peer_id_to_secret_key.get(&replica_id).unwrap();
         let vote_sig = replica_sk.sign(&block_hash);
-        context.add_own_vote(vote_sig).unwrap();
+        context.add_own_vote(block_hash, vote_sig).unwrap();
         assert!(context.has_voted);
 
         // Then receive 3 votes for a DIFFERENT block (Byzantine behavior)
