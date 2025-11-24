@@ -973,13 +973,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
-        if is_enough_to_finalize && should_vote {
-            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
-                view: vote_view_number,
-                block_hash: vote_block_hash,
-            });
-        }
-
         if is_enough_to_m_notarize && should_vote {
             // Process pending child blocks that were waiting for this parent
             self.process_all_pending_blocks()?;
@@ -988,6 +981,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 view: vote_view_number,
                 block_hash: vote_block_hash,
                 should_forward_m_notarization: true,
+            });
+        }
+
+        if is_enough_to_finalize && should_vote {
+            // Don't finalize if it's the current view. We must progress first.
+            if vote_view_number == self.view_chain.current_view_number() {
+                return Ok(ViewProgressEvent::ShouldVote {
+                    view: vote_view_number,
+                    block_hash: vote_block_hash,
+                });
+            }
+            return Ok(ViewProgressEvent::ShouldVoteAndFinalize {
+                view: vote_view_number,
+                block_hash: vote_block_hash,
             });
         }
 
@@ -3265,7 +3272,7 @@ mod tests {
             create_test_m_notarization::<6, 1, 3>(&votes, 1, block_hash_1, leader_id_1);
 
         let result = manager.handle_m_notarization(m_notarization);
-        result.unwrap();
+        result.unwrap(); // Should accept duplicate
 
         // Should not progress view since it's for a past view
         assert_eq!(manager.current_view_number(), 4);

@@ -307,8 +307,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             // Periodic tick
             if last_tick.elapsed() >= self.tick_interval {
                 did_work = true;
-                if let Err(e) = self.view_manager.tick() {
-                    slog::error!(self.logger, "Error ticking view manager: {}", e);
+                match self.handle_tick() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        slog::error!(self.logger, "Error handling tick: {}", e);
+                    }
                 }
                 last_tick = Instant::now();
             }
@@ -483,21 +486,33 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let block_hash = compute_block_hash(parent_block_hash, &transactions, timestamp, view);
-        let leader_signature = self.secret_key.sign(&block_hash);
 
-        // Create a new block
-        let block = Block::new(
+        // Create a dummy signature to construct the block structure.
+        // The signature is NOT part of the block hash, so this doesn't affect the hash.
+        // We sign a zero-byte array just to get a valid BlsSignature type.
+        let dummy_signature = self.secret_key.sign(&[0u8; 32]);
+
+        // Create the block. This internally calls compute_hash() on the contents.
+        let mut block = Block::new(
             view,
-            self.view_manager.replica_id(), /* It is the current leader replica that is
-                                             * proposing the block */
+            self.view_manager.replica_id(),
             parent_block_hash,
             transactions,
             timestamp,
-            leader_signature,
+            dummy_signature,
             false,
             view,
         );
+
+        // Get the canonical hash from the block itself.
+        // This is the exact hash that validators will re-compute.
+        let block_hash = block.get_hash();
+
+        // Sign the canonical hash with the leader's key.
+        let leader_signature = self.secret_key.sign(&block_hash);
+
+        // Update the block with the REAL signature.
+        block.leader_signature = leader_signature;
 
         // Broadcast the block proposal to the network layer (to be received by other replicas)
         self.broadcast_consensus_message(ConsensusMessage::BlockProposal(block))?;
@@ -533,11 +548,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             leader_id,
         );
 
+        let my_pk = self.secret_key.public_key();
+        if !my_pk.verify(&block_hash, &vote_signature) {
+            slog::error!(
+                self.logger,
+                "[DEBUG] CRITICAL: Local vote signing failed verification with own PK!"
+            );
+        }
+
         // Broadcast the vote to the network layer (to be received by other replicas)
         self.broadcast_consensus_message(ConsensusMessage::Vote(vote))?;
 
         // Mark the vote as cast
-        self.view_manager.mark_voted(view)?;
+        // self.view_manager.mark_voted(view)?;
 
         // Add the vote to the view context
         self.view_manager.add_own_vote(view, vote_signature)?;
@@ -795,31 +818,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
     }
 }
 
-fn compute_block_hash(
-    parent_block_hash: [u8; blake3::OUT_LEN],
-    txs: &[Transaction],
-    timestamp: u64,
-    view: u64,
-) -> [u8; blake3::OUT_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&parent_block_hash);
-    hasher.update(
-        &txs.iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&i.to_le_bytes());
-                hasher.update(&t.tx_hash);
-                hasher.finalize().into()
-            })
-            .collect::<Vec<[u8; blake3::OUT_LEN]>>()
-            .concat(),
-    );
-    hasher.update(&timestamp.to_le_bytes());
-    hasher.update(&view.to_le_bytes());
-    hasher.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,28 +996,6 @@ mod tests {
         // 3. Nullification requires 2f+1 = 3 nullify messages
         assert_eq!(2 * F + 1, M_SIZE);
         assert_eq!(N - F, 5);
-    }
-
-    #[test]
-    fn test_block_hash_computation_is_consistent() {
-        let parent_hash = [0u8; blake3::OUT_LEN];
-        let txs = vec![create_test_transaction(1), create_test_transaction(2)];
-        let timestamp = 1234567890;
-        let view = 1;
-
-        let hash1 = compute_block_hash(parent_hash, &txs, timestamp, view);
-        let hash2 = compute_block_hash(parent_hash, &txs, timestamp, view);
-
-        // Same inputs should produce same hash
-        assert_eq!(hash1, hash2);
-
-        // Different timestamp should produce different hash
-        let hash3 = compute_block_hash(parent_hash, &txs, timestamp + 1, view);
-        assert_ne!(hash1, hash3);
-
-        // Different view should produce different hash
-        let hash4 = compute_block_hash(parent_hash, &txs, timestamp, view + 1);
-        assert_ne!(hash1, hash4);
     }
 
     #[test]

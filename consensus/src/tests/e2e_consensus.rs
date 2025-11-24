@@ -77,8 +77,16 @@ fn test_e2e_consensus_happy_path() {
     let mut network = LocalNetwork::<N, F, M_SIZE>::new();
     let mut replica_setups = Vec::with_capacity(N);
 
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
     for (i, &peer_id) in fixture.peer_set.sorted_peer_ids.iter().enumerate() {
-        let secret_key = fixture.keypairs[i].secret_key.clone();
+        let secret_key = peer_id_to_secret_key
+            .get(&peer_id)
+            .expect("Secret key not found")
+            .clone();
         let setup = ReplicaSetup::new(peer_id, secret_key);
 
         slog::debug!(

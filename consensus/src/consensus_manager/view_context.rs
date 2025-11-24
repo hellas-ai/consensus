@@ -535,8 +535,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         let peer_public_key = peers.get_public_key(&vote.peer_id)?;
         if !vote.verify(peer_public_key) {
             return Err(anyhow::anyhow!(
-                "Vote signature is not valid for peer {}",
-                vote.peer_id
+                "Vote signature is not valid for peer {}, view number {}",
+                vote.peer_id,
+                vote.view
             ));
         }
 
