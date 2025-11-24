@@ -7,7 +7,8 @@
 //! ## Test Organization
 //!
 //! - **`e2e_consensus`**: End-to-end tests for basic consensus functionality
-//! - **`network_simulator`**: Network simulation infrastructure for routing messages between replicas
+//! - **`network_simulator`**: Network simulation infrastructure for routing messages between
+//!   replicas
 //! - **`test_helpers`**: Common utilities, fixtures, and helper functions
 //!
 //! ## Running Integration Tests

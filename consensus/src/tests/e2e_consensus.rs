@@ -14,7 +14,7 @@ use std::{env, str::FromStr, thread, time::Duration};
 ///
 /// Respects the `RUST_LOG` environment variable:
 /// - `error` - Only errors
-/// - `warn` - Warnings and errors  
+/// - `warn` - Warnings and errors
 /// - `info` - Info, warnings, and errors (default)
 /// - `debug` - All messages including debug
 ///

@@ -65,7 +65,7 @@ impl NetworkStats {
         self.messages_dropped.load(Ordering::Relaxed)
     }
 
-    pub fn reset(&self) {
+    pub fn _reset(&self) {
         self.messages_routed.store(0, Ordering::Relaxed);
         self.messages_dropped.store(0, Ordering::Relaxed);
     }

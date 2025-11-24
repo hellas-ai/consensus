@@ -98,7 +98,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         initial_view: ViewContext<N, F, M_SIZE>,
         persistence_storage: ConsensusStore,
         view_timeout: Duration,
-        genesis_hash: [u8; blake3::OUT_LEN],
     ) -> Self {
         let current_view = initial_view.view_number;
         let mut non_finalized_views = HashMap::new();
@@ -108,7 +107,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             current_view,
             non_finalized_views,
             persistence_storage,
-            previously_committed_block_hash: genesis_hash,
+            previously_committed_block_hash: Block::genesis_hash(),
             _view_timeout: view_timeout,
         }
     }
@@ -2922,9 +2921,9 @@ mod tests {
     fn test_duplicate_block_proposal_to_same_view_fails() {
         // Test that attempting to add a second block to a view that already has one fails
         let setup = TestSetup::new(N);
-        let leader_id = setup.leader_id(0);
-        let replica_id = setup.replica_id(1);
-        let parent_hash = [0u8; blake3::OUT_LEN];
+        let leader_id = setup.leader_id(1);
+        let replica_id = setup.replica_id(0);
+        let parent_hash = Block::genesis_hash();
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let mut view_chain =
