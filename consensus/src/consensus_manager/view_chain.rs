@@ -330,6 +330,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             return ctx.add_vote(vote, peers);
         }
 
+        // Check if this view is older than our oldest active view.
+        // If so, it has already been finalized and garbage collected, so we can safely ignore this
+        // message.
+        let oldest_active_view = self
+            .non_finalized_views
+            .keys()
+            .min()
+            .copied()
+            .unwrap_or(self.current_view);
+
+        if vote.view < oldest_active_view {
+            return Ok(CollectedVotesResult {
+                should_await: false,
+                is_enough_to_m_notarize: false,
+                is_enough_to_finalize: false,
+                should_nullify: false,
+                should_vote: false,
+            });
+        }
+
         Err(anyhow::anyhow!(
             "Vote for view {} is not the current view {} or an unfinalized view",
             vote.view,
@@ -369,6 +389,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             return Ok(false);
         }
 
+        // Check if this view is older than our oldest active view.
+        // If so, it has already been finalized and garbage collected, so we can safely ignore this
+        // message.
+        let oldest_active_view = self
+            .non_finalized_views
+            .keys()
+            .min()
+            .cloned()
+            .unwrap_or(self.current_view);
+
+        if nullify.view < oldest_active_view {
+            return Ok(false);
+        }
+
         Err(anyhow::anyhow!(
             "Nullify for view {} is not the current view {} or an unfinalized view",
             nullify.view,
@@ -402,6 +436,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ctx.has_view_progressed_without_m_notarization()?;
             }
             return ctx.add_m_notarization(m_notarization, peers);
+        }
+
+        // Check if this view is older than our oldest active view.
+        // If so, it has already been finalized and garbage collected, so we can safely ignore this
+        // message.
+        let oldest_active_view = self
+            .non_finalized_views
+            .keys()
+            .min()
+            .cloned()
+            .unwrap_or(self.current_view);
+
+        if m_notarization.view < oldest_active_view {
+            return Ok(ShouldMNotarize {
+                should_notarize: false,
+                should_await: false,
+                should_vote: false,
+                should_nullify: false,
+                should_forward: false,
+            });
         }
 
         Err(anyhow::anyhow!(
@@ -608,13 +662,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
-        // 4. Find the parent view (the view the finalized block builds on)
-        let parent_hash = finalized_ctx
-            .block
-            .as_ref()
-            .ok_or(anyhow::anyhow!("Finalized view has no block"))?
-            .parent_block_hash();
+        // 4. Check if we have the block. If not, we defer finalization.
+        // We cannot finalize without the block because we need the parent_block_hash for GC
+        // and the transactions for persistence.
+        if finalized_ctx.block.is_none() {
+            return Ok(());
+        }
 
+        let finalized_block = finalized_ctx.block.as_ref().unwrap_or_else(|| {
+            panic!("Block for finalized view {} is not None", finalized_view);
+        });
+        let parent_hash = finalized_block.parent_block_hash();
         let parent_view = self.find_parent_view(&parent_hash);
 
         // 5. Validate the chain structure
@@ -661,6 +719,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     "View number {} is not a non-finalized view",
                     finalized_view
                 ))?;
+
+        // Pre-check: Ensure all non-nullified views in the range have blocks.
+        // If any ancestor is missing its block, we must defer the entire finalization
+        // to avoid partial persistence errors.
+        for view_num in to_persist_range.clone() {
+            if let Some(ctx) = self.non_finalized_views.get(&view_num) {
+                // Nullified views don't need blocks, but M/L-notarized views do.
+                if ctx.nullification.is_none() && ctx.block.is_none() {
+                    return Ok(());
+                }
+            }
+        }
 
         for view_number in to_persist_range {
             let ctx = self.non_finalized_views.remove(&view_number).unwrap();

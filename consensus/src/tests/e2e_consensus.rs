@@ -107,11 +107,16 @@ fn test_e2e_consensus_happy_path() {
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
 
+    let mut stores = Vec::with_capacity(N);
+
     for (i, setup) in replica_setups.into_iter().enumerate() {
         let replica_id = setup.replica_id;
 
         // Keep transaction producer for later
         let tx_producer = setup.transaction_producer;
+
+        // Keep a clone of the storage for verification
+        stores.push(setup.storage.clone());
 
         // Register with network
         network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
@@ -263,8 +268,15 @@ fn test_e2e_consensus_happy_path() {
     // Phase 9: Graceful shutdown
     slog::info!(logger, "Phase 9: Shutting down consensus engines");
 
+    // 1. Signal ALL engines to stop immediately.
+    // This prevents one replica from advancing while others are already stopped.
+    for engine in &engines {
+        engine.shutdown();
+    }
+
+    // 2. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
-        slog::debug!(logger, "Shutting down engine"; "replica" => i);
+        slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
         engine
             .shutdown_and_wait(Duration::from_secs(5))
@@ -280,6 +292,73 @@ fn test_e2e_consensus_happy_path() {
     }
 
     slog::info!(logger, "All engines shut down successfully");
+
+    // Phase 10: Verify state consistency
+    slog::info!(logger, "Phase 10: Verifying state consistency");
+
+    let mut first_replica_blocks: Option<Vec<crate::state::block::Block>> = None;
+
+    for (i, store) in stores.iter().enumerate() {
+        // Retrieve all finalized blocks from the store
+        let blocks = store
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+
+        slog::info!(
+            logger,
+            "Replica state check";
+            "replica" => i,
+            "finalized_blocks" => blocks.len(),
+            "highest_view" => blocks.last().map(|b| b.view()).unwrap_or(0),
+        );
+
+        // 1. Check that we have finalized blocks (progress was made)
+        assert!(
+            !blocks.is_empty(),
+            "Replica {} should have finalized blocks",
+            i
+        );
+
+        // 2. Check chain integrity
+        for (idx, window) in blocks.windows(2).enumerate() {
+            let prev = &window[0];
+            let curr = &window[1];
+            assert_eq!(
+                curr.parent_block_hash(),
+                prev.get_hash(),
+                "Chain broken at index {} for replica {} (view {} -> {})",
+                idx,
+                i,
+                prev.view(),
+                curr.view()
+            );
+            assert!(curr.view() > prev.view(), "View should strictly increase");
+        }
+
+        // 3. Check consistency across replicas
+        if let Some(ref first_blocks) = first_replica_blocks {
+            assert_eq!(
+                blocks.len(),
+                first_blocks.len(),
+                "Replica {} has different number of blocks than replica 0",
+                i
+            );
+            for (j, (b1, b2)) in blocks.iter().zip(first_blocks.iter()).enumerate() {
+                assert_eq!(
+                    b1.get_hash(),
+                    b2.get_hash(),
+                    "Block mismatch at index {} between replica {} and 0 (view {})",
+                    j,
+                    i,
+                    b1.view()
+                );
+            }
+        } else {
+            first_replica_blocks = Some(blocks);
+        }
+    }
+
+    slog::info!(logger, "State consistency verification passed! ✓");
 
     // Shutdown network
     slog::info!(logger, "Shutting down network");

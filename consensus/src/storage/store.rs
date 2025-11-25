@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ark_serialize::CanonicalSerialize;
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rkyv::de::Pool;
 use rkyv::rancor::Strategy;
 use rkyv::util::AlignedVec;
@@ -204,6 +204,30 @@ impl ConsensusStore {
     /// Retrieves a finalized block from the database, if it exists.
     pub fn get_finalized_block(&self, hash: &[u8; blake3::OUT_LEN]) -> Result<Option<Block>> {
         unsafe { self.get_blob_value::<Block, _>(FINALIZED_BLOCKS, *hash) }
+    }
+
+    /// Retrieves all finalized blocks from the database.
+    pub fn get_all_finalized_blocks(&self) -> Result<Vec<Block>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+        let mut blocks = Vec::new();
+
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let val = value.value();
+            let mut aligned = AlignedVec::<1024>::with_capacity(val.len());
+            aligned.extend_from_slice(val);
+            let archived = unsafe { access_archived::<Block>(aligned.as_slice()) };
+            let block: Block = deserialize(archived).map_err(|e: rkyv::rancor::Error| {
+                anyhow::anyhow!("Failed to deserialize: {:?}", e)
+            })?;
+            blocks.push(block);
+        }
+
+        // Sort blocks by view number to ensure consistent order
+        blocks.sort_by_key(|b| b.view());
+
+        Ok(blocks)
     }
 
     /// Puts a non-finalized block into the database.

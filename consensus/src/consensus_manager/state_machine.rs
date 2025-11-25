@@ -205,6 +205,7 @@
 //!   first created, as per Algorithm 1 lines 2-3
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -229,6 +230,9 @@ const MAX_BROADCAST_ATTEMPTS: usize = 10;
 pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The view progress manager that drives consensus logic
     view_manager: ViewProgressManager<N, F, M_SIZE>,
+
+    /// Buffer for messages received for future views
+    pending_messages: BTreeMap<u64, Vec<ConsensusMessage<N, F, M_SIZE>>>,
 
     /// Secret key for signing messages
     secret_key: BlsSecretKey,
@@ -267,6 +271,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
     ) -> Result<Self> {
         Ok(Self {
             view_manager,
+            pending_messages: BTreeMap::new(),
             secret_key,
             message_consumer,
             broadcast_producer,
@@ -345,7 +350,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
     /// Handles any incoming consensus messages
     fn handle_consensus_message(&mut self, message: ConsensusMessage<N, F, M_SIZE>) -> Result<()> {
-        let event = self.view_manager.process_consensus_msg(message)?;
+        let event = self.view_manager.process_consensus_msg(message.clone())?;
+
+        if let ViewProgressEvent::ShouldUpdateView { new_view, .. } = event {
+            slog::info!(
+                self.logger,
+                "Buffering message for future view {}",
+                new_view
+            );
+            self.pending_messages
+                .entry(new_view)
+                .or_default()
+                .push(message);
+            return Ok(());
+        }
+
         self.handle_event(event)
     }
 
@@ -511,17 +530,67 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // Sign the canonical hash with the leader's key.
         let leader_signature = self.secret_key.sign(&block_hash);
 
-        // Update the block with the REAL signature.
-        block.leader_signature = leader_signature;
+        // Update the block with the true leader signature.
+        block.leader_signature = leader_signature.clone();
 
         // Broadcast the block proposal to the network layer (to be received by other replicas)
-        self.broadcast_consensus_message(ConsensusMessage::BlockProposal(block))?;
+        self.broadcast_consensus_message(ConsensusMessage::BlockProposal(block.clone()))?;
+
+        // Manually process the block proposal locally to avoid redundant vote broadcasting.
+        // The leader's block proposal implicitly counts as a vote.
+        let event = self
+            .view_manager
+            .process_consensus_msg(ConsensusMessage::BlockProposal(block))?;
+
+        match event {
+            ViewProgressEvent::ShouldVote { view, block_hash } => {
+                // Leader implicitly votes via block proposal.
+                // Update local state but DO NOT broadcast explicit Vote message.
+                slog::debug!(
+                    self.logger,
+                    "Adding own vote for view {view} with block hash {block_hash:?}",
+                );
+                self.view_manager
+                    .add_own_vote(view, block_hash, leader_signature)?;
+            }
+            ViewProgressEvent::ShouldVoteAndMNotarize {
+                view,
+                block_hash,
+                should_forward_m_notarization,
+            } => {
+                slog::debug!(
+                    self.logger,
+                    "Adding own vote and creating M-notarization for view {view} with block hash {block_hash:?}",
+                );
+                self.view_manager
+                    .add_own_vote(view, block_hash, leader_signature)?;
+                self.create_and_broadcast_m_notarization(
+                    view,
+                    block_hash,
+                    should_forward_m_notarization,
+                )?;
+            }
+            ViewProgressEvent::ShouldVoteAndFinalize { view, block_hash } => {
+                slog::debug!(
+                    self.logger,
+                    "Adding own vote and finalizing view {view} with block hash {block_hash:?}",
+                );
+                self.view_manager
+                    .add_own_vote(view, block_hash, leader_signature)?;
+                self.finalize_view(view, block_hash)?;
+            }
+            // Fallback for other events
+            _ => {
+                slog::warn!(
+                    self.logger,
+                    "Unexpected event after block proposal: {event:?}. Handling it anyway.",
+                );
+                self.handle_event(event)?;
+            }
+        }
 
         // Mark the block as proposed
         self.view_manager.mark_proposed(view)?;
-
-        // Mark the block as voted
-        self.view_manager.mark_voted(view)?;
 
         Ok(())
     }
@@ -660,6 +729,30 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             self.logger,
             "Progressing to next view {view} with leader {leader} and notarized block hash {notarized_block_hash:?}"
         );
+
+        // Replay any buffered messages for this view (or previous ones)
+        let pending_views: Vec<u64> = self
+            .pending_messages
+            .keys()
+            .cloned()
+            .filter(|&v| v <= view)
+            .collect();
+
+        for pending_view in pending_views {
+            if let Some(messages) = self.pending_messages.remove(&pending_view) {
+                slog::debug!(
+                    self.logger,
+                    "Replaying {} buffered messages for view {}",
+                    messages.len(),
+                    pending_view
+                );
+                for msg in messages {
+                    if let Err(e) = self.handle_consensus_message(msg) {
+                        slog::error!(self.logger, "Failed to process buffered message: {}", e);
+                    }
+                }
+            }
+        }
 
         // Check if the current replica is the leader for the next view
         let replica_id = self.view_manager.replica_id();
@@ -946,6 +1039,9 @@ mod tests {
             }
             let config = create_test_config(N, F, peer_strs);
 
+            // Create logger
+            let logger = slog::Logger::root(slog::Discard, slog::o!());
+
             // Create leader manager
             let leader_manager = Box::new(RoundRobinLeaderManager::new(
                 N,
@@ -960,7 +1056,8 @@ mod tests {
 
             // Create view manager
             let view_manager =
-                ViewProgressManager::new(config, replica_id, storage, leader_manager).unwrap();
+                ViewProgressManager::new(config, replica_id, storage, leader_manager, logger)
+                    .unwrap();
 
             // Create logger
             let logger = slog::Logger::root(slog::Discard, slog::o!());

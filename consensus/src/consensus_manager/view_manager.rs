@@ -408,6 +408,9 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
 
     /// Transaction pool
     pending_txs: Vec<Transaction>,
+
+    /// Logger for logging events
+    logger: slog::Logger,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N, F, M_SIZE> {
@@ -416,6 +419,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         replica_id: PeerId,
         persistence_storage: ConsensusStore,
         leader_manager: Box<dyn LeaderManager>,
+        logger: slog::Logger,
     ) -> Result<Self> {
         let peers = PeerSet::new(
             config
@@ -473,6 +477,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             replica_id,
             peers,
             pending_txs: Vec::new(),
+            logger,
         })
     }
 
@@ -482,6 +487,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         config: ConsensusConfig,
         replica_id: PeerId,
         persistence_storage: ConsensusStore,
+        logger: slog::Logger,
     ) -> Result<Self> {
         let peers = PeerSet::new(
             config
@@ -521,6 +527,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             replica_id,
             peers,
             pending_txs: Vec::new(),
+            logger,
         })
     }
 
@@ -1134,7 +1141,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .progress_with_m_notarization(new_view_context)?;
 
             // Try to finalize the old view now that we have progressed
-            self.finalize_view(m_notarization_view_number)?;
+            if let Err(e) = self.finalize_view(m_notarization_view_number) {
+                // This is expected if we don't have L-notarization yet
+                slog::debug!(
+                    self.logger,
+                    "Error finalizing view on `handle_m_notarization` after progress: {}: {}",
+                    m_notarization_view_number,
+                    e
+                );
+            }
 
             if should_vote {
                 return Ok(ViewProgressEvent::ShouldVoteAndProgressToNextView {
@@ -1487,6 +1502,8 @@ mod tests {
         }
         let config = create_test_config(N, F, peer_strs);
 
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             N,
             setup.peer_set.sorted_peer_ids.clone(),
@@ -1495,8 +1512,14 @@ mod tests {
         let path = temp_db_path("view_manager");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
         (
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap(),
+            ViewProgressManager::new(
+                config,
+                replica_id,
+                persistence_storage,
+                leader_manager,
+                logger,
+            )
+            .unwrap(),
             path,
         )
     }
@@ -1529,11 +1552,13 @@ mod tests {
             peer_strs.push(peer_str);
         }
         let config = create_test_config(6, 1, peer_strs);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let path = temp_db_path("view_manager_genesis");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
         let manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::from_genesis(config, replica_id, persistence_storage).unwrap();
+            ViewProgressManager::from_genesis(config, replica_id, persistence_storage, logger)
+                .unwrap();
 
         assert_eq!(manager.current_view_number(), 0);
         assert_eq!(manager.non_finalized_count(), 1);
@@ -1738,6 +1763,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
@@ -1746,9 +1772,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_timeout");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         // Verify initial state - should be waiting for block
         let initial_result = manager.tick();
@@ -1799,6 +1830,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
@@ -1807,9 +1839,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_timeout_voted");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         // Mark as already voted
         manager.mark_voted(1).unwrap();
@@ -1853,6 +1890,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
@@ -1861,9 +1899,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_timeout_nullified");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         // Mark as already nullified
         manager.mark_nullified(1).unwrap();
@@ -1908,7 +1951,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
-
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
             setup.peer_set.sorted_peer_ids.clone(),
@@ -1916,9 +1959,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_past_timeout");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         // Create and add M-notarization for view 0
         let leader_id_0 = setup.peer_set.sorted_peer_ids[1];
@@ -2365,6 +2413,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
@@ -2373,9 +2422,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_multiple_timeout");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         // Step 1: Progress from View 1 to View 2 via Nullification
         {
@@ -2479,6 +2533,7 @@ mod tests {
             Network::Local,
             peer_strs,
         );
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
             6,
@@ -2487,9 +2542,14 @@ mod tests {
 
         let path = temp_db_path("view_manager_priority");
         let persistence_storage = ConsensusStore::open(&path).unwrap();
-        let mut manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::new(config, replica_id, persistence_storage, leader_manager)
-                .unwrap();
+        let mut manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::new(
+            config,
+            replica_id,
+            persistence_storage,
+            leader_manager,
+            logger,
+        )
+        .unwrap();
 
         let leader_id = setup.peer_set.sorted_peer_ids[1];
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();

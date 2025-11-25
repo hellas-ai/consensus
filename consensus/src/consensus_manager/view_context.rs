@@ -629,7 +629,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.has_voted = true;
         self.votes.insert(Vote::new(
             self.view_number,
-            self.block_hash.unwrap(),
+            block_hash,
             signature,
             self.replica_id,
             self.leader_id,
@@ -794,6 +794,29 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         let should_vote = !self.has_voted && !self.has_nullified;
 
         if self.block_hash.is_none() {
+            // If we receive an M-notarization but haven't seen the block yet,
+            // we accept the block hash from the M-notarization as the valid one for this view.
+            // This ensures that future chain validation (e.g., find_parent_view) can find this
+            // view.
+            self.block_hash = Some(m_notarization.block_hash);
+
+            // Process any non-verified votes that match this hash
+            if !self.non_verified_votes.is_empty() {
+                let block_hash = m_notarization.block_hash;
+                let mut num_matching_votes = 0;
+
+                self.non_verified_votes
+                    .iter()
+                    .filter(|v| v.block_hash == block_hash)
+                    .for_each(|v| {
+                        self.votes.insert(v.clone());
+                        num_matching_votes += 1;
+                    });
+
+                self.num_invalid_votes += self.non_verified_votes.len() - num_matching_votes;
+                self.non_verified_votes.clear();
+            }
+
             let should_forward = if self.m_notarization.is_none() {
                 self.m_notarization = Some(m_notarization.clone());
                 true

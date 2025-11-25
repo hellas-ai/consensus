@@ -210,8 +210,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         };
 
         // Create view progress manager
-        let view_manager = ViewProgressManager::new(config, replica_id, storage, leader_manager)
-            .context("Failed to create ViewProgressManager")?;
+        let view_manager =
+            ViewProgressManager::new(config, replica_id, storage, leader_manager, logger.clone())
+                .context("Failed to create ViewProgressManager")?;
 
         // Build consensus state machine
         let mut state_machine = ConsensusStateMachineBuilder::new()
