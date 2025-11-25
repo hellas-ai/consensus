@@ -6180,4 +6180,48 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn test_handle_m_notarization_continues_on_finalization_deferral() {
+        let setup = create_test_peer_setup(4);
+        let (mut manager, _path) = create_test_manager::<4, 1, 3>(&setup, 0);
+
+        // Setup:
+        // Current view is 2.
+        // We receive M-notarization for view 2.
+        // This should trigger progress to view 3.
+        // Crucially, it tries to finalize view 2. If view 2 has no block, finalize returns Ok
+        // (deferred). We want to ensure handle_m_notarization propagates the progress
+        // event.
+
+        let mut votes = HashSet::new();
+        for i in 0..3 {
+            votes.insert(create_test_vote(
+                i,
+                1,
+                [0u8; 32],
+                manager.leader_for_view(1).unwrap(),
+                &create_test_peer_setup(4),
+            ));
+        }
+        let m_notarization =
+            create_test_m_notarization(&votes, 1, [0u8; 32], manager.leader_for_view(1).unwrap());
+
+        // Force the manager into state where view 1 exists but has no block (simulating race)
+        // The create_test_manager creates view 1 as genesis or similar?
+        // Actually default start is usually view 1.
+
+        let result = manager.handle_m_notarization(m_notarization);
+
+        assert!(result.is_ok());
+        let event = result.unwrap();
+
+        // Should return ProgressToNextView
+        match event {
+            ViewProgressEvent::ProgressToNextView { new_view, .. } => {
+                assert_eq!(new_view, 2);
+            }
+            _ => panic!("Expected ProgressToNextView"),
+        }
+    }
 }

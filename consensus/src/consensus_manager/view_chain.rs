@@ -3893,4 +3893,74 @@ mod tests {
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
+
+    #[test]
+    fn test_finalize_with_l_notarization_defers_if_no_block() {
+        // Use N from module constants to match ViewChain generics
+        let setup = TestSetup::new(N);
+        let mut context = create_view_context_with_votes(
+            1,
+            setup.leader_id(0),
+            setup.replica_id(1),
+            [0u8; 32],
+            N - F, // Ensure we have enough votes for L-notarization (N-F)
+            &setup,
+        );
+        context.block = None;
+
+        // Ensure M-notarization exists.
+        // We extract the block hash from the votes created by the helper.
+        if let Some(first_vote) = context.votes.iter().next() {
+            let block_hash = first_vote.block_hash;
+            context.block_hash = Some(block_hash);
+            let m_not = create_m_notarization(&context.votes, 1, block_hash, setup.leader_id(0));
+            context.m_notarization = Some(m_not);
+        } else {
+            panic!("Setup failed to create votes");
+        }
+
+        let mut chain = ViewChain::new(context, setup.storage.clone(), Duration::from_secs(10));
+
+        let result = chain.finalize_with_l_notarization(1, &setup.peer_set);
+
+        // This should now succeed (returning Ok) because we have enough votes (N-F),
+        // but it will defer actual finalization (return Ok without removing view) because block is
+        // missing.
+        result.unwrap();
+        assert!(chain.non_finalized_views.contains_key(&1));
+    }
+
+    #[test]
+    fn test_route_messages_ignores_old_views() {
+        let setup = TestSetup::new(4);
+        let initial_view = create_view_context_with_votes(
+            10,
+            setup.leader_id(0),
+            setup.replica_id(1),
+            [0u8; 32],
+            0,
+            &setup,
+        );
+        let mut chain =
+            ViewChain::new(initial_view, setup.storage.clone(), Duration::from_secs(10));
+
+        // Test Vote for old view
+        let old_vote = create_vote(2, 5, [0u8; 32], setup.leader_id(0), &setup);
+        let vote_result = chain.route_vote(old_vote, &setup.peer_set);
+        assert!(vote_result.is_ok());
+        let res = vote_result.unwrap();
+        assert!(!res.should_vote);
+
+        // Test M-notarization for old view
+        let mut votes = HashSet::new();
+        // Fix: create enough votes to satisfy the threshold (3 for N=4, F=1)
+        for i in 0..3 {
+            votes.insert(create_vote(i, 5, [0u8; 32], setup.leader_id(0), &setup));
+        }
+        let old_m_not = create_m_notarization(&votes, 5, [0u8; 32], setup.leader_id(0));
+        let m_res = chain.route_m_notarization(old_m_not, &setup.peer_set);
+        assert!(m_res.is_ok());
+        let res = m_res.unwrap();
+        assert!(!res.should_notarize);
+    }
 }

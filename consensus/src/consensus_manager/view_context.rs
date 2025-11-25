@@ -4475,4 +4475,79 @@ mod tests {
         assert!(result.is_ok());
         assert!(context.has_nullified);
     }
+
+    #[test]
+    fn test_add_m_notarization_sets_block_hash_if_missing() {
+        let setup = create_test_peer_setup(4);
+        // N=4, F=1, M=3
+        let mut ctx = create_test_view_context(
+            1,
+            setup.peer_set.sorted_peer_ids[0],
+            setup.peer_set.sorted_peer_ids[1],
+            [0u8; 32],
+        );
+
+        // Simulate receiving 3 votes (M-notarization threshold) for a block hash
+        let block_hash = [0xaa; 32];
+        let mut votes = HashSet::new();
+        for i in 0..3 {
+            let vote =
+                create_test_vote(i, 1, block_hash, setup.peer_set.sorted_peer_ids[0], &setup);
+            votes.insert(vote);
+        }
+
+        let m_notarization =
+            create_test_m_notarization(&votes, 1, block_hash, setup.peer_set.sorted_peer_ids[0]);
+
+        // Pre-condition: Block hash is unknown
+        assert!(ctx.block_hash.is_none());
+
+        // Action: Add M-notarization
+        let result = ctx.add_m_notarization(m_notarization, &setup.peer_set);
+
+        // Assertion: Result is Ok and block_hash is now set
+        assert!(result.is_ok());
+        assert_eq!(ctx.block_hash, Some(block_hash));
+        assert!(ctx.m_notarization.is_some());
+    }
+
+    #[test]
+    fn test_add_m_notarization_processes_non_verified_votes() {
+        let setup = create_test_peer_setup(4);
+        let mut ctx = create_test_view_context(
+            1,
+            setup.peer_set.sorted_peer_ids[0],
+            setup.peer_set.sorted_peer_ids[1],
+            [0u8; 32],
+        );
+        let block_hash = [0xaa; 32];
+
+        // Add a vote to non-verified (because block hash is unknown)
+        let vote = create_test_vote(2, 1, block_hash, setup.peer_set.sorted_peer_ids[0], &setup);
+        ctx.add_vote(vote.clone(), &setup.peer_set).unwrap();
+        assert!(ctx.non_verified_votes.contains(&vote));
+        assert!(ctx.votes.is_empty());
+
+        // Create M-notarization
+        let mut votes = HashSet::new();
+        for i in 0..3 {
+            votes.insert(create_test_vote(
+                i,
+                1,
+                block_hash,
+                setup.peer_set.sorted_peer_ids[0],
+                &setup,
+            ));
+        }
+        let m_notarization =
+            create_test_m_notarization(&votes, 1, block_hash, setup.peer_set.sorted_peer_ids[0]);
+
+        // Add M-notarization
+        ctx.add_m_notarization(m_notarization, &setup.peer_set)
+            .unwrap();
+
+        // Assertion: The vote should move from non-verified to valid votes
+        assert!(ctx.non_verified_votes.is_empty());
+        assert!(ctx.votes.contains(&vote));
+    }
 }
