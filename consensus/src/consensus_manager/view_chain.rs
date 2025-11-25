@@ -3924,8 +3924,7 @@ mod tests {
         let result = chain.finalize_with_l_notarization(1, &setup.peer_set);
 
         // This should now succeed (returning Ok) because we have enough votes (N-F),
-        // but it will defer actual finalization (return Ok without removing view) because block is
-        // missing.
+        // but it will defer actual finalization (return Ok without removing view) because block is missing.
         result.unwrap();
         assert!(chain.non_finalized_views.contains_key(&1));
     }

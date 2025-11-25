@@ -6190,9 +6190,8 @@ mod tests {
         // Current view is 2.
         // We receive M-notarization for view 2.
         // This should trigger progress to view 3.
-        // Crucially, it tries to finalize view 2. If view 2 has no block, finalize returns Ok
-        // (deferred). We want to ensure handle_m_notarization propagates the progress
-        // event.
+        // Crucially, it tries to finalize view 2. If view 2 has no block, finalize returns Ok (deferred).
+        // We want to ensure handle_m_notarization propagates the progress event.
 
         let mut votes = HashSet::new();
         for i in 0..3 {
