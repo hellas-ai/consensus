@@ -274,7 +274,12 @@ fn test_e2e_consensus_happy_path() {
         engine.shutdown();
     }
 
-    // 2. Now wait for each engine to finish its thread.
+    // 2. Stop the network BEFORE waiting for engines to finish.
+    // This prevents new messages from being delivered during shutdown,
+    // which would cause some replicas to finalize more blocks than others.
+    network.shutdown();
+
+    // 3. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
@@ -359,10 +364,6 @@ fn test_e2e_consensus_happy_path() {
     }
 
     slog::info!(logger, "State consistency verification passed! ✓");
-
-    // Shutdown network
-    slog::info!(logger, "Shutting down network");
-    network.shutdown();
 
     // Final success message
     slog::info!(
