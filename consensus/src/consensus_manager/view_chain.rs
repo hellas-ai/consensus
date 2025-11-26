@@ -3624,8 +3624,8 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_fails_if_no_block_in_view() {
-        // View has votes but no block (corrupted state)
+    fn test_finalize_defers_if_no_block_in_view() {
+        // View has votes but no block - finalization should be deferred
         let setup = TestSetup::new(N);
         let leader_id = setup.leader_id(0);
         let replica_id = setup.replica_id(1);
@@ -3633,9 +3633,7 @@ mod tests {
 
         // Create view without block but with votes (manually)
         let mut ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        // Don't add block, just add votes manually
         ctx.block_hash = Some([66u8; 32]);
-        // Manually add votes to bypass normal validation
         for i in 0..(N - F) {
             let vote = create_vote(i, 1, [66u8; 32], leader_id, &setup);
             ctx.votes.insert(vote);
@@ -3659,11 +3657,11 @@ mod tests {
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, [66u8; 32]);
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
-        // Try to finalize view 1 - should fail because no block
+        // Try to finalize view 1 - should defer (return Ok) because no block
         let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("has no block"));
+        assert!(result.is_ok()); // Deferral, not failure
+        assert!(view_chain.non_finalized_views.contains_key(&1)); // View still present
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3892,41 +3890,6 @@ mod tests {
         assert_eq!(view_chain.previously_committed_block_hash, block_hash_v3);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
-    }
-
-    #[test]
-    fn test_finalize_with_l_notarization_defers_if_no_block() {
-        // Use N from module constants to match ViewChain generics
-        let setup = TestSetup::new(N);
-        let mut context = create_view_context_with_votes(
-            1,
-            setup.leader_id(0),
-            setup.replica_id(1),
-            [0u8; 32],
-            N - F, // Ensure we have enough votes for L-notarization (N-F)
-            &setup,
-        );
-        context.block = None;
-
-        // Ensure M-notarization exists.
-        // We extract the block hash from the votes created by the helper.
-        if let Some(first_vote) = context.votes.iter().next() {
-            let block_hash = first_vote.block_hash;
-            context.block_hash = Some(block_hash);
-            let m_not = create_m_notarization(&context.votes, 1, block_hash, setup.leader_id(0));
-            context.m_notarization = Some(m_not);
-        } else {
-            panic!("Setup failed to create votes");
-        }
-
-        let mut chain = ViewChain::new(context, setup.storage.clone(), Duration::from_secs(10));
-
-        let result = chain.finalize_with_l_notarization(1, &setup.peer_set);
-
-        // This should now succeed (returning Ok) because we have enough votes (N-F),
-        // but it will defer actual finalization (return Ok without removing view) because block is missing.
-        result.unwrap();
-        assert!(chain.non_finalized_views.contains_key(&1));
     }
 
     #[test]

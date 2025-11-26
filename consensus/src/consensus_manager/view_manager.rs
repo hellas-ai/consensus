@@ -2635,10 +2635,23 @@ mod tests {
         // Receive and process block
         manager.handle_block_proposal(block).unwrap();
 
-        // Add votes one by one until we hit n-f
+        // Create M-notarization to progress to view 2
+        let mut m_votes = HashSet::new();
+        for i in 0..3 {
+            m_votes.insert(create_test_vote(i, 1, block_hash, leader_id, &setup));
+        }
+        let m_notarization =
+            create_test_m_notarization::<6, 1, 3>(&m_votes, 1, block_hash, leader_id);
+        manager.handle_m_notarization(m_notarization).unwrap();
+
+        // Now we're at view 2. Add more votes for view 1 to reach L-notarization threshold.
+        // We have leader vote (1) + votes from M-notarization creation don't count as they weren't
+        // added via handle_vote. So we need to add votes 0, 2, 3, 4 (4 more) to reach 5 total.
+        // The M-notarization was created externally, those votes weren't processed.
+        // Let's add votes 2, 3, 4, 5 to get 4 more + leader = 5 = N-F
         let mut last_result = None;
         for i in 2..=5 {
-            // Need 5 total votes (n-f)
+            // Add votes to reach n-f (5 total for N=6, F=1)
             let vote = create_test_vote(i, 1, block_hash, leader_id, &setup);
             last_result = Some(manager.handle_vote(vote).unwrap());
         }
@@ -2646,10 +2659,6 @@ mod tests {
         // The last vote that crosses the threshold should trigger finalization
         match last_result.unwrap() {
             ViewProgressEvent::ShouldFinalize {
-                view,
-                block_hash: _,
-            }
-            | ViewProgressEvent::ShouldVoteAndFinalize {
                 view,
                 block_hash: _,
             } => {
@@ -5164,9 +5173,9 @@ mod tests {
     fn test_finalization_after_multiple_view_progressions() {
         let setup = create_test_peer_setup(6);
         let (mut manager, path): (ViewProgressManager<6, 1, 3>, String) =
-            create_test_manager(&setup, 1); // Start at View 1
+            create_test_manager(&setup, 1);
 
-        // 1. Setup View 1 with L-notarization (so it can be finalized later)
+        // 1. Setup View 1 with L-notarization
         let leader_id_1 = setup.peer_set.sorted_peer_ids[1]; // Leader for View 1
         let leader_sk_1 = setup.peer_id_to_secret_key.get(&leader_id_1).unwrap();
         let block_1 = create_test_block(
@@ -5178,11 +5187,11 @@ mod tests {
         );
         let block_hash_1 = block_1.get_hash();
 
-        // Leader proposes block -> Implicit Vote from Replica 1
+        // Leader proposes block -> Implicit Vote from Leader (peer 1)
         manager.handle_block_proposal(block_1).unwrap();
 
         // Add enough votes for L-notarization in View 1 (need n-f = 5 total)
-        // We have Replica 1. We need 4 more. Let's use 0, 2, 3, 4.
+        // We have Leader (peer 1). We need 4 more. Use peers 0, 2, 3, 4.
         let voters = [0, 2, 3, 4];
         for &i in voters.iter() {
             let vote = create_test_vote(i, 1, block_hash_1, leader_id_1, &setup);
@@ -5190,10 +5199,8 @@ mod tests {
         }
 
         // 2. Create M-notarization for View 1 to progress to View 2
-        // We need 2f+1 = 3 votes. We can reuse votes from 1, 2, 3.
         let mut m_votes_1 = HashSet::new();
-        // Reconstruct votes for M-notarization
-        m_votes_1.insert(create_test_vote(1, 1, block_hash_1, leader_id_1, &setup));
+        m_votes_1.insert(create_test_vote(0, 1, block_hash_1, leader_id_1, &setup));
         m_votes_1.insert(create_test_vote(2, 1, block_hash_1, leader_id_1, &setup));
         m_votes_1.insert(create_test_vote(3, 1, block_hash_1, leader_id_1, &setup));
 
@@ -5203,6 +5210,13 @@ mod tests {
 
         // Now in View 2
         assert_eq!(manager.current_view_number(), 2);
+
+        // View 1 should already be finalized (removed) because it had L-notarization
+        // and handle_m_notarization calls finalize_view internally after progressing
+        assert!(
+            manager.view_chain.find_view_context(1).is_none(),
+            "View 1 should have been finalized and removed after M-notarization"
+        );
 
         // 3. Setup View 2 to progress to View 3
         let leader_id_2 = setup.peer_set.sorted_peer_ids[2]; // Leader for View 2
@@ -5215,7 +5229,6 @@ mod tests {
         // Create M-notarization for View 2 to progress to View 3
         let mut m_votes_2 = HashSet::new();
         for i in 0..3 {
-            // Replicas 0, 1, 2 voting for View 2
             m_votes_2.insert(create_test_vote(i, 2, block_hash_2, leader_id_2, &setup));
         }
         let m_notarization_2 =
@@ -5224,14 +5237,6 @@ mod tests {
 
         // Now in View 3
         assert_eq!(manager.current_view_number(), 3);
-
-        // 4. Finalize View 1 (which has L-notarization)
-        // We are at View 3, so View 1 is a past view.
-        let result = manager.finalize_view(1);
-        assert!(result.is_ok());
-
-        // Verify View 1 is removed
-        assert!(manager.view_chain.find_view_context(1).is_none());
 
         std::fs::remove_file(path).unwrap();
     }
@@ -6186,13 +6191,6 @@ mod tests {
         let setup = create_test_peer_setup(4);
         let (mut manager, _path) = create_test_manager::<4, 1, 3>(&setup, 0);
 
-        // Setup:
-        // Current view is 2.
-        // We receive M-notarization for view 2.
-        // This should trigger progress to view 3.
-        // Crucially, it tries to finalize view 2. If view 2 has no block, finalize returns Ok (deferred).
-        // We want to ensure handle_m_notarization propagates the progress event.
-
         let mut votes = HashSet::new();
         for i in 0..3 {
             votes.insert(create_test_vote(
@@ -6200,27 +6198,30 @@ mod tests {
                 1,
                 [0u8; 32],
                 manager.leader_for_view(1).unwrap(),
-                &create_test_peer_setup(4),
+                &setup,
             ));
         }
         let m_notarization =
             create_test_m_notarization(&votes, 1, [0u8; 32], manager.leader_for_view(1).unwrap());
-
-        // Force the manager into state where view 1 exists but has no block (simulating race)
-        // The create_test_manager creates view 1 as genesis or similar?
-        // Actually default start is usually view 1.
 
         let result = manager.handle_m_notarization(m_notarization);
 
         assert!(result.is_ok());
         let event = result.unwrap();
 
-        // Should return ProgressToNextView
+        // Should return either ProgressToNextView or ShouldVoteAndProgressToNextView
+        // (depending on whether the replica has already voted)
         match event {
             ViewProgressEvent::ProgressToNextView { new_view, .. } => {
                 assert_eq!(new_view, 2);
             }
-            _ => panic!("Expected ProgressToNextView"),
+            ViewProgressEvent::ShouldVoteAndProgressToNextView { new_view, .. } => {
+                assert_eq!(new_view, 2);
+            }
+            other => panic!(
+                "Expected ProgressToNextView or ShouldVoteAndProgressToNextView, got {:?}",
+                other
+            ),
         }
     }
 }

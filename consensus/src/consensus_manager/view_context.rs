@@ -2878,15 +2878,15 @@ mod tests {
         let mut context =
             create_test_view_context_with_params::<6, 1, 3>(10, leader_id, replica_id, parent_hash);
 
-        // Step 1: Receive M-notarization for WRONG block hash
-        let wrong_block_hash = [69u8; blake3::OUT_LEN];
+        // Step 1: Receive M-notarization for an initial block hash
+        let initial_block_hash = [69u8; blake3::OUT_LEN];
         let mut votes = HashSet::new();
         for i in 1..=3 {
-            let vote = create_test_vote(i, 10, wrong_block_hash, leader_id, &setup);
+            let vote = create_test_vote(i, 10, initial_block_hash, leader_id, &setup);
             votes.insert(vote);
         }
         let m_notarization =
-            create_test_m_notarization::<6, 1, 3>(&votes, 10, wrong_block_hash, leader_id);
+            create_test_m_notarization::<6, 1, 3>(&votes, 10, initial_block_hash, leader_id);
 
         let result1 = context.add_m_notarization(m_notarization, peers);
         assert!(result1.is_ok());
@@ -2896,12 +2896,13 @@ mod tests {
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block = create_test_block(10, leader_id, parent_hash, leader_sk.clone(), 1);
         let actual_block_hash = block.get_hash();
-        assert_ne!(actual_block_hash, wrong_block_hash); // Verify they're different
+        assert_ne!(actual_block_hash, initial_block_hash); // Verify they're different
 
         let result2 = context.add_new_view_block(block, peers);
         assert!(result2.is_ok());
 
         let proposal_result = result2.unwrap();
+        assert!(proposal_result.should_nullify);
 
         // should_nullify should be true
         assert!(proposal_result.should_nullify);
@@ -2912,7 +2913,8 @@ mod tests {
 
         // Block hash should be set to the one of the M-notarization block hash
         // as at least one honest replica voted for it, and therefore the leader was Byzantine
-        assert!(context.block_hash.is_none());
+        assert!(context.block_hash.is_some());
+        assert_eq!(context.block_hash.unwrap(), initial_block_hash);
 
         // Non-verified M-notarization should NOT be DISCARDED (hash mismatch), but should be
         // nullified
