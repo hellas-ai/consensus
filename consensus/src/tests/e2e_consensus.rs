@@ -337,7 +337,12 @@ fn test_e2e_consensus_happy_path() {
                 prev.view(),
                 curr.view()
             );
-            assert!(curr.view() > prev.view(), "View should strictly increase");
+            assert!(
+                curr.view() == prev.view() + 1,
+                "View should increase by 1 ({} -> {})",
+                prev.view(),
+                curr.view()
+            );
         }
 
         // 3. Check consistency across replicas
