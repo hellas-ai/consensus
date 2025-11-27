@@ -679,6 +679,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // Get view context to create nullify message
         let view_ctx = self.view_manager.view_context_mut(view)?;
 
+        if view_ctx.has_nullified {
+            slog::info!(
+                self.logger,
+                "View {view} already nullified, ignoring request"
+            );
+            return Ok(());
+        }
+
         let nullify = if view_ctx.has_voted {
             // NOTE: After voting, the current replica must have conflicting evidence,
             // so in this case, the view is under Byzantine behavior.

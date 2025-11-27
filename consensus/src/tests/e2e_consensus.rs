@@ -1041,11 +1041,32 @@ fn test_e2e_consensus_with_crashed_replica() {
                 curr.view()
             );
             assert!(
-                curr.view() == prev.view() + 1,
-                "View should increase by 1 ({} -> {})",
+                curr.view() > prev.view(),
+                "View should increase monotonically ({} -> {})",
                 prev.view(),
                 curr.view()
             );
+
+            // Verify that skipped views were properly nullified
+            for skipped_view in (prev.view() + 1)..curr.view() {
+                let nullification = store
+                    .get_nullification::<N, F, M_SIZE>(skipped_view)
+                    .expect("Failed to query nullification");
+
+                assert!(
+                    nullification.is_some(),
+                    "Skipped view {} should be nullified (replica {})",
+                    skipped_view,
+                    i
+                );
+
+                slog::info!(
+                    logger,
+                    "Verified nullification";
+                    "view" => skipped_view,
+                    "replica" => i,
+                );
+            }
         }
 
         healthy_replica_blocks.push((i, blocks.clone()));
