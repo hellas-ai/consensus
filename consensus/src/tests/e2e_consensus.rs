@@ -754,7 +754,8 @@ fn test_e2e_consensus_continuous_load() {
         "inclusion_rate" => format!("{:.2}%", inclusion_rate * 100.0)
     );
 
-    // We expect most transactions to be finalized (e.g. > 90% given 30s duration vs 400ms block time)
+    // We expect most transactions to be finalized (e.g. > 90% given 30s duration vs 400ms block
+    // time)
     assert!(
         inclusion_rate > 0.9,
         "Transaction inclusion rate too low: {:.2}%",
@@ -1029,10 +1030,8 @@ fn test_e2e_consensus_with_crashed_replica() {
     slog::info!(logger, "Phase 10: Shutting down healthy consensus engines");
 
     // 1. Signal all healthy engines to stop
-    for engine_opt in engines.iter() {
-        if let Some(engine) = engine_opt {
-            engine.shutdown();
-        }
+    for engine in engines.iter().flatten() {
+        engine.shutdown();
     }
 
     // 2. Stop the network
