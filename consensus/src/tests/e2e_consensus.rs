@@ -703,3 +703,393 @@ fn test_e2e_consensus_continuous_load() {
         "test_duration_secs" => test_duration.as_secs(),
     );
 }
+
+#[test]
+#[ignore] // Run with: cargo test --lib test_e2e_consensus_with_crashed_replica -- --ignored --nocapture
+fn test_e2e_consensus_with_crashed_replica() {
+    // Create logger for test
+    let logger = create_test_logger();
+
+    // The replica index that will be crashed (0-indexed, so replica 5 is the 6th)
+    const CRASHED_REPLICA_IDX: usize = 5;
+
+    slog::info!(
+        logger,
+        "Starting end-to-end consensus test (with crashed replica)";
+        "replicas" => N,
+        "byzantine_tolerance" => F,
+        "crashed_replica" => CRASHED_REPLICA_IDX,
+    );
+
+    // Phase 1: Setup test environment
+    slog::info!(logger, "Phase 1: Creating test fixture");
+    let fixture = TestFixture::default();
+
+    slog::info!(
+        logger,
+        "Generated keypairs and peer set";
+        "total_replicas" => N,
+        "peer_ids" => ?fixture.peer_set.sorted_peer_ids,
+    );
+
+    // Phase 2: Initialize network simulator
+    slog::info!(logger, "Phase 2: Setting up network simulator");
+    let mut network = LocalNetwork::<N, F, M_SIZE>::new();
+    let mut replica_setups = Vec::with_capacity(N);
+
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
+    for (i, &peer_id) in fixture.peer_set.sorted_peer_ids.iter().enumerate() {
+        let secret_key = peer_id_to_secret_key
+            .get(&peer_id)
+            .expect("Secret key not found")
+            .clone();
+        let setup = ReplicaSetup::new(peer_id, secret_key);
+
+        slog::debug!(
+            logger,
+            "Created replica setup";
+            "replica_index" => i,
+            "peer_id" => peer_id,
+        );
+
+        replica_setups.push(setup);
+    }
+
+    // Phase 3: Register replicas and start engines, keeping transaction producers
+    slog::info!(
+        logger,
+        "Phase 3: Registering replicas and starting consensus engines"
+    );
+    let mut engines = Vec::with_capacity(N);
+    let mut transaction_producers = Vec::with_capacity(N);
+    let mut stores = Vec::with_capacity(N);
+
+    for (i, setup) in replica_setups.into_iter().enumerate() {
+        let replica_id = setup.replica_id;
+
+        // Keep transaction producer for later
+        let tx_producer = setup.transaction_producer;
+
+        // Keep a clone of the storage for verification
+        stores.push(setup.storage.clone());
+
+        // Register with network
+        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+        // Create consensus engine
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            fixture.config.clone(),
+            replica_id,
+            setup.secret_key,
+            setup.storage,
+            setup.message_consumer,
+            setup.broadcast_producer,
+            setup.transaction_consumer,
+            DEFAULT_TICK_INTERVAL,
+            replica_logger,
+        )
+        .expect("Failed to create consensus engine");
+
+        slog::debug!(
+            logger,
+            "Consensus engine started";
+            "replica" => i,
+            "peer_id" => replica_id,
+        );
+
+        engines.push(Some(engine));
+        transaction_producers.push(tx_producer);
+    }
+
+    slog::info!(
+        logger,
+        "All replicas registered and engines started";
+        "count" => engines.len(),
+    );
+
+    // Phase 4: Start network routing
+    slog::info!(logger, "Phase 4: Starting network routing");
+    network.start();
+    assert!(network.is_running(), "Network should be running");
+    slog::info!(logger, "Network routing thread active");
+
+    // Phase 5: Crash replica 5 immediately (simulate Byzantine/crash fault)
+    slog::info!(
+        logger,
+        "Phase 5: Crashing replica to simulate Byzantine fault";
+        "crashed_replica" => CRASHED_REPLICA_IDX,
+    );
+
+    if let Some(crashed_engine) = engines[CRASHED_REPLICA_IDX].take() {
+        crashed_engine.shutdown();
+        crashed_engine
+            .shutdown_and_wait(Duration::from_secs(5))
+            .expect("Failed to shutdown crashed replica");
+    }
+
+    slog::info!(
+        logger,
+        "Replica crashed (shutdown)";
+        "crashed_replica" => CRASHED_REPLICA_IDX,
+    );
+
+    // Phase 6: Submit transactions (only to healthy replicas)
+    let num_transactions = 30;
+    slog::info!(
+        logger,
+        "Phase 6: Submitting transactions";
+        "count" => num_transactions,
+    );
+
+    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+
+    for (i, tx) in transactions.into_iter().enumerate() {
+        // Distribute transactions across healthy replicas only (skip crashed one)
+        let mut replica_idx = i % N;
+        if replica_idx == CRASHED_REPLICA_IDX {
+            replica_idx = (replica_idx + 1) % N;
+        }
+
+        transaction_producers[replica_idx]
+            .push(tx)
+            .expect("Failed to submit transaction");
+
+        slog::debug!(
+            logger,
+            "Transaction submitted";
+            "tx_index" => i,
+            "target_replica" => replica_idx,
+        );
+    }
+
+    slog::info!(
+        logger,
+        "All transactions submitted";
+        "total" => num_transactions,
+    );
+
+    // Phase 7: Allow consensus to progress through multiple views
+    slog::info!(
+        logger,
+        "Phase 7: Waiting for consensus to progress (with one replica down)";
+        "duration_secs" => 30,
+    );
+
+    // Wait and check progress periodically
+    let test_duration = Duration::from_secs(30);
+    let check_interval = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < test_duration {
+        thread::sleep(check_interval);
+
+        let elapsed = start_time.elapsed().as_secs();
+        let msgs_routed = network.stats.messages_routed();
+        let msgs_dropped = network.stats.messages_dropped();
+
+        slog::info!(
+            logger,
+            "Consensus progress check";
+            "elapsed_secs" => elapsed,
+            "messages_routed" => msgs_routed,
+            "messages_dropped" => msgs_dropped,
+            "healthy_replicas" => N - 1,
+        );
+    }
+
+    // Phase 8: Verify healthy replicas are still running
+    slog::info!(logger, "Phase 8: Verifying healthy replicas");
+
+    for (i, engine_opt) in engines.iter().enumerate() {
+        if i == CRASHED_REPLICA_IDX {
+            assert!(
+                engine_opt.is_none(),
+                "Crashed replica {} should have been taken",
+                i
+            );
+            slog::info!(
+                logger,
+                "Crashed replica confirmed down";
+                "replica" => i,
+            );
+        } else if let Some(engine) = engine_opt {
+            let is_running = engine.is_running();
+            slog::info!(
+                logger,
+                "Healthy replica check";
+                "replica" => i,
+                "is_running" => is_running,
+            );
+            assert!(is_running, "Engine {} should still be running", i);
+        }
+    }
+
+    // Phase 9: Collect final statistics
+    slog::info!(logger, "Phase 9: Collecting final statistics");
+
+    let final_msgs_routed = network.stats.messages_routed();
+    let final_msgs_dropped = network.stats.messages_dropped();
+    let drop_rate = if final_msgs_routed > 0 {
+        (final_msgs_dropped as f64 / (final_msgs_routed + final_msgs_dropped) as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    slog::info!(
+        logger,
+        "Final network statistics";
+        "messages_routed" => final_msgs_routed,
+        "messages_dropped" => final_msgs_dropped,
+        "drop_rate_percent" => format!("{:.2}", drop_rate),
+    );
+
+    // Assert reasonable performance
+    assert!(final_msgs_routed > 0, "Network should have routed messages");
+
+    // Phase 10: Graceful shutdown of remaining engines
+    slog::info!(logger, "Phase 10: Shutting down healthy consensus engines");
+
+    // 1. Signal all healthy engines to stop
+    for engine_opt in engines.iter() {
+        if let Some(engine) = engine_opt {
+            engine.shutdown();
+        }
+    }
+
+    // 2. Stop the network
+    network.shutdown();
+
+    // 3. Wait for each healthy engine to finish
+    for (i, engine_opt) in engines.into_iter().enumerate() {
+        if let Some(engine) = engine_opt {
+            slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
+
+            engine
+                .shutdown_and_wait(Duration::from_secs(5))
+                .unwrap_or_else(|e| {
+                    slog::error!(
+                        logger,
+                        "Engine shutdown failed";
+                        "replica" => i,
+                        "error" => ?e,
+                    );
+                    panic!("Engine {} failed to shutdown: {}", i, e)
+                });
+        }
+    }
+
+    slog::info!(logger, "All healthy engines shut down successfully");
+
+    // Phase 11: Verify state consistency among healthy replicas
+    slog::info!(
+        logger,
+        "Phase 11: Verifying state consistency among healthy replicas"
+    );
+
+    let mut first_healthy_blocks: Option<Vec<crate::state::block::Block>> = None;
+    let mut healthy_replica_blocks: Vec<(usize, Vec<crate::state::block::Block>)> = Vec::new();
+
+    for (i, store) in stores.iter().enumerate() {
+        if i == CRASHED_REPLICA_IDX {
+            // Skip the crashed replica - it may have incomplete state
+            slog::info!(
+                logger,
+                "Skipping crashed replica in consistency check";
+                "replica" => i,
+            );
+            continue;
+        }
+
+        // Retrieve all finalized blocks from the store
+        let blocks = store
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+
+        slog::info!(
+            logger,
+            "Healthy replica state check";
+            "replica" => i,
+            "finalized_blocks" => blocks.len(),
+            "highest_view" => blocks.last().map(|b| b.view()).unwrap_or(0),
+        );
+
+        // 1. Check that we have finalized blocks (progress was made despite crashed replica)
+        assert!(
+            !blocks.is_empty(),
+            "Healthy replica {} should have finalized blocks (BFT should make progress with {} replicas)",
+            i,
+            N - 1
+        );
+
+        // 2. Check chain integrity
+        for (idx, window) in blocks.windows(2).enumerate() {
+            let prev = &window[0];
+            let curr = &window[1];
+            assert_eq!(
+                curr.parent_block_hash(),
+                prev.get_hash(),
+                "Chain broken at index {} for replica {} (view {} -> {})",
+                idx,
+                i,
+                prev.view(),
+                curr.view()
+            );
+            assert!(
+                curr.view() == prev.view() + 1,
+                "View should increase by 1 ({} -> {})",
+                prev.view(),
+                curr.view()
+            );
+        }
+
+        healthy_replica_blocks.push((i, blocks.clone()));
+
+        // 3. Check consistency across healthy replicas
+        if let Some(ref first_blocks) = first_healthy_blocks {
+            assert_eq!(
+                blocks.len(),
+                first_blocks.len(),
+                "Healthy replica {} has different number of blocks than first healthy replica",
+                i
+            );
+            for (j, (b1, b2)) in blocks.iter().zip(first_blocks.iter()).enumerate() {
+                assert_eq!(
+                    b1.get_hash(),
+                    b2.get_hash(),
+                    "Block mismatch at index {} between healthy replicas (view {})",
+                    j,
+                    b1.view()
+                );
+            }
+        } else {
+            first_healthy_blocks = Some(blocks);
+        }
+    }
+
+    let finalized_count = first_healthy_blocks.as_ref().map(|b| b.len()).unwrap_or(0);
+
+    slog::info!(
+        logger,
+        "State consistency verification passed! ✓";
+        "healthy_replicas" => N - 1,
+        "finalized_blocks" => finalized_count,
+    );
+
+    // Final success message
+    slog::info!(
+        logger,
+        "Test completed successfully! ✓";
+        "total_messages_routed" => final_msgs_routed,
+        "test_duration_secs" => 30,
+        "crashed_replica" => CRASHED_REPLICA_IDX,
+        "healthy_replicas" => N - 1,
+        "finalized_blocks" => finalized_count,
+        "bft_assumption" => "n >= 5f + 1 (6 >= 6)",
+    );
+}
