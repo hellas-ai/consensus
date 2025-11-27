@@ -402,6 +402,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 should_forward_m_notarization,
             ),
             ViewProgressEvent::ShouldFinalize { view, block_hash } => {
+                // If finalizing current view, ensure we have progressed past it
+                if view == self.view_manager.current_view_number() {
+                    slog::info!(
+                        self.logger,
+                        "Finalizing current view {view}, forcing progression first (ShouldFinalize)"
+                    );
+
+                    if let Ok(m_not) = self.view_manager.get_m_notarization(view) {
+                        // Broadcast it
+                        self.broadcast_consensus_message(ConsensusMessage::MNotarization(
+                            m_not.clone(),
+                        ))?;
+
+                        // Process it to advance view state
+                        if let Ok(progression_event) = self
+                            .view_manager
+                            .process_consensus_msg(ConsensusMessage::MNotarization(m_not))
+                        {
+                            self.handle_event(progression_event)?;
+                        }
+                    }
+                }
                 self.finalize_view(view, block_hash)
             }
             ViewProgressEvent::ShouldNullify { view } => self.nullify_view(view),
@@ -422,6 +444,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             }
             ViewProgressEvent::ShouldVoteAndFinalize { view, block_hash } => {
                 self.vote_for_block(view, block_hash)?;
+
+                // If finalizing current view, ensure we have progressed past it
+                if view == self.view_manager.current_view_number() {
+                    slog::info!(
+                        self.logger,
+                        "Finalizing current view {view}, forcing progression first"
+                    );
+
+                    if let Ok(m_not) = self.view_manager.get_m_notarization(view) {
+                        // Broadcast it
+                        self.broadcast_consensus_message(ConsensusMessage::MNotarization(
+                            m_not.clone(),
+                        ))?;
+
+                        // Process it to advance view state.
+                        // We MUST handle the returned event (likely ProgressToNextView) to actually
+                        // update the view state.
+                        match self
+                            .view_manager
+                            .process_consensus_msg(ConsensusMessage::MNotarization(m_not))
+                        {
+                            Ok(progression_event) => {
+                                self.handle_event(progression_event)?;
+                            }
+                            Err(e) => {
+                                slog::error!(
+                                    self.logger,
+                                    "Error processing M-notarization on `ShouldVoteAndFinalize` event for current view: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+
                 self.finalize_view(view, block_hash)
             }
             ViewProgressEvent::ProgressToNextView {
