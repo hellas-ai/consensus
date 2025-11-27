@@ -170,6 +170,10 @@ fn test_e2e_consensus_happy_path() {
 
     let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
 
+    // Keep a copy of transaction hashes for verification
+    let expected_tx_hashes: std::collections::HashSet<_> =
+        transactions.iter().map(|tx| tx.tx_hash).collect();
+
     for (i, tx) in transactions.into_iter().enumerate() {
         // Distribute transactions across replicas (simulating different clients)
         let replica_idx = i % N;
@@ -370,6 +374,40 @@ fn test_e2e_consensus_happy_path() {
 
     slog::info!(logger, "State consistency verification passed! ✓");
 
+    // Verify all transactions were included
+    let mut included_tx_hashes = std::collections::HashSet::new();
+    if let Some(ref blocks) = first_replica_blocks {
+        for block in blocks {
+            for tx in &block.transactions {
+                included_tx_hashes.insert(tx.tx_hash);
+            }
+        }
+    }
+
+    // Verify each expected transaction is present
+    let mut missing_txs = 0;
+    for tx_hash in &expected_tx_hashes {
+        if !included_tx_hashes.contains(tx_hash) {
+            slog::error!(logger, "Transaction missing"; "tx_hash" => ?tx_hash);
+            missing_txs += 1;
+        }
+    }
+
+    assert_eq!(
+        missing_txs,
+        0,
+        "Some transactions were lost! {} missing out of {}",
+        missing_txs,
+        expected_tx_hashes.len()
+    );
+
+    slog::info!(
+        logger,
+        "Transaction inclusion verified! ✓";
+        "total_transactions" => expected_tx_hashes.len(),
+        "included_transactions" => included_tx_hashes.len()
+    );
+
     // Final success message
     slog::info!(
         logger,
@@ -506,6 +544,7 @@ fn test_e2e_consensus_continuous_load() {
     let mut last_check = start_time;
     let mut tx_count = 0usize;
     let mut tx_index = 0usize;
+    let mut expected_tx_hashes = std::collections::HashSet::new();
 
     while start_time.elapsed() < test_duration {
         // Submit a batch of transactions
@@ -513,12 +552,14 @@ fn test_e2e_consensus_continuous_load() {
         let transactions = create_test_transactions(&fixture.keypairs, batch_size);
 
         for tx in transactions {
+            let tx_hash = tx.tx_hash;
             // Distribute transactions across replicas (round-robin)
             let replica_idx = tx_index % N;
             tx_index += 1;
 
             if transaction_producers[replica_idx].push(tx).is_ok() {
                 tx_count += 1;
+                expected_tx_hashes.insert(tx_hash);
             }
         }
 
@@ -693,6 +734,33 @@ fn test_e2e_consensus_continuous_load() {
 
     slog::info!(logger, "State consistency verification passed! ✓");
 
+    // Verify transaction inclusion
+    let mut included_tx_hashes = std::collections::HashSet::new();
+    let first_blocks = &all_replica_blocks[0];
+    for block in first_blocks {
+        for tx in &block.transactions {
+            included_tx_hashes.insert(tx.tx_hash);
+        }
+    }
+
+    let included_count = included_tx_hashes.intersection(&expected_tx_hashes).count();
+    let inclusion_rate = included_count as f64 / expected_tx_hashes.len() as f64;
+
+    slog::info!(
+        logger,
+        "Transaction inclusion check";
+        "total_submitted" => expected_tx_hashes.len(),
+        "included_finalized" => included_count,
+        "inclusion_rate" => format!("{:.2}%", inclusion_rate * 100.0)
+    );
+
+    // We expect most transactions to be finalized (e.g. > 90% given 30s duration vs 400ms block time)
+    assert!(
+        inclusion_rate > 0.9,
+        "Transaction inclusion rate too low: {:.2}%",
+        inclusion_rate * 100.0
+    );
+
     // Final success message
     slog::info!(
         logger,
@@ -846,6 +914,11 @@ fn test_e2e_consensus_with_crashed_replica() {
         "Phase 6: Submitting transactions";
         "count" => num_transactions,
     );
+
+    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    // Keep a copy of transaction hashes for verification
+    let expected_tx_hashes: std::collections::HashSet<_> =
+        transactions.iter().map(|tx| tx.tx_hash).collect();
 
     let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
 
@@ -1100,6 +1173,40 @@ fn test_e2e_consensus_with_crashed_replica() {
         "State consistency verification passed! ✓";
         "healthy_replicas" => N - 1,
         "finalized_blocks" => finalized_count,
+    );
+
+    // Verify all transactions were included
+    let mut included_tx_hashes = std::collections::HashSet::new();
+    if let Some(ref blocks) = first_healthy_blocks {
+        for block in blocks {
+            for tx in &block.transactions {
+                included_tx_hashes.insert(tx.tx_hash);
+            }
+        }
+    }
+
+    // Verify each expected transaction is present
+    let mut missing_txs = 0;
+    for tx_hash in &expected_tx_hashes {
+        if !included_tx_hashes.contains(tx_hash) {
+            slog::error!(logger, "Transaction missing"; "tx_hash" => ?tx_hash);
+            missing_txs += 1;
+        }
+    }
+
+    assert_eq!(
+        missing_txs,
+        0,
+        "Some transactions were lost! {} missing out of {}",
+        missing_txs,
+        expected_tx_hashes.len()
+    );
+
+    slog::info!(
+        logger,
+        "Transaction inclusion verified! ✓";
+        "total_transactions" => expected_tx_hashes.len(),
+        "included_transactions" => included_tx_hashes.len()
     );
 
     // Final success message
