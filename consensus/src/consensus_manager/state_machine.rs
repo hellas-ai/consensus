@@ -396,11 +396,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 view,
                 block_hash,
                 should_forward_m_notarization,
-            } => self.create_and_broadcast_m_notarization(
-                view,
-                block_hash,
-                should_forward_m_notarization,
-            ),
+            } => {
+                // 1. Create and broadcast the M-notarization
+                self.create_and_broadcast_m_notarization(
+                    view,
+                    block_hash,
+                    should_forward_m_notarization,
+                )?;
+
+                // 2. Immediately process the M-notarization to advance state
+                // Retrieve the M-notarization we just created
+                if let Ok(m_not) = self.view_manager.get_m_notarization(view) {
+                    // Process it synchronously to advance state
+                    if let Ok(event) = self
+                        .view_manager
+                        .process_consensus_msg(ConsensusMessage::MNotarization(m_not))
+                    {
+                        self.handle_event(event)?;
+                    }
+                }
+
+                Ok(())
+            }
             ViewProgressEvent::ShouldFinalize { view, block_hash } => {
                 self.finalize_view(view, block_hash)
             }
@@ -413,12 +430,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 block_hash,
                 should_forward_m_notarization,
             } => {
+                // 1. Vote for the block and create and broadcast the M-notarization
                 self.vote_for_block(view, block_hash)?;
+
+                // 2. Create and broadcast the M-notarization
                 self.create_and_broadcast_m_notarization(
                     view,
                     block_hash,
                     should_forward_m_notarization,
-                )
+                )?;
+
+                // 3. Immediately process the M-notarization to advance state
+                if let Ok(m_not) = self.view_manager.get_m_notarization(view)
+                    && let Ok(event) = self
+                        .view_manager
+                        .process_consensus_msg(ConsensusMessage::MNotarization(m_not))
+                {
+                    self.handle_event(event)?;
+                }
+
+                Ok(())
             }
             ViewProgressEvent::ShouldVoteAndFinalize { view, block_hash } => {
                 self.vote_for_block(view, block_hash)?;
