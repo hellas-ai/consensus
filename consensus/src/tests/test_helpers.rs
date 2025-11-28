@@ -25,7 +25,7 @@ pub const BUFFER_SIZE: usize = 10_000;
 pub const DEFAULT_VIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default tick interval for consensus engines
-pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(10);
+pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Keypair for a replica
 #[derive(Clone)]
