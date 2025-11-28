@@ -441,13 +441,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 )?;
 
                 // 3. Immediately process the M-notarization to advance state
-                if let Ok(m_not) = self.view_manager.get_m_notarization(view) {
-                    if let Ok(event) = self
+                if let Ok(m_not) = self.view_manager.get_m_notarization(view)
+                    && let Ok(event) = self
                         .view_manager
                         .process_consensus_msg(ConsensusMessage::MNotarization(m_not))
-                    {
-                        self.handle_event(event)?;
-                    }
+                {
+                    self.handle_event(event)?;
                 }
 
                 Ok(())
