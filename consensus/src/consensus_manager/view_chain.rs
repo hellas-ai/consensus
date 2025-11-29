@@ -86,7 +86,7 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// The most recent finalized block hash in the current replica's state machine
     // TODO: Move this to [`ViewProgressManager`]
-    previously_committed_block_hash: [u8; blake3::OUT_LEN],
+    pub(crate) previously_committed_block_hash: [u8; blake3::OUT_LEN],
 
     /// The timeout period for a view to be considered nullified by the current replica
     _view_timeout: Duration,
@@ -3930,5 +3930,197 @@ mod tests {
         assert!(m_res.is_ok());
         let res = m_res.unwrap();
         assert!(!res.should_notarize);
+    }
+
+    #[test]
+    fn test_select_parent_skips_nullified_views() {
+        let setup = TestSetup::new(N);
+        let leader_v1 = setup.leader_id(0);
+        let leader_v2 = setup.leader_id(1);
+        let replica_id = setup.replica_id(2);
+        let parent_hash = [1u8; blake3::OUT_LEN];
+
+        // Create view 1 with M-notarization
+        // Use leader at index 0, so votes from indices 1, 2 won't conflict
+        let ctx_v1 =
+            create_view_context_with_votes(1, leader_v1, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // For view 2, we need to create the context manually to avoid vote conflicts
+        // since leader_v2 is at index 1, which would conflict with the voter at index 1
+        let mut ctx_v2 = ViewContext::new(2, leader_v2, replica_id, block_hash_v1);
+
+        // Add block for view 2
+        let leader_sk_v2 = setup.peer_id_to_secret_key.get(&leader_v2).unwrap();
+        let block_v2 = create_test_block(2, leader_v2, block_hash_v1, leader_sk_v2.clone(), 2);
+        let block_hash_v2 = block_v2.get_hash();
+        ctx_v2
+            .add_new_view_block(block_v2, &setup.peer_set)
+            .unwrap();
+
+        // Add votes from peers that are NOT the leader (indices 2, 3, etc.)
+        // Leader at index 1 already has implicit vote from block proposal
+        for i in 2..(M_SIZE + 1) {
+            let vote = create_vote(i, 2, block_hash_v2, leader_v2, &setup);
+            ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Before nullification: select_parent(3) should return view 2's block hash
+        let parent = view_chain.select_parent(3);
+        assert_eq!(
+            parent, block_hash_v2,
+            "Should select view 2's block as parent"
+        );
+
+        // Nullify view 1 by setting has_nullified = true
+        if let Some(ctx) = view_chain.non_finalized_views.get_mut(&1) {
+            ctx.has_nullified = true;
+        }
+
+        // After nullifying view 1: select_parent(3) should still return view 2's block hash
+        // (view 2 is built on view 1, but view 2 itself is not nullified)
+        let parent_after = view_chain.select_parent(3);
+        assert_eq!(
+            parent_after, block_hash_v2,
+            "Should still select view 2's block as parent"
+        );
+
+        // Now nullify view 2 as well
+        if let Some(ctx) = view_chain.non_finalized_views.get_mut(&2) {
+            ctx.has_nullified = true;
+        }
+
+        // After nullifying both views: select_parent(3) should fall back to
+        // previously_committed_block_hash
+        let parent_fallback = view_chain.select_parent(3);
+        assert_eq!(
+            parent_fallback, view_chain.previously_committed_block_hash,
+            "Should fall back to previously committed block when all views nullified"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_select_parent_skips_views_with_nullification_quorum() {
+        let setup = TestSetup::new(N);
+        let leader_v1 = setup.leader_id(0);
+        let leader_v2 = setup.leader_id(1);
+        let replica_id = setup.replica_id(2);
+        let parent_hash = [2u8; blake3::OUT_LEN];
+
+        // Create view 1 with M-notarization
+        let ctx_v1 =
+            create_view_context_with_votes(1, leader_v1, replica_id, parent_hash, M_SIZE, &setup);
+        let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+
+        // For view 2, manually create context to avoid vote conflicts
+        // since leader_v2 is at index 1, which would conflict with voter at index 1
+        let mut ctx_v2 = ViewContext::new(2, leader_v2, replica_id, block_hash_v1);
+
+        // Add block for view 2
+        let leader_sk_v2 = setup.peer_id_to_secret_key.get(&leader_v2).unwrap();
+        let block_v2 = create_test_block(2, leader_v2, block_hash_v1, leader_sk_v2.clone(), 2);
+        let block_hash_v2 = block_v2.get_hash();
+        ctx_v2
+            .add_new_view_block(block_v2, &setup.peer_set)
+            .unwrap();
+
+        // Add votes from peers that are NOT the leader (indices 2, 3, etc.)
+        for i in 2..(M_SIZE + 1) {
+            let vote = create_vote(i, 2, block_hash_v2, leader_v2, &setup);
+            ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
+        }
+
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Add nullification quorum to view 1
+        let mut nullify_messages = HashSet::new();
+        for i in 0..M_SIZE {
+            let nullify = create_nullify(i, 1, leader_v1, &setup);
+            nullify_messages.insert(nullify);
+        }
+        let nullification = create_nullification(&nullify_messages, 1, leader_v1);
+
+        // Add the nullification to view 1
+        if let Some(ctx) = view_chain.non_finalized_views.get_mut(&1) {
+            ctx.nullification = Some(nullification);
+        }
+
+        // select_parent(3) should still return view 2's block hash
+        // (view 2's M-notarization is still valid even though view 1 has nullification)
+        let parent = view_chain.select_parent(3);
+        assert_eq!(
+            parent, block_hash_v2,
+            "Should select view 2's block as parent"
+        );
+
+        // Now add nullification to view 2 as well
+        let mut nullify_messages_v2 = HashSet::new();
+        for i in 0..M_SIZE {
+            let nullify = create_nullify(i, 2, leader_v2, &setup);
+            nullify_messages_v2.insert(nullify);
+        }
+        let nullification_v2 = create_nullification(&nullify_messages_v2, 2, leader_v2);
+        if let Some(ctx) = view_chain.non_finalized_views.get_mut(&2) {
+            ctx.nullification = Some(nullification_v2);
+        }
+
+        // After nullification on both views: should fall back to previously committed
+        let parent_fallback = view_chain.select_parent(3);
+        assert_eq!(
+            parent_fallback, view_chain.previously_committed_block_hash,
+            "Should fall back to previously committed block when all views have nullification"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_route_nullification_returns_should_broadcast_only_for_new_nullification() {
+        let setup = TestSetup::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [3u8; blake3::OUT_LEN];
+
+        let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain =
+            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+
+        // Create nullification
+        let mut nullify_messages = HashSet::new();
+        for i in 0..M_SIZE {
+            let nullify = create_nullify(i, 1, leader_id, &setup);
+            nullify_messages.insert(nullify);
+        }
+        let nullification = create_nullification(&nullify_messages, 1, leader_id);
+
+        // First time: should_broadcast_nullification should be true
+        let result1 = view_chain
+            .route_nullification(nullification.clone(), &setup.peer_set)
+            .unwrap();
+        assert!(
+            result1.should_broadcast_nullification,
+            "First nullification should trigger broadcast"
+        );
+
+        // Second time (same nullification): should_broadcast_nullification should be false
+        let result2 = view_chain
+            .route_nullification(nullification, &setup.peer_set)
+            .unwrap();
+        assert!(
+            !result2.should_broadcast_nullification,
+            "Duplicate nullification should NOT trigger broadcast"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
 }

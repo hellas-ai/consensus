@@ -532,16 +532,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     current_view
                 );
 
-                // 1. Broadcast the nullification for the view that triggered the cascade (if needed)
-                if should_broadcast_nullification {
-                    if let Err(e) = self.broadcast_nullification(start_view) {
-                        slog::debug!(
-                            self.logger,
-                            "Failed to broadcast nullification for view {}: {}",
-                            start_view,
-                            e
-                        );
-                    }
+                // 1. Broadcast the nullification for the view that triggered the cascade (if
+                //    needed)
+                if should_broadcast_nullification
+                    && let Err(e) = self.broadcast_nullification(start_view)
+                {
+                    slog::debug!(
+                        self.logger,
+                        "Failed to broadcast nullification for view {}: {}",
+                        start_view,
+                        e
+                    );
                 }
 
                 // 2. Nullify all views from start_view to current_view
