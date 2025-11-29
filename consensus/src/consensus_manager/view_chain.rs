@@ -1128,9 +1128,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// 4. If no M-notarization found in non-finalized views, return previously_committed_block_hash
     pub fn select_parent(&self, new_view: u64) -> [u8; blake3::OUT_LEN] {
         // Find the greatest view v' < new_view that has an M-notarization
+        // and has not been nullified
         let mut greatest_view_with_m_not: Option<(u64, [u8; blake3::OUT_LEN])> = None;
 
         for (view_num, ctx) in &self.non_finalized_views {
+            // Skip views that have a full nullification OR have been locally nullified
+            // (pending full nullification). This ensures we don't build on invalid chains
+            // even before the network-wide nullification quorum is formed.
+            if ctx.nullification.is_some() || ctx.has_nullified {
+                continue;
+            }
+
             if *view_num < new_view
                 && let Some(ref m_not) = ctx.m_notarization
             {

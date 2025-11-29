@@ -529,13 +529,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 );
 
                 // Cascade nullify all views in the range [start_view, end_view].
-                // This will:
-                // 1. Create/Broadcast a Nullify message for the start_view (if we haven't already).
-                // 2. Create/Broadcast Nullify messages for all subsequent views (invalidating the chain).
-                // nullify_view() handles the "already nullified" check internally, so this is safe.
                 for view in start_view..=end_view {
-                    // We ignore errors on individual views to ensure we try to clean up the whole chain.
-                    // (e.g., if one view is already finalized or in a weird state, we still want to nullify the rest)
                     if let Err(e) = self.nullify_view(view) {
                         slog::debug!(
                             self.logger,
@@ -545,6 +539,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                         );
                     }
                 }
+
+                // After cascade, the next leader will call select_parent() which now
+                // skips nullified views, so they'll build on the correct parent.
+                // Log the new parent for debugging
+                let new_parent = self.view_manager.select_parent(end_view + 1);
+                slog::info!(
+                    self.logger,
+                    "After cascade, new parent block hash: {:?}",
+                    new_parent
+                );
 
                 Ok(())
             }
@@ -757,7 +761,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             // conflicting evidence
             let conflicting_count = view_ctx.nullify_messages.len() + view_ctx.num_invalid_votes;
 
-            if conflicting_count > 2 * F {
+            if conflicting_count > F {
                 // Byzantine behavior detected before voting
                 view_ctx.create_nullify_for_byzantine(&self.secret_key)?
             } else {

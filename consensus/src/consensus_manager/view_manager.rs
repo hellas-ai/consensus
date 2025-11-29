@@ -787,6 +787,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
     }
 
+    /// Selects the parent block for a new view according to the Minimmit SelectParent function.
+    ///
+    /// This implements the SelectParent(S, v) function from the Minimmit paper (Section 4):
+    /// "If v' < v is the greatest view such that S contains an M-notarization for some b
+    /// with b.view = v', and if b is the lexicographically least such block, the function
+    /// outputs b."
+    ///
+    /// # Arguments
+    /// * `view` - The view number for which we're selecting a parent
+    pub fn select_parent(&self, view: u64) -> [u8; blake3::OUT_LEN] {
+        self.view_chain.select_parent(view)
+    }
+
     /// Returns the M-notarization for a view.
     ///
     /// Returns an error if the view is not found or the M-notarization is not found.
@@ -1250,17 +1263,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         let nullification_view_number = nullification.view;
 
+        // Check if the nullified view had an M-notarization that we might have built upon
+        let nullified_view_had_m_notarization = self
+            .view_chain
+            .find_view_context(nullification_view_number)
+            .map(|ctx| ctx.m_notarization.is_some())
+            .unwrap_or_default();
+
         let CollectedNullificationsResult {
             should_broadcast_nullification,
         } = self
             .view_chain
             .route_nullification(nullification, &self.peers)?;
 
-        // Check for cascading nullification
-        // If we receive a nullification for a past view, we must nullify all subsequent views.
-        // We only trigger cascade if should_broadcast_nullification is true, which indicates
-        // that this is NEW evidence (we haven't seen this nullification before).
-        if should_broadcast_nullification && (nullification_view_number < current_view_number) {
+        // Cascade nullification if:
+        // 1. This is a past view (nullification_view_number < current_view_number)
+        // 2. And if this is new evidence OR the nullified view had an M-notarization or nullification
+        //
+        // The second condition ensures we cascade even if we've seen this nullification before,
+        // because we might have built on the now-invalid chain.
+        if nullification_view_number < current_view_number
+            && (should_broadcast_nullification || nullified_view_had_m_notarization)
+        {
             slog::warn!(
                 self.logger,
                 "Received nullification for past view {} while in view {}. Triggering cascade.",
