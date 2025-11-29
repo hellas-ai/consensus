@@ -1085,8 +1085,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         if has_nullification {
             // Check for cascading nullification
-            // If we just completed a nullification for a past view, we must nullify all subsequent views
-            // because their parent chain is now invalid.
+            // If we just completed a nullification for a past view, we must nullify all subsequent
+            // views because their parent chain is now invalid.
             if nullify_view_number < current_view_number {
                 slog::warn!(
                     self.logger,
@@ -1278,7 +1278,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         // Cascade nullification if:
         // 1. This is a past view (nullification_view_number < current_view_number)
-        // 2. And if this is new evidence OR the nullified view had an M-notarization or nullification
+        // 2. And if this is new evidence OR the nullified view had an M-notarization or
+        //    nullification
         //
         // The second condition ensures we cascade even if we've seen this nullification before,
         // because we might have built on the now-invalid chain.
