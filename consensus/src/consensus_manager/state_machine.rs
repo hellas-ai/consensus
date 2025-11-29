@@ -808,15 +808,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             view_ctx.create_nullify_for_byzantine(&self.secret_key)?
         } else {
             // NOTE: If the current replica attempts to nullify a message before voting, it could be
-            // timeout OR Byzantine We can't distinguish here, so we check if there's
-            // conflicting evidence
-            let conflicting_count = view_ctx.nullify_messages.len() + view_ctx.num_invalid_votes;
+            // timeout OR Byzantine. We distinguish based on the type of evidence:
+            let num_conflicting_votes = view_ctx.num_invalid_votes;
+            let num_nullify_messages = view_ctx.nullify_messages.len();
+            let combined_count = num_conflicting_votes + num_nullify_messages;
 
-            if conflicting_count > 2 * F {
-                // Byzantine behavior detected before voting
+            if num_conflicting_votes > F || combined_count > 2 * F {
+                // Byzantine behavior detected:
+                // - Conflicting votes > F means equivocation (can't finalize)
+                // - Combined evidence > 2F indicates Byzantine quorum
                 view_ctx.create_nullify_for_byzantine(&self.secret_key)?
             } else {
-                // Timeout
+                // Timeout (no strong evidence of Byzantine behavior)
                 view_ctx.create_nullify_for_timeout(&self.secret_key)?
             }
         };

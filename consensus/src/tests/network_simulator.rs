@@ -79,7 +79,8 @@ impl NetworkStats {
 /// 3. Tracks statistics about message routing
 pub struct LocalNetwork<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Map of replica_id -> message producer (for sending messages TO that replica)
-    message_producers: Arc<Mutex<HashMap<PeerId, Producer<ConsensusMessage<N, F, M_SIZE>>>>>,
+    pub(crate) message_producers:
+        Arc<Mutex<HashMap<PeerId, Producer<ConsensusMessage<N, F, M_SIZE>>>>>,
 
     /// Map of replica_id -> broadcast consumer (for receiving messages FROM that replica)
     broadcast_consumers: Arc<Mutex<HashMap<PeerId, Consumer<ConsensusMessage<N, F, M_SIZE>>>>>,
