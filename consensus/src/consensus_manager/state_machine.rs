@@ -519,6 +519,89 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             ViewProgressEvent::BroadcastConsensusMessage { message } => {
                 self.broadcast_consensus_message(*message)
             }
+            ViewProgressEvent::ShouldCascadeNullification {
+                start_view,
+                should_broadcast_nullification,
+            } => {
+                let current_view = self.view_manager.current_view_number();
+
+                slog::warn!(
+                    self.logger,
+                    "Cascading nullification from view {} through {} (inclusive)",
+                    start_view,
+                    current_view
+                );
+
+                // 1. Broadcast the nullification for the view that triggered the cascade (if needed)
+                if should_broadcast_nullification {
+                    if let Err(e) = self.broadcast_nullification(start_view) {
+                        slog::debug!(
+                            self.logger,
+                            "Failed to broadcast nullification for view {}: {}",
+                            start_view,
+                            e
+                        );
+                    }
+                }
+
+                // 2. Nullify all views from start_view to current_view
+                for view in (start_view + 1)..=current_view {
+                    if let Err(e) = self.nullify_view(view) {
+                        slog::debug!(
+                            self.logger,
+                            "View {} already nullified or error during cascade: {}",
+                            view,
+                            e
+                        );
+                    }
+                }
+
+                // 2. Progress to a new fresh view
+                let new_view = current_view + 1;
+
+                // 3. Find the most recent valid parent (skips all nullified views)
+                let parent_hash = self.view_manager.select_parent(new_view);
+                let leader = self.view_manager.leader_for_view(new_view)?;
+
+                slog::info!(
+                    self.logger,
+                    "After cascade: progressing to new view {} with parent {:?}",
+                    new_view,
+                    parent_hash
+                );
+
+                // 4. Progress to the new view
+                self.progress_to_next_view(new_view, leader, parent_hash)?;
+
+                Ok(())
+            }
+            ViewProgressEvent::ShouldNullifyRange { start_view } => {
+                let current_view = self.view_manager.current_view_number();
+
+                slog::warn!(
+                    self.logger,
+                    "Nullifying range from view {} through {} (inclusive)",
+                    start_view,
+                    current_view
+                );
+
+                // Send nullify messages for all views from start_view to current_view (INCLUSIVE)
+                // This marks them as has_nullified locally and broadcasts nullify votes,
+                // but does NOT progress to a new view - we must wait for a Nullification
+                // (aggregated proof with 2F+1 signatures) before we can safely progress.
+                for view in start_view..=current_view {
+                    if let Err(e) = self.nullify_view(view) {
+                        slog::debug!(
+                            self.logger,
+                            "View {} already nullified or error: {}",
+                            view,
+                            e
+                        );
+                    }
+                }
+
+                Ok(())
+            }
         }
     }
 

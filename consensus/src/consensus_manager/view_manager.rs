@@ -565,6 +565,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(vote)
     }
 
+    /// Selects the parent block for a new view according to the Minimmit SelectParent function.
+    ///
+    /// This implements the SelectParent(S, v) function from the Minimmit paper (Section 4):
+    /// "If v' < v is the greatest view such that S contains an M-notarization for some b
+    /// with b.view = v', and if b is the lexicographically least such block, the function
+    /// outputs b."
+    ///
+    /// # Arguments
+    /// * `view` - The view number for which we're selecting a parent
+    ///
+    /// # Returns
+    /// * The block hash to use as parent for the new view
+    ///
+    /// # Logic
+    /// 1. Search all non-finalized views < new_view in descending order
+    /// 2. Find the greatest view with an M-notarization that is not nullified
+    /// 3. Return that M-notarization's block_hash
+    /// 4. If no M-notarization found in non-finalized views, return previously_committed_block_hash
+    pub fn select_parent(&self, new_view: u64) -> [u8; blake3::OUT_LEN] {
+        self.view_chain.select_parent(new_view)
+    }
+
     /// Main driver of the state machine replication algorithm.
     ///
     /// Processes received `ConsensusMessage` and emits appropriate `ViewProgressEvent`s
@@ -980,6 +1002,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         if should_nullify {
+            // Check if this is a past view and if so, trigger should nullify range
+            if vote_view_number < current_view_number {
+                return Ok(ViewProgressEvent::ShouldNullifyRange {
+                    start_view: vote_view_number,
+                });
+            }
+
             return Ok(ViewProgressEvent::ShouldNullify {
                 view: vote_view_number,
             });
@@ -1069,6 +1098,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         let has_nullification = self.view_chain.route_nullify(nullify, &self.peers)?;
 
         if has_nullification {
+            // Check if this is a past view - if so, trigger should cascade nullification
+            if nullify_view_number < current_view_number {
+                return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                    start_view: nullify_view_number,
+                    should_broadcast_nullification: true, // We just created the nullification
+                });
+            }
             return Ok(ViewProgressEvent::ShouldBroadcastNullification {
                 view: nullify_view_number,
             });
@@ -1237,6 +1273,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         } = self
             .view_chain
             .route_nullification(nullification, &self.peers)?;
+
+        // Cascade if this is a past view AND (new evidence OR had M-notarization)
+        if nullification_view_number < current_view_number && should_broadcast_nullification {
+            slog::warn!(
+                self.logger,
+                "Received nullification for past view {} while in view {}. Triggering cascade.",
+                nullification_view_number,
+                current_view_number
+            );
+            return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                start_view: nullification_view_number,
+                should_broadcast_nullification,
+            });
+        }
 
         // Progress to next view with nullification
         if nullification_view_number == current_view_number {

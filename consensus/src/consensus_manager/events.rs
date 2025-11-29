@@ -173,4 +173,27 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         /// View number (for which the replica should nullify).
         view: u64,
     },
+
+    /// If the current replica should nullify a range of views starting from a past view.
+    /// This creates a cascading nullification effect to clean up invalid view forks.
+    /// The cascade nullifies from `start_view` up to and including `current_view`,
+    /// then progresses to a new fresh view with the most recent valid parent.
+    ShouldCascadeNullification {
+        /// The starting view that triggered the cascade (the view that was just nullified)
+        start_view: u64,
+        /// Whether the replica should broadcast the nullification for the start_view
+        should_broadcast_nullification: bool,
+    },
+
+    /// If the current replica should nullify a range of views because it detected
+    /// conflicting evidence for a past view. This sends nullify messages for all
+    /// views from `start_view` to `current_view` (inclusive) and progresses to a new view.
+    ///
+    /// This is different from `ShouldCascadeNullification` which is triggered by
+    /// receiving a Nullification (aggregated proof). This event is triggered by
+    /// local detection of conflicting evidence.
+    ShouldNullifyRange {
+        /// The starting view that triggered the nullification (where conflict was detected)
+        start_view: u64,
+    },
 }

@@ -1096,10 +1096,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let mut greatest_view_with_m_not: Option<(u64, [u8; blake3::OUT_LEN])> = None;
 
         for (view_num, ctx) in &self.non_finalized_views {
+            // Skip views that:
+            // 1. Have a full nullification quorum, OR
+            // 2. Have been locally marked for nullification (has_nullified = true)
+            if ctx.nullification.is_some() || ctx.has_nullified {
+                continue;
+            }
+
             if *view_num < new_view
                 && let Some(ref m_not) = ctx.m_notarization
             {
-                // Update if this is a greater view number than we've seen
                 match greatest_view_with_m_not {
                     None => {
                         greatest_view_with_m_not = Some((*view_num, m_not.block_hash));
