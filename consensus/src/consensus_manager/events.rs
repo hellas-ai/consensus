@@ -173,4 +173,13 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         /// View number (for which the replica should nullify).
         view: u64,
     },
+
+    /// If the current replica should nullify a range of views following a past view nullification.
+    /// This creates a cascading nullification effect to clean up invalid view forks.
+    ShouldCascadeNullification {
+        /// The starting view to nullify (the view that triggered the cascade)
+        start_view: u64,
+        /// The ending view to nullify (current_view)
+        end_view: u64,
+    },
 }

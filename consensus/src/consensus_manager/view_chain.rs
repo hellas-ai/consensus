@@ -220,15 +220,48 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             })?;
 
         // Check if this view already has a block
-        if ctx.block.is_some() {
+        if let Some(existing_block) = &ctx.block {
+            let existing_hash = existing_block.get_hash();
+            let new_hash = block.get_hash();
+
+            if existing_hash != new_hash {
+                // Equivocation detected: Leader proposed two different blocks for the same view.
+                // We must nullify this view immediately.
+                return Ok(LeaderProposalResult {
+                    block_hash: existing_hash,
+                    should_vote: false,
+                    is_enough_to_m_notarize: false,
+                    is_enough_to_finalize: false,
+                    should_await: false,
+                    should_nullify: true,
+                });
+            }
+
             return Err(anyhow::anyhow!(
-                "Block proposal for view {} already has a block from leader",
-                view_number
+                "Block proposal for view {} already has a block from leader with hash {}",
+                view_number,
+                hex::encode(existing_hash)
             ));
         }
 
         // Check if this view already has a pending block
-        if ctx.pending_block.is_some() {
+        if let Some(pending_block) = &ctx.pending_block {
+            let pending_hash = pending_block.get_hash();
+            let new_hash = block.get_hash();
+
+            if pending_hash != new_hash {
+                // Equivocation detected: Leader proposed two different blocks for the same view.
+                // We must nullify this view immediately.
+                return Ok(LeaderProposalResult {
+                    block_hash: pending_hash,
+                    should_vote: false,
+                    is_enough_to_m_notarize: false,
+                    is_enough_to_finalize: false,
+                    should_await: false,
+                    should_nullify: true,
+                });
+            }
+
             return Err(anyhow::anyhow!(
                 "Block proposal for view {} already has a pending block",
                 view_number
@@ -382,8 +415,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             if view_number != self.current_view {
                 ctx.has_view_progressed_without_m_notarization()?;
             }
+            let was_nullified = ctx.nullification.is_some();
             ctx.add_nullify(nullify, peers)?;
-            if ctx.nullification.is_some() {
+            let is_nullified = ctx.nullification.is_some();
+            if !was_nullified && is_nullified {
                 return Ok(true);
             }
             return Ok(false);

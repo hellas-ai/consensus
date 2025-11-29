@@ -206,6 +206,23 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> LocalNetwork<N, F, M_S
                 .unwrap_or(false)
     }
 
+    /// Injects a message directly to a specific replica
+    pub fn inject_message(
+        &self,
+        target: PeerId,
+        msg: ConsensusMessage<N, F, M_SIZE>,
+    ) -> Result<(), anyhow::Error> {
+        let mut producers = self.message_producers.lock().unwrap();
+        if let Some(producer) = producers.get_mut(&target) {
+            producer.push(msg).map_err(|e| {
+                anyhow::anyhow!("Failed to push message to replica {}: {}", target, e)
+            })?;
+            Ok(())
+        } else {
+            panic!("Replica {} not registered with network", target);
+        }
+    }
+
     /// Shuts down the network routing thread
     pub fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Relaxed);

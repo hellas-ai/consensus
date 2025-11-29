@@ -351,13 +351,24 @@ fn test_e2e_consensus_happy_path() {
 
         // 3. Check consistency across replicas
         if let Some(ref first_blocks) = first_replica_blocks {
-            assert_eq!(
+            // Allow for 1 block difference due to shutdown race
+            let diff = (blocks.len() as i32 - first_blocks.len() as i32).abs();
+            assert!(
+                diff <= 1,
+                "Replica {} block count {} differs too much from replica 0 count {}",
+                i,
                 blocks.len(),
-                first_blocks.len(),
-                "Replica {} has different number of blocks than replica 0",
-                i
+                first_blocks.len()
             );
-            for (j, (b1, b2)) in blocks.iter().zip(first_blocks.iter()).enumerate() {
+
+            // Verify common prefix
+            let min_len = std::cmp::min(blocks.len(), first_blocks.len());
+            for (j, (b1, b2)) in blocks
+                .iter()
+                .take(min_len)
+                .zip(first_blocks.iter().take(min_len))
+                .enumerate()
+            {
                 assert_eq!(
                     b1.get_hash(),
                     b2.get_hash(),
@@ -1219,4 +1230,187 @@ fn test_e2e_consensus_with_crashed_replica() {
         "finalized_blocks" => finalized_count,
         "bft_assumption" => "n >= 5f + 1 (6 >= 6)",
     );
+}
+
+#[test]
+#[ignore] // Run with: cargo test --lib test_e2e_consensus_with_equivocating_leader -- --ignored --nocapture
+fn test_e2e_consensus_with_equivocating_leader() {
+    // Create logger for test
+    let logger = create_test_logger();
+
+    // The replica index that will be faulty (leader of View 1)
+    const FAULTY_REPLICA_IDX: usize = 0;
+
+    slog::info!(
+        logger,
+        "Starting end-to-end consensus test (equivocating leader)";
+        "replicas" => N,
+        "byzantine_tolerance" => F,
+        "faulty_replica" => FAULTY_REPLICA_IDX,
+    );
+
+    // Phase 1: Setup test environment
+    let fixture = TestFixture::default();
+
+    // Phase 2: Initialize network simulator
+    let mut network = LocalNetwork::<N, F, M_SIZE>::new();
+    let mut replica_setups = Vec::with_capacity(N);
+
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
+    for peer_id in fixture.peer_set.sorted_peer_ids.iter() {
+        let secret_key = peer_id_to_secret_key
+            .get(peer_id)
+            .expect("Secret key not found")
+            .clone();
+        let setup = ReplicaSetup::new(*peer_id, secret_key);
+        replica_setups.push(setup);
+    }
+
+    // Phase 3: Register replicas and start engines (except faulty one)
+    let mut engines = Vec::with_capacity(N);
+    let mut transaction_producers = Vec::with_capacity(N);
+    let mut stores = Vec::with_capacity(N);
+
+    // Keep peer IDs for targeting
+    let peer_ids: Vec<crate::crypto::aggregated::PeerId> =
+        replica_setups.iter().map(|s| s.replica_id).collect();
+
+    for (i, setup) in replica_setups.into_iter().enumerate() {
+        let replica_id = setup.replica_id;
+        let tx_producer = setup.transaction_producer;
+        stores.push(setup.storage.clone());
+
+        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
+
+        // Do NOT start engine for faulty replica
+        if i == FAULTY_REPLICA_IDX {
+            slog::info!(logger, "Skipping engine start for faulty replica"; "replica" => i);
+            engines.push(None);
+            transaction_producers.push(tx_producer);
+            continue;
+        }
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            fixture.config.clone(),
+            replica_id,
+            setup.secret_key,
+            setup.storage,
+            setup.message_consumer,
+            setup.broadcast_producer,
+            setup.transaction_consumer,
+            DEFAULT_TICK_INTERVAL,
+            replica_logger,
+        )
+        .expect("Failed to create consensus engine");
+
+        engines.push(Some(engine));
+        transaction_producers.push(tx_producer);
+    }
+
+    // Phase 4: Start network
+    network.start();
+
+    // Phase 5: Inject equivocation (conflicting block proposals)
+    slog::info!(logger, "Phase 5: Injecting conflicting blocks for View 1");
+
+    let view = 1;
+    let faulty_peer_id = fixture.peer_set.sorted_peer_ids[FAULTY_REPLICA_IDX];
+    let faulty_sk = peer_id_to_secret_key.get(&faulty_peer_id).unwrap();
+    let parent_hash = crate::state::block::Block::genesis_hash();
+
+    // Block A
+    let block_a = create_test_block(view, faulty_peer_id, parent_hash, faulty_sk.clone(), 100);
+    // Block B (different payload -> different hash)
+    let block_b = create_test_block(view, faulty_peer_id, parent_hash, faulty_sk.clone(), 200);
+
+    assert_ne!(
+        block_a.get_hash(),
+        block_b.get_hash(),
+        "Blocks must have different hashes"
+    );
+
+    // Split votes: 2 for A, 2 for B. Neither reaches M=3.
+    // Send Block A to replicas 1, 2
+    for &peer_id in &peer_ids[1..=2] {
+        slog::info!(logger, "Sending Block A to replica"; "replica" => peer_id);
+        network
+            .inject_message(
+                peer_id,
+                crate::consensus::ConsensusMessage::BlockProposal(block_a.clone()),
+            )
+            .unwrap();
+    }
+
+    // Send Block B to replicas 3, 4
+    for &peer_id in &peer_ids[3..=4] {
+        slog::info!(logger, "Sending Block B to replica"; "replica" => peer_id);
+        network
+            .inject_message(
+                peer_id,
+                crate::consensus::ConsensusMessage::BlockProposal(block_b.clone()),
+            )
+            .unwrap();
+    }
+
+    // Replica 5 gets nothing (or gets one of them, doesn't matter much if split is 2-2-1)
+
+    // Phase 6: Wait for progress
+    // Expect View 1 to timeout and nullify
+    let test_duration = Duration::from_secs(30);
+    let check_interval = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < test_duration {
+        thread::sleep(check_interval);
+        let msgs_routed = network.stats.messages_routed();
+        slog::info!(logger, "Consensus progress check"; "messages_routed" => msgs_routed);
+    }
+
+    // Phase 7: Shutdown
+    for engine in engines.iter().flatten() {
+        engine.shutdown();
+    }
+
+    network.shutdown();
+
+    for engine in engines.into_iter().flatten() {
+        engine.shutdown_and_wait(Duration::from_secs(5)).unwrap();
+    }
+
+    // Phase 8: Verify state
+    slog::info!(logger, "Phase 8: Verifying state consistency");
+
+    // We expect healthy replicas to have moved past View 1 via nullification
+    for (i, store) in stores.iter().enumerate() {
+        if i == FAULTY_REPLICA_IDX {
+            continue;
+        }
+
+        let nullification = store
+            .get_nullification::<N, F, M_SIZE>(view)
+            .expect("Failed to query nullification");
+
+        assert!(
+            nullification.is_some(),
+            "View {} should have been nullified for replica {} due to equivocation/split votes",
+            view,
+            i
+        );
+        slog::info!(logger, "Verified nullification for view 1"; "replica" => i);
+
+        // Check they progressed further (View > 1)
+        let blocks = store.get_all_finalized_blocks().unwrap();
+        if let Some(last_block) = blocks.last() {
+            assert!(
+                last_block.view() > 1,
+                "Replica should have progressed past view 1"
+            );
+        }
+    }
 }

@@ -6,7 +6,7 @@ use crate::{
     consensus::ConsensusMessage,
     consensus_manager::{config::ConsensusConfig, leader_manager::LeaderSelectionStrategy},
     crypto::aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
-    state::{peer::PeerSet, transaction::Transaction},
+    state::{block::Block, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
 };
 use ark_serialize::CanonicalSerialize;
@@ -249,4 +249,39 @@ pub fn create_test_transactions(keypairs: &[KeyPair], count: usize) -> Vec<Trans
         ));
     }
     transactions
+}
+
+/// Creates a test block with valid signature
+pub fn create_test_block(
+    view: u64,
+    leader: PeerId,
+    parent_hash: [u8; blake3::OUT_LEN],
+    secret_key: BlsSecretKey,
+    nonce: u64,
+) -> Block {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Create dummy signature for initial block creation
+    let dummy_signature = secret_key.sign(&[0u8; 32]);
+
+    let mut block = Block::new(
+        view,
+        leader,
+        parent_hash,
+        vec![],            // No transactions for simple block test
+        timestamp + nonce, // Ensure uniqueness with nonce
+        dummy_signature,
+        false,
+        view,
+    );
+
+    // Sign the block hash properly
+    let block_hash = block.get_hash();
+    let signature = secret_key.sign(&block_hash);
+    block.leader_signature = signature;
+
+    block
 }

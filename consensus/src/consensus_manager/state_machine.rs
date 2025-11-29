@@ -519,6 +519,35 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             ViewProgressEvent::BroadcastConsensusMessage { message } => {
                 self.broadcast_consensus_message(*message)
             }
+            ViewProgressEvent::ShouldCascadeNullification {
+                start_view,
+                end_view,
+            } => {
+                slog::warn!(
+                    self.logger,
+                    "Cascading nullification from view {start_view} to {end_view}"
+                );
+
+                // Cascade nullify all views in the range [start_view, end_view].
+                // This will:
+                // 1. Create/Broadcast a Nullify message for the start_view (if we haven't already).
+                // 2. Create/Broadcast Nullify messages for all subsequent views (invalidating the chain).
+                // nullify_view() handles the "already nullified" check internally, so this is safe.
+                for view in start_view..=end_view {
+                    // We ignore errors on individual views to ensure we try to clean up the whole chain.
+                    // (e.g., if one view is already finalized or in a weird state, we still want to nullify the rest)
+                    if let Err(e) = self.nullify_view(view) {
+                        slog::debug!(
+                            self.logger,
+                            "Error nullifying view {} during cascade: {}",
+                            view,
+                            e
+                        );
+                    }
+                }
+
+                Ok(())
+            }
         }
     }
 

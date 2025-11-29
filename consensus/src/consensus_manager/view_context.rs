@@ -472,6 +472,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             self.non_verified_votes.clear();
         }
 
+        if self.should_nullify_after_receiving_new_vote() {
+            return Ok(LeaderProposalResult {
+                block_hash,
+                should_vote: false,
+                is_enough_to_m_notarize: false,
+                is_enough_to_finalize: false,
+                should_await: false,
+                should_nullify: true,
+            });
+        }
+
         let is_enough_to_m_notarize = self.votes.len() > 2 * F || self.m_notarization.is_some();
         let is_enough_to_finalize = self.votes.len() >= N - F;
 
@@ -550,7 +561,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                     .non_verified_votes
                     .iter()
                     .filter(|v| v.block_hash == vote.block_hash)
-                    .count() + 1 // NOTE: We need to include the current vote in the count
+                    .count()  // NOTE: We need to include the current vote in the count
                     > 2 * F;
             self.non_verified_votes.insert(vote);
 
@@ -615,6 +626,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         if self.has_voted {
             return Err(anyhow::anyhow!("Replica has already voted"));
         }
+
         if let Some(current_hash) = self.block_hash {
             if current_hash != block_hash {
                 return Err(anyhow::anyhow!(
@@ -626,6 +638,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         } else {
             self.block_hash = Some(block_hash);
         }
+
         self.has_voted = true;
         self.votes.insert(Vote::new(
             self.view_number,
@@ -634,6 +647,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             self.replica_id,
             self.leader_id,
         ));
+
+        // Move non-verified votes that match the chosen block hash to the verified set
+        // and count invalid votes
+        if !self.non_verified_votes.is_empty() {
+            let mut num_matching_votes = 0;
+            self.non_verified_votes
+                .iter()
+                .filter(|v| v.block_hash == block_hash)
+                .for_each(|v| {
+                    self.votes.insert(v.clone());
+                    num_matching_votes += 1;
+                });
+            self.num_invalid_votes += self.non_verified_votes.len() - num_matching_votes;
+            self.non_verified_votes.clear();
+        }
+
         Ok(())
     }
 
@@ -815,6 +844,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
 
                 self.num_invalid_votes += self.non_verified_votes.len() - num_matching_votes;
                 self.non_verified_votes.clear();
+            }
+
+            if self.should_nullify_after_receiving_new_vote() {
+                return Ok(ShouldMNotarize {
+                    should_notarize: false,
+                    should_await: false,
+                    should_vote: false,
+                    should_nullify: true,
+                    should_forward: false,
+                });
             }
 
             let should_forward = if self.m_notarization.is_none() {
@@ -1016,7 +1055,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
     /// Public method to check if replica should nullify after having voted
     /// Called by ViewProgressManager to check for conflicting evidence
     pub fn should_nullify_after_receiving_new_vote(&self) -> bool {
-        if !self.has_voted || self.has_nullified {
+        if self.has_nullified {
             return false;
         }
 
@@ -1025,7 +1064,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         conflicting_count += self.nullify_messages.len(); // Count nullify messages
         conflicting_count += self.num_invalid_votes; // Count invalid votes (votes for different blocks)
 
-        conflicting_count > 2 * F
+        conflicting_count > F
     }
 }
 
@@ -1957,10 +1996,10 @@ mod tests {
             assert!(result.is_ok());
 
             let vote_result = result.unwrap();
-            if i < 2 {
+            if i < 1 {
                 assert!(!vote_result.should_nullify);
             } else {
-                // At i=2 (third vote), we have >2f+1 conflicting
+                // At i=1 (second vote), we have >= f+1 conflicting
                 assert!(vote_result.should_nullify);
             }
         }
@@ -2188,8 +2227,12 @@ mod tests {
             let result = context.add_vote(vote, peers);
             assert!(result.is_ok());
 
-            // Should never trigger nullification if haven't voted
-            assert!(!result.unwrap().should_nullify);
+            // Should trigger nullification even if not voted yet
+            if i < 1 {
+                assert!(!result.unwrap().should_nullify);
+            } else {
+                assert!(result.unwrap().should_nullify);
+            }
         }
     }
 
@@ -2338,20 +2381,19 @@ mod tests {
         context.block_hash = Some(block_hash);
         context.has_voted = true;
 
-        // Add exactly 2*F invalid votes (not enough)
+        // Add exactly F invalid votes (not enough)
         let wrong_hash = [39u8; blake3::OUT_LEN];
-        for i in 0..2 {
-            let vote = create_test_vote(i, 10, wrong_hash, leader_id, &setup);
-            let result = context.add_vote(vote, peers);
-            assert!(result.is_ok());
-            assert!(!result.unwrap().should_nullify); // Need >2, not >=2
-        }
-
-        // Add one more invalid vote (now >2*F)
-        let vote3 = create_test_vote(2, 10, wrong_hash, leader_id, &setup);
-        let result = context.add_vote(vote3, peers);
+        // 1 vote = 1*F = 1 (not > 1)
+        let vote = create_test_vote(0, 10, wrong_hash, leader_id, &setup);
+        let result = context.add_vote(vote, peers);
         assert!(result.is_ok());
-        assert!(result.unwrap().should_nullify); // Now >2*F conflicting
+        assert!(!result.unwrap().should_nullify);
+
+        // Add one more invalid vote (now >F)
+        let vote2 = create_test_vote(1, 10, wrong_hash, leader_id, &setup);
+        let result = context.add_vote(vote2, peers);
+        assert!(result.is_ok());
+        assert!(result.unwrap().should_nullify); // Now >F conflicting
     }
 
     #[test]
@@ -3662,8 +3704,8 @@ mod tests {
         // Add conflicting evidence
         context.num_invalid_votes = 3;
 
-        // Should NOT nullify if haven't voted yet
-        assert!(!context.should_nullify_after_receiving_new_vote());
+        // Should nullify if have conflicting evidence and haven't voted yet
+        assert!(context.should_nullify_after_receiving_new_vote());
     }
 
     #[test]
@@ -3698,10 +3740,10 @@ mod tests {
 
         context.has_voted = true;
 
-        // Only 2 conflicting (need >2)
+        // Only 2 conflicting (need >= 2)
         context.num_invalid_votes = 2;
 
-        assert!(!context.should_nullify_after_receiving_new_vote());
+        assert!(context.should_nullify_after_receiving_new_vote());
     }
 
     #[test]

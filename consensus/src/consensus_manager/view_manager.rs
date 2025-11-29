@@ -608,7 +608,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 continue;
             }
 
-            if view_ctx.should_timeout_nullify(self.config.view_timeout) {
+            if view_ctx.should_timeout_nullify(self.config.view_timeout)
+                || view_ctx.should_nullify_after_receiving_new_vote()
+            {
                 return Ok(ViewProgressEvent::ShouldNullify {
                     view: view_ctx.view_number,
                 });
@@ -1069,6 +1071,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         let has_nullification = self.view_chain.route_nullify(nullify, &self.peers)?;
 
         if has_nullification {
+            // Check for cascading nullification
+            // If we just completed a nullification for a past view, we must nullify all subsequent views
+            // because their parent chain is now invalid.
+            if nullify_view_number < current_view_number {
+                slog::warn!(
+                    self.logger,
+                    "Past view {} nullified while in view {}. Triggering cascade.",
+                    nullify_view_number,
+                    current_view_number
+                );
+                return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                    start_view: nullify_view_number,
+                    end_view: current_view_number,
+                });
+            }
+
             return Ok(ViewProgressEvent::ShouldBroadcastNullification {
                 view: nullify_view_number,
             });
@@ -1237,6 +1255,23 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         } = self
             .view_chain
             .route_nullification(nullification, &self.peers)?;
+
+        // Check for cascading nullification
+        // If we receive a nullification for a past view, we must nullify all subsequent views.
+        // We only trigger cascade if should_broadcast_nullification is true, which indicates
+        // that this is NEW evidence (we haven't seen this nullification before).
+        if should_broadcast_nullification && (nullification_view_number < current_view_number) {
+            slog::warn!(
+                self.logger,
+                "Received nullification for past view {} while in view {}. Triggering cascade.",
+                nullification_view_number,
+                current_view_number
+            );
+            return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                start_view: nullification_view_number,
+                end_view: current_view_number,
+            });
+        }
 
         // Progress to next view with nullification
         if nullification_view_number == current_view_number {
@@ -4268,11 +4303,12 @@ mod tests {
         assert!(result.is_ok());
 
         match result.unwrap() {
-            ViewProgressEvent::ShouldBroadcastNullification { view } => {
-                assert_eq!(view, 1);
-            }
-            ViewProgressEvent::ShouldNullify { view } => {
-                assert_eq!(view, 1);
+            ViewProgressEvent::ShouldCascadeNullification {
+                start_view,
+                end_view,
+            } => {
+                assert_eq!(start_view, 1);
+                assert_eq!(end_view, 2);
             }
             other => panic!(
                 "Expected ShouldBroadcastNullification or ShouldNullify, got {:?}",
@@ -5718,8 +5754,17 @@ mod tests {
 
         // For past view duplicate, should return NoOp or ShouldNullify (without broadcast)
         match result.unwrap() {
-            ViewProgressEvent::NoOp | ViewProgressEvent::ShouldNullify { .. } => {}
-            other => panic!("Expected NoOp/ShouldNullify for duplicate, got {:?}", other),
+            ViewProgressEvent::ShouldCascadeNullification {
+                start_view,
+                end_view,
+            } => {
+                assert_eq!(start_view, 1);
+                assert_eq!(end_view, 2);
+            }
+            other => panic!(
+                "Expected NoOp/ShouldNullify/ShouldCascadeNullification for duplicate, got {:?}",
+                other
+            ),
         }
 
         std::fs::remove_file(path).unwrap();
