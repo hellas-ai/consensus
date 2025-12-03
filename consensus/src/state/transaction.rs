@@ -224,7 +224,7 @@ mod tests {
     use crate::storage::conversions::serialize_for_db;
 
     fn gen_keypair() -> (TxSecretKey, TxPublicKey) {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         (sk, pk)
     }
@@ -262,6 +262,7 @@ mod tests {
     #[test]
     fn equality_is_by_tx_hash_only() {
         let (sk, pk) = gen_keypair();
+        let fixed_timestamp = 1000000u64;
 
         let a = Transaction::new_transfer(
             Address::from_public_key(&pk),
@@ -272,14 +273,15 @@ mod tests {
             &sk,
         );
 
-        let b = Transaction::new_transfer(
-            Address::from_public_key(&pk),
-            Address::from_public_key(&pk),
-            100,
-            1,
-            1,
-            &sk,
-        );
+        let mut b = a.clone();
+
+        b.timestamp = fixed_timestamp;
+        b.fee = 2;
+        b.nonce = 0;
+        b.instruction = TransactionInstruction::Mint {
+            recipient: Address::from_public_key(&pk),
+            amount: 5_000,
+        };
 
         assert_eq!(a, b);
     }
@@ -312,5 +314,266 @@ mod tests {
 
         // Signature was created over the original tx_hash, so verify is expected to be false now
         assert!(!restored.verify());
+    }
+
+    #[test]
+    fn new_mint_creates_valid_transaction() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([5u8; 32]);
+
+        let tx = Transaction::new_mint(sender, recipient, 1000, 0, &sk);
+
+        assert!(tx.verify());
+        assert_eq!(tx.amount(), 1000);
+        assert_eq!(tx.recipient(), Some(recipient));
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.fee, 0); // Mint is free for testnet
+        assert_eq!(tx.sender, sender);
+    }
+
+    #[test]
+    fn new_create_account_creates_valid_transaction() {
+        let (sk, pk) = gen_keypair();
+        let address = Address::from_public_key(&pk);
+
+        let tx = Transaction::new_create_account(address, 0, 100, &sk);
+
+        assert!(tx.verify());
+        assert_eq!(tx.amount(), 0); // CreateAccount has no amount
+        assert_eq!(tx.recipient(), Some(address));
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.fee, 100);
+    }
+
+    #[test]
+    fn transfer_instruction_fields() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([9u8; 32]);
+
+        let tx = Transaction::new_transfer(sender, recipient, 500, 42, 10, &sk);
+
+        assert_eq!(tx.amount(), 500);
+        assert_eq!(tx.recipient(), Some(recipient));
+        assert_eq!(tx.nonce, 42);
+        assert_eq!(tx.fee, 10);
+        assert_eq!(tx.sender, sender);
+
+        match &tx.instruction {
+            TransactionInstruction::Transfer {
+                recipient: r,
+                amount: a,
+            } => {
+                assert_eq!(*r, recipient);
+                assert_eq!(*a, 500);
+            }
+            _ => panic!("Expected Transfer instruction"),
+        }
+    }
+
+    #[test]
+    fn mint_instruction_fields() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([7u8; 32]);
+
+        let tx = Transaction::new_mint(sender, recipient, 9999, 5, &sk);
+
+        match &tx.instruction {
+            TransactionInstruction::Mint {
+                recipient: r,
+                amount: a,
+            } => {
+                assert_eq!(*r, recipient);
+                assert_eq!(*a, 9999);
+            }
+            _ => panic!("Expected Mint instruction"),
+        }
+    }
+
+    #[test]
+    fn create_account_instruction_fields() {
+        let (sk, pk) = gen_keypair();
+        let address = Address::from_public_key(&pk);
+
+        let tx = Transaction::new_create_account(address, 1, 50, &sk);
+
+        match &tx.instruction {
+            TransactionInstruction::CreateAccount { address: a } => {
+                assert_eq!(*a, address);
+            }
+            _ => panic!("Expected CreateAccount instruction"),
+        }
+    }
+
+    #[test]
+    fn different_instructions_produce_different_hashes() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([3u8; 32]);
+
+        // Create transactions with same parameters but different instructions
+        let transfer = Transaction::new_transfer(sender, recipient, 100, 0, 10, &sk);
+        let mint = Transaction::new_mint(sender, recipient, 100, 0, &sk);
+
+        // They should have different hashes (different instruction discriminant)
+        assert_ne!(transfer.tx_hash, mint.tx_hash);
+    }
+
+    #[test]
+    fn same_content_produces_same_hash() {
+        let (_sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([4u8; 32]);
+
+        // Compute hash manually
+        let instruction = TransactionInstruction::Transfer {
+            recipient,
+            amount: 100,
+        };
+        let nonce = 5u64;
+        let timestamp = 123456789u64;
+        let fee = 10u64;
+
+        let hash1 = Transaction::compute_hash(&sender, &instruction, nonce, timestamp, fee);
+        let hash2 = Transaction::compute_hash(&sender, &instruction, nonce, timestamp, fee);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn different_nonce_produces_different_hash() {
+        let sender = Address::from_bytes([1u8; 32]);
+        let recipient = Address::from_bytes([2u8; 32]);
+        let instruction = TransactionInstruction::Transfer {
+            recipient,
+            amount: 100,
+        };
+
+        let hash1 = Transaction::compute_hash(&sender, &instruction, 0, 1000, 10);
+        let hash2 = Transaction::compute_hash(&sender, &instruction, 1, 1000, 10);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn different_fee_produces_different_hash() {
+        let sender = Address::from_bytes([1u8; 32]);
+        let recipient = Address::from_bytes([2u8; 32]);
+        let instruction = TransactionInstruction::Transfer {
+            recipient,
+            amount: 100,
+        };
+
+        let hash1 = Transaction::compute_hash(&sender, &instruction, 0, 1000, 10);
+        let hash2 = Transaction::compute_hash(&sender, &instruction, 0, 1000, 20);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn different_amount_produces_different_hash() {
+        let sender = Address::from_bytes([1u8; 32]);
+        let recipient = Address::from_bytes([2u8; 32]);
+
+        let instruction1 = TransactionInstruction::Transfer {
+            recipient,
+            amount: 100,
+        };
+        let instruction2 = TransactionInstruction::Transfer {
+            recipient,
+            amount: 200,
+        };
+
+        let hash1 = Transaction::compute_hash(&sender, &instruction1, 0, 1000, 10);
+        let hash2 = Transaction::compute_hash(&sender, &instruction2, 0, 1000, 10);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn different_recipient_produces_different_hash() {
+        let sender = Address::from_bytes([1u8; 32]);
+        let recipient1 = Address::from_bytes([2u8; 32]);
+        let recipient2 = Address::from_bytes([3u8; 32]);
+
+        let instruction1 = TransactionInstruction::Transfer {
+            recipient: recipient1,
+            amount: 100,
+        };
+        let instruction2 = TransactionInstruction::Transfer {
+            recipient: recipient2,
+            amount: 100,
+        };
+
+        let hash1 = Transaction::compute_hash(&sender, &instruction1, 0, 1000, 10);
+        let hash2 = Transaction::compute_hash(&sender, &instruction2, 0, 1000, 10);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn verify_fails_with_wrong_sender_address() {
+        let (sk, _pk) = gen_keypair();
+        let (_sk2, pk2) = gen_keypair();
+
+        // Create transaction with pk2's address but sign with sk (pk's key)
+        // This simulates someone trying to spend from another account
+        let wrong_sender = Address::from_public_key(&pk2);
+        let recipient = Address::from_bytes([5u8; 32]);
+
+        let tx = Transaction::new_transfer(wrong_sender, recipient, 100, 0, 10, &sk);
+
+        // Verification should fail because sender address doesn't match signing key
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn tx_hash_is_32_bytes() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([1u8; 32]);
+
+        let tx = Transaction::new_transfer(sender, recipient, 100, 0, 10, &sk);
+
+        assert_eq!(tx.tx_hash.len(), 32);
+    }
+
+    #[test]
+    fn zero_amount_transfer_is_valid() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([1u8; 32]);
+
+        let tx = Transaction::new_transfer(sender, recipient, 0, 0, 10, &sk);
+
+        assert!(tx.verify());
+        assert_eq!(tx.amount(), 0);
+    }
+
+    #[test]
+    fn max_amount_transfer_is_valid() {
+        let (sk, pk) = gen_keypair();
+        let sender = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([1u8; 32]);
+
+        let tx = Transaction::new_transfer(sender, recipient, u64::MAX, 0, 10, &sk);
+
+        assert!(tx.verify());
+        assert_eq!(tx.amount(), u64::MAX);
+    }
+
+    #[test]
+    fn self_transfer_is_valid() {
+        let (sk, pk) = gen_keypair();
+        let address = Address::from_public_key(&pk);
+
+        // Transfer to self
+        let tx = Transaction::new_transfer(address, address, 100, 0, 10, &sk);
+
+        assert!(tx.verify());
+        assert_eq!(tx.recipient(), Some(address));
+        assert_eq!(tx.sender, address);
     }
 }

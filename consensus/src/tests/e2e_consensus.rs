@@ -924,8 +924,6 @@ fn test_e2e_consensus_with_crashed_replica() {
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
 
-    let transactions = create_test_transactions(num_transactions);
-
     for (i, tx) in transactions.into_iter().enumerate() {
         // Distribute transactions across healthy replicas only (skip crashed one)
         let mut replica_idx = i % N;
@@ -1393,7 +1391,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
     // Create two different transactions to make the blocks different
     let tx1 = {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         Transaction::new_transfer(
             Address::from_public_key(&pk),
@@ -1406,7 +1404,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
     };
 
     let tx2 = {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         Transaction::new_transfer(
             Address::from_public_key(&pk),
@@ -2116,7 +2114,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
                 // Create two different transactions
                 let tx1 = {
-                    let sk = TxSecretKey::generate();
+                    let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
                     let pk = sk.public_key();
                     Transaction::new_transfer(
                         Address::from_public_key(&pk),
@@ -2129,7 +2127,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
                 };
 
                 let tx2 = {
-                    let sk = TxSecretKey::generate();
+                    let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
                     let pk = sk.public_key();
                     Transaction::new_transfer(
                         Address::from_public_key(&pk),

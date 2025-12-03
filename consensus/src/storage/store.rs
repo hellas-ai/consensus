@@ -375,7 +375,7 @@ mod tests {
     }
 
     fn gen_keypair() -> (TxSecretKey, TxPublicKey) {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         (sk, pk)
     }

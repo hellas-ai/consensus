@@ -1221,7 +1221,7 @@ mod tests {
 
     /// Creates a test transaction
     fn gen_tx() -> Transaction {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         Transaction::new_transfer(
             Address::from_public_key(&pk),

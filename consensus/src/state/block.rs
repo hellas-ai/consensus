@@ -198,7 +198,7 @@ mod tests {
 
     fn gen_tx() -> Transaction {
         let (sk, pk) = {
-            let sk = TxSecretKey::generate();
+            let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
             let pk = sk.public_key();
             (sk, pk)
         };

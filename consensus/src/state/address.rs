@@ -30,11 +30,19 @@ impl Address {
         &self.0
     }
 
-    /// Converts back to public key (for Ed25519, address = pubkey)
-    pub fn to_public_key(
-        &self,
-    ) -> Result<TxPublicKey, crate::crypto::transaction_crypto::SignatureError> {
-        TxPublicKey::from_bytes(&self.0)
+    /// Checks if this address corresponds to a valid Ed25519 public key
+    /// (i.e., the bytes represent a point on the curve)
+    pub fn is_valid_public_key(&self) -> bool {
+        TxPublicKey::from_bytes(&self.0).is_ok()
+    }
+
+    /// Converts to public key, returning None if invalid
+    ///
+    /// NOTE: Not all addresses are valid public keys. Addresses created via
+    /// `from_bytes()` with arbitrary data may not be on the Ed25519 curve
+    /// and cannot be converted back to a public key.
+    pub fn to_public_key(&self) -> Option<TxPublicKey> {
+        TxPublicKey::from_bytes(&self.0).ok()
     }
 }
 

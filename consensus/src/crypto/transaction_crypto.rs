@@ -7,6 +7,7 @@ use ed25519_dalek::{
     PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH, Signature, Signer, SigningKey,
     Verifier, VerifyingKey,
 };
+use rand::{CryptoRng, RngCore};
 use rkyv::{Archive, Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,10 +26,9 @@ pub struct TxSecretKey(pub SigningKey);
 pub struct TxSignature(pub Signature);
 
 impl TxSecretKey {
-    /// Generate a new random secret key
-    pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let signing_key = SigningKey::generate(&mut rng);
+    /// Generate a new random secret key using the provided RNG
+    pub fn generate<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
+        let signing_key = SigningKey::generate(rng);
         Self(signing_key)
     }
 
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify() {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
 
         let message = b"hello world";
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn roundtrip_bytes() {
-        let sk = TxSecretKey::generate();
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         let sig = sk.sign(b"test");
 
