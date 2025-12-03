@@ -2089,7 +2089,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
             // Only inject if we haven't already injected for this view
             // and the network is close to this view (within 3 views)
-            let should_inject = last_injected_view.map_or(true, |last| next_byzantine_view > last)
+            let should_inject = last_injected_view.is_none_or(|last| next_byzantine_view > last)
                 && next_byzantine_view <= current_tip_view + 3;
 
             if should_inject {
