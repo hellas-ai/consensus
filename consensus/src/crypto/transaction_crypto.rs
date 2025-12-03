@@ -10,6 +10,7 @@ use ed25519_dalek::{
 use rand::{CryptoRng, RngCore};
 use rkyv::{Archive, Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::ZeroizeOnDrop;
 
 type Result<T> = std::result::Result<T, SignatureError>;
 
@@ -18,7 +19,7 @@ type Result<T> = std::result::Result<T, SignatureError>;
 pub struct TxPublicKey(pub VerifyingKey);
 
 /// A 32-byte Ed25519 secret key for transaction signing
-#[derive(Clone)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct TxSecretKey(pub SigningKey);
 
 /// A 64-byte Ed25519 signature
