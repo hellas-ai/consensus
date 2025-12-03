@@ -1,5 +1,5 @@
-use crate::crypto::aggregated::BlsPublicKey;
-use crate::crypto::conversions::ArkSerdeWrapper;
+use crate::crypto::transaction_crypto::SerializableTxPublicKey;
+use crate::crypto::transaction_crypto::TxPublicKey;
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// [`Account`] represents an account in the consensus protocol.
@@ -10,8 +10,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[derive(Archive, Deserialize, Serialize, Clone, Debug)]
 pub struct Account {
     /// The account's public key
-    #[rkyv(with = ArkSerdeWrapper)]
-    pub public_key: BlsPublicKey,
+    pub public_key: SerializableTxPublicKey,
     /// The account's balance
     pub balance: u64,
     /// The account's current nonce
@@ -19,9 +18,9 @@ pub struct Account {
 }
 
 impl Account {
-    pub fn new(public_key: BlsPublicKey, balance: u64, nonce: u64) -> Self {
+    pub fn new(public_key: TxPublicKey, balance: u64, nonce: u64) -> Self {
         Self {
-            public_key,
+            public_key: SerializableTxPublicKey::from(&public_key),
             balance,
             nonce,
         }
@@ -30,7 +29,7 @@ impl Account {
 
 impl PartialEq for Account {
     fn eq(&self, other: &Self) -> bool {
-        self.public_key.0 == other.public_key.0
+        self.public_key.bytes == other.public_key.bytes
     }
 }
 

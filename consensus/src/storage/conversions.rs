@@ -180,7 +180,10 @@ impl Storable for Account {
 
     fn key(&self) -> Self::Key {
         let mut writer = Vec::new();
-        self.public_key.serialize_compressed(&mut writer).unwrap();
+        self.public_key
+            .bytes
+            .serialize_compressed(&mut writer)
+            .unwrap();
         writer
     }
 

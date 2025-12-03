@@ -1048,8 +1048,8 @@ mod tests {
             leader_manager::{LeaderSelectionStrategy, RoundRobinLeaderManager},
             view_manager::ViewProgressManager,
         },
-        crypto::aggregated::BlsSecretKey,
-        state::{peer::PeerSet, transaction::Transaction},
+        crypto::{aggregated::BlsSecretKey, transaction_crypto::TxSecretKey},
+        state::{address::Address, peer::PeerSet, transaction::Transaction},
         storage::store::ConsensusStore,
     };
     use ark_serialize::CanonicalSerialize;
@@ -1099,14 +1099,16 @@ mod tests {
     }
 
     fn create_test_transaction(nonce: u64) -> Transaction {
-        let mut rng = thread_rng();
-        let sk = BlsSecretKey::generate(&mut rng);
+        let sk = TxSecretKey::generate();
         let pk = sk.public_key();
-        let mut tx_data = Vec::new();
-        tx_data.extend_from_slice(&nonce.to_le_bytes());
-        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(&tx_data).into();
-        let sig = sk.sign(&tx_hash);
-        Transaction::new(pk, [7u8; 32], 42, nonce, 1_000, 3, tx_hash, sig)
+        Transaction::new_transfer(
+            Address::from_public_key(&pk),
+            Address::from_bytes([7u8; 32]),
+            42,
+            nonce,
+            1_000,
+            &sk,
+        )
     }
 
     fn create_test_config(n: usize, f: usize, peer_strs: Vec<String>) -> ConsensusConfig {

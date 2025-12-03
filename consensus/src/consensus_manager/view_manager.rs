@@ -1370,8 +1370,9 @@ mod tests {
             leader_manager::{LeaderSelectionStrategy, RoundRobinLeaderManager},
             utils::{create_notarization_data, create_nullification_data},
         },
-        crypto::aggregated::BlsSecretKey,
+        crypto::{aggregated::BlsSecretKey, transaction_crypto::TxSecretKey},
         state::{
+            address::Address,
             block::Block,
             notarizations::{MNotarization, Vote},
             nullify::{Nullification, Nullify},
@@ -1414,12 +1415,16 @@ mod tests {
 
     /// Creates a test transaction
     fn create_test_transaction() -> Transaction {
-        let mut rng = thread_rng();
-        let sk = BlsSecretKey::generate(&mut rng);
+        let sk = TxSecretKey::generate();
         let pk = sk.public_key();
-        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(b"test tx").into();
-        let sig = sk.sign(&tx_hash);
-        Transaction::new(pk, [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig)
+        Transaction::new_transfer(
+            Address::from_public_key(&pk),
+            Address::from_bytes([7u8; 32]),
+            42,
+            9,
+            1_000,
+            &sk,
+        )
     }
 
     /// Creates a test block
