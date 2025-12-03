@@ -1888,3 +1888,621 @@ fn test_e2e_consensus_with_equivocating_leader() {
         "equivocation_handled" => "Protocol correctly recovered from Byzantine equivocation",
     );
 }
+
+#[test]
+#[ignore] // Run with: cargo test --lib test_e2e_consensus_with_persistent_equivocating_leader -- --ignored --nocapture
+fn test_e2e_consensus_with_persistent_equivocating_leader() {
+    // Create logger for test
+    let logger = create_test_logger();
+
+    // The replica index that will act as a persistent Byzantine equivocating leader
+    // Replica 1 is the leader for views 1, 7, 13, 19, ... (round-robin: view % N == 1)
+    const BYZANTINE_LEADER_IDX: usize = 1;
+
+    slog::info!(
+        logger,
+        "Starting end-to-end consensus test (persistent equivocating leader)";
+        "replicas" => N,
+        "byzantine_tolerance" => F,
+        "byzantine_leader" => BYZANTINE_LEADER_IDX,
+        "byzantine_views" => "1, 7, 13, 19, ... (view % 6 == 1)",
+    );
+
+    // Phase 1: Setup test environment
+    slog::info!(logger, "Phase 1: Creating test fixture");
+    let fixture = TestFixture::default();
+
+    slog::info!(
+        logger,
+        "Generated keypairs and peer set";
+        "total_replicas" => N,
+        "peer_ids" => ?fixture.peer_set.sorted_peer_ids,
+    );
+
+    // Phase 2: Initialize network simulator
+    slog::info!(logger, "Phase 2: Setting up network simulator");
+    let mut network = LocalNetwork::<N, F, M_SIZE>::new();
+    let mut replica_setups = Vec::with_capacity(N);
+
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
+    for (i, &peer_id) in fixture.peer_set.sorted_peer_ids.iter().enumerate() {
+        let secret_key = peer_id_to_secret_key
+            .get(&peer_id)
+            .expect("Secret key not found")
+            .clone();
+        let setup = ReplicaSetup::new(peer_id, secret_key);
+
+        slog::debug!(
+            logger,
+            "Created replica setup";
+            "replica_index" => i,
+            "peer_id" => peer_id,
+        );
+
+        replica_setups.push(setup);
+    }
+
+    // Phase 3: Register replicas and start engines
+    slog::info!(
+        logger,
+        "Phase 3: Registering replicas and starting consensus engines (excluding Byzantine leader)"
+    );
+    let mut engines = Vec::with_capacity(N);
+    let mut transaction_producers = Vec::with_capacity(N);
+    let mut stores = Vec::with_capacity(N);
+
+    // Store the Byzantine leader's secret key for signing blocks
+    let mut byzantine_leader_secret_key: Option<crate::crypto::aggregated::BlsSecretKey> = None;
+    let mut byzantine_leader_peer_id: Option<u64> = None;
+
+    for (i, setup) in replica_setups.into_iter().enumerate() {
+        let replica_id = setup.replica_id;
+
+        // Keep a clone of the storage for verification
+        stores.push(setup.storage.clone());
+
+        if i == BYZANTINE_LEADER_IDX {
+            byzantine_leader_peer_id = Some(replica_id);
+            byzantine_leader_secret_key = Some(setup.secret_key.clone());
+
+            network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+            engines.push(None);
+            transaction_producers.push(None);
+
+            slog::info!(
+                logger,
+                "Byzantine leader registered (engine NOT started)";
+                "replica" => i,
+                "peer_id" => replica_id,
+            );
+            continue;
+        }
+
+        let tx_producer = setup.transaction_producer;
+
+        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            fixture.config.clone(),
+            replica_id,
+            setup.secret_key,
+            setup.storage,
+            setup.message_consumer,
+            setup.broadcast_producer,
+            setup.transaction_consumer,
+            DEFAULT_TICK_INTERVAL,
+            replica_logger,
+        )
+        .expect("Failed to create consensus engine");
+
+        slog::debug!(
+            logger,
+            "Consensus engine started";
+            "replica" => i,
+            "peer_id" => replica_id,
+        );
+
+        engines.push(Some(engine));
+        transaction_producers.push(Some(tx_producer));
+    }
+
+    let byzantine_secret_key =
+        byzantine_leader_secret_key.expect("Byzantine leader secret key should exist");
+    let byzantine_peer_id = byzantine_leader_peer_id.expect("Byzantine peer ID should exist");
+
+    slog::info!(
+        logger,
+        "Honest replicas registered and engines started";
+        "honest_count" => N - 1,
+        "byzantine_leader_peer_id" => byzantine_peer_id,
+    );
+
+    // Phase 4: Start network routing
+    slog::info!(logger, "Phase 4: Starting network routing");
+    network.start();
+    assert!(network.is_running(), "Network should be running");
+    slog::info!(logger, "Network routing thread active");
+
+    // Give honest replicas a moment to initialize
+    thread::sleep(Duration::from_millis(100));
+
+    // Phase 5: Start Byzantine equivocation thread
+    // This thread continuously monitors view progress and injects equivocating blocks
+    // whenever the Byzantine leader's turn comes up
+    slog::info!(logger, "Phase 5: Starting Byzantine equivocation thread");
+
+    use crate::consensus::ConsensusMessage;
+    use crate::state::block::Block;
+    use crate::state::transaction::Transaction;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let equivocations_injected = Arc::new(AtomicU64::new(0));
+
+    // Clone what we need for the Byzantine thread
+    let byzantine_thread_logger = logger.clone();
+    let byzantine_thread_shutdown = shutdown_flag.clone();
+    let byzantine_thread_equivocations = equivocations_injected.clone();
+    let byzantine_thread_secret_key = byzantine_secret_key.clone();
+    let byzantine_thread_peer_id = byzantine_peer_id;
+    let message_producers = network.message_producers.clone();
+    let sorted_peer_ids = fixture.peer_set.sorted_peer_ids.clone();
+
+    // We need a reference store to check current chain tip
+    // Use replica 0's store (first honest replica)
+    let reference_store = stores[0].clone();
+
+    let byzantine_thread = thread::spawn(move || {
+        let mut last_injected_view: Option<u64> = None;
+        let mut equivocation_counter = 0u64;
+
+        while !byzantine_thread_shutdown.load(Ordering::Relaxed) {
+            // Get current chain tip from reference store
+            let finalized_blocks = reference_store
+                .get_all_finalized_blocks()
+                .unwrap_or_default();
+
+            let (current_tip_view, current_tip_hash) =
+                if let Some(last_block) = finalized_blocks.last() {
+                    (last_block.view(), last_block.get_hash())
+                } else {
+                    (0, Block::genesis_hash())
+                };
+
+            // Calculate next Byzantine leader view
+            // Byzantine leader is replica 1, which leads views where view % N == 1
+            let next_byzantine_view = {
+                let mut v = current_tip_view + 1;
+                while v % (N as u64) != (BYZANTINE_LEADER_IDX as u64) {
+                    v += 1;
+                }
+                v
+            };
+
+            // Only inject if we haven't already injected for this view
+            // and the network is close to this view (within 3 views)
+            let should_inject = last_injected_view.map_or(true, |last| next_byzantine_view > last)
+                && next_byzantine_view <= current_tip_view + 3;
+
+            if should_inject {
+                // Determine parent hash for this view
+                // We need to find the block that will be the parent
+                let parent_hash = if next_byzantine_view == current_tip_view + 1 {
+                    current_tip_hash
+                } else {
+                    // There's a gap - views might be getting nullified
+                    // Use the current tip as parent (the protocol will handle this)
+                    current_tip_hash
+                };
+
+                // Create two different transactions
+                let tx1 = {
+                    let mut rng = rand::thread_rng();
+                    let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+                    let pk = sk.public_key();
+                    let tx_data = format!("equivocating tx A view {}", next_byzantine_view);
+                    let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(tx_data.as_bytes()).into();
+                    let sig = sk.sign(&tx_hash);
+                    Transaction::new(
+                        pk,
+                        [1u8; 32],
+                        equivocation_counter,
+                        1,
+                        1000,
+                        1,
+                        tx_hash,
+                        sig,
+                    )
+                };
+
+                let tx2 = {
+                    let mut rng = rand::thread_rng();
+                    let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+                    let pk = sk.public_key();
+                    let tx_data = format!("equivocating tx B view {}", next_byzantine_view);
+                    let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(tx_data.as_bytes()).into();
+                    let sig = sk.sign(&tx_hash);
+                    Transaction::new(
+                        pk,
+                        [2u8; 32],
+                        equivocation_counter + 1,
+                        2,
+                        2000,
+                        2,
+                        tx_hash,
+                        sig,
+                    )
+                };
+
+                // Create Block 1
+                let temp_block1 = Block::new(
+                    next_byzantine_view,
+                    byzantine_thread_peer_id,
+                    parent_hash,
+                    vec![tx1],
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    byzantine_thread_secret_key.sign(b"temp1"),
+                    false,
+                    1,
+                );
+                let block1_hash = temp_block1.get_hash();
+                let block1 = Block::new(
+                    next_byzantine_view,
+                    byzantine_thread_peer_id,
+                    parent_hash,
+                    temp_block1.transactions.clone(),
+                    temp_block1.header.timestamp,
+                    byzantine_thread_secret_key.sign(&block1_hash),
+                    false,
+                    1,
+                );
+
+                // Create Block 2 (different transactions, same view - EQUIVOCATION!)
+                let temp_block2 = Block::new(
+                    next_byzantine_view,
+                    byzantine_thread_peer_id,
+                    parent_hash,
+                    vec![tx2],
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                        + 1,
+                    byzantine_thread_secret_key.sign(b"temp2"),
+                    false,
+                    1,
+                );
+                let block2_hash = temp_block2.get_hash();
+                let block2 = Block::new(
+                    next_byzantine_view,
+                    byzantine_thread_peer_id,
+                    parent_hash,
+                    temp_block2.transactions.clone(),
+                    temp_block2.header.timestamp,
+                    byzantine_thread_secret_key.sign(&block2_hash),
+                    false,
+                    1,
+                );
+
+                let msg1 = ConsensusMessage::BlockProposal(block1.clone());
+                let msg2 = ConsensusMessage::BlockProposal(block2.clone());
+
+                // Inject to partitions
+                {
+                    let mut producers = message_producers.lock().unwrap();
+
+                    for (i, &target_peer_id) in sorted_peer_ids.iter().enumerate() {
+                        if i == BYZANTINE_LEADER_IDX {
+                            continue;
+                        }
+
+                        // Partition A (replicas 0, 2, 3) gets block1
+                        // Partition B (replicas 4, 5) gets block2
+                        let msg = if i == 0 || i == 2 || i == 3 {
+                            msg1.clone()
+                        } else {
+                            msg2.clone()
+                        };
+
+                        if let Some(producer) = producers.get_mut(&target_peer_id) {
+                            let _ = producer.push(msg);
+                        }
+                    }
+                }
+
+                slog::info!(
+                    byzantine_thread_logger,
+                    "Injected equivocating blocks";
+                    "view" => next_byzantine_view,
+                    "block1_hash" => hex::encode(&block1.get_hash()[..8]),
+                    "block2_hash" => hex::encode(&block2.get_hash()[..8]),
+                    "equivocation_count" => equivocation_counter / 2 + 1,
+                );
+
+                last_injected_view = Some(next_byzantine_view);
+                equivocation_counter += 2;
+                byzantine_thread_equivocations.fetch_add(1, Ordering::Relaxed);
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    // Phase 6: Submit transactions to honest replicas
+    let num_transactions = 50;
+    slog::info!(
+        logger,
+        "Phase 6: Submitting transactions to honest replicas";
+        "count" => num_transactions,
+    );
+
+    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    let expected_tx_hashes: std::collections::HashSet<_> =
+        transactions.iter().map(|tx| tx.tx_hash).collect();
+
+    for (i, tx) in transactions.into_iter().enumerate() {
+        let mut replica_idx = i % N;
+        if replica_idx == BYZANTINE_LEADER_IDX {
+            replica_idx = (replica_idx + 1) % N;
+        }
+
+        if let Some(ref mut tx_producer) = transaction_producers[replica_idx] {
+            tx_producer.push(tx).expect("Failed to submit transaction");
+        }
+    }
+
+    slog::info!(
+        logger,
+        "All transactions submitted";
+        "total" => num_transactions,
+    );
+
+    // Phase 7: Let consensus run with persistent equivocation
+    slog::info!(
+        logger,
+        "Phase 7: Running consensus with persistent Byzantine equivocation";
+        "duration_secs" => 60,
+    );
+
+    let test_duration = Duration::from_secs(60);
+    let check_interval = Duration::from_secs(10);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < test_duration {
+        thread::sleep(check_interval);
+
+        let elapsed = start_time.elapsed().as_secs();
+        let msgs_routed = network.stats.messages_routed();
+        let msgs_dropped = network.stats.messages_dropped();
+        let equivocations = equivocations_injected.load(Ordering::Relaxed);
+
+        slog::info!(
+            logger,
+            "Consensus progress check (persistent equivocation)";
+            "elapsed_secs" => elapsed,
+            "messages_routed" => msgs_routed,
+            "messages_dropped" => msgs_dropped,
+            "equivocations_injected" => equivocations,
+        );
+    }
+
+    // Phase 8: Shutdown Byzantine thread
+    slog::info!(
+        logger,
+        "Phase 8: Shutting down Byzantine equivocation thread"
+    );
+    shutdown_flag.store(true, Ordering::Relaxed);
+    byzantine_thread.join().expect("Byzantine thread panicked");
+
+    let total_equivocations = equivocations_injected.load(Ordering::Relaxed);
+    slog::info!(
+        logger,
+        "Byzantine thread stopped";
+        "total_equivocations" => total_equivocations,
+    );
+
+    // Phase 9: Verify honest replicas are still running
+    slog::info!(logger, "Phase 9: Verifying honest replicas");
+
+    for (i, engine_opt) in engines.iter().enumerate() {
+        if i == BYZANTINE_LEADER_IDX {
+            continue;
+        }
+
+        if let Some(engine) = engine_opt {
+            let is_running = engine.is_running();
+            slog::info!(
+                logger,
+                "Honest replica check";
+                "replica" => i,
+                "is_running" => is_running,
+            );
+            assert!(is_running, "Engine {} should still be running", i);
+        }
+    }
+
+    // Phase 10: Collect statistics
+    let final_msgs_routed = network.stats.messages_routed();
+    let final_msgs_dropped = network.stats.messages_dropped();
+
+    slog::info!(
+        logger,
+        "Final network statistics";
+        "messages_routed" => final_msgs_routed,
+        "messages_dropped" => final_msgs_dropped,
+        "total_equivocations" => total_equivocations,
+    );
+
+    // Phase 11: Graceful shutdown
+    slog::info!(logger, "Phase 11: Shutting down consensus engines");
+
+    for engine in engines.iter().flatten() {
+        engine.shutdown();
+    }
+
+    network.shutdown();
+
+    for (i, engine_opt) in engines.into_iter().enumerate() {
+        if let Some(engine) = engine_opt {
+            engine
+                .shutdown_and_wait(Duration::from_secs(5))
+                .unwrap_or_else(|e| panic!("Engine {} failed to shutdown: {}", i, e));
+        }
+    }
+
+    slog::info!(logger, "All engines shut down successfully");
+
+    // Phase 12: Verify state consistency
+    slog::info!(
+        logger,
+        "Phase 12: Verifying state consistency with persistent equivocation"
+    );
+
+    let mut first_honest_blocks: Option<Vec<crate::state::block::Block>> = None;
+    let mut byzantine_views_nullified = 0u64;
+
+    for (i, store) in stores.iter().enumerate() {
+        if i == BYZANTINE_LEADER_IDX {
+            continue;
+        }
+
+        let blocks = store
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+
+        // Count how many Byzantine leader views were nullified
+        let finalized_views: std::collections::HashSet<u64> =
+            blocks.iter().map(|b| b.view()).collect();
+
+        // Check all views where Byzantine leader should have been leader
+        for view in (1..=blocks.last().map(|b| b.view()).unwrap_or(0)).step_by(N) {
+            if !finalized_views.contains(&view) {
+                let nullification = store
+                    .get_nullification::<N, F, M_SIZE>(view)
+                    .expect("Failed to query nullification");
+                if nullification.is_some() {
+                    byzantine_views_nullified += 1;
+                }
+            }
+        }
+
+        slog::info!(
+            logger,
+            "Honest replica state check";
+            "replica" => i,
+            "finalized_blocks" => blocks.len(),
+            "highest_view" => blocks.last().map(|b| b.view()).unwrap_or(0),
+        );
+
+        assert!(
+            !blocks.is_empty(),
+            "Honest replica {} should have finalized blocks despite persistent equivocation",
+            i
+        );
+
+        // Check chain integrity
+        for window in blocks.windows(2) {
+            let prev = &window[0];
+            let curr = &window[1];
+            assert_eq!(
+                curr.parent_block_hash(),
+                prev.get_hash(),
+                "Chain broken for replica {} (view {} -> {})",
+                i,
+                prev.view(),
+                curr.view()
+            );
+        }
+
+        // Check consistency across honest replicas
+        if let Some(ref first_blocks) = first_honest_blocks {
+            let min_len = std::cmp::min(blocks.len(), first_blocks.len());
+            for j in 0..min_len {
+                assert_eq!(
+                    blocks[j].get_hash(),
+                    first_blocks[j].get_hash(),
+                    "Block mismatch at index {} between honest replicas",
+                    j
+                );
+            }
+        } else {
+            first_honest_blocks = Some(blocks);
+        }
+    }
+
+    let finalized_count = first_honest_blocks.as_ref().map(|b| b.len()).unwrap_or(0);
+    let honest_replica_count = N - 1;
+
+    slog::info!(
+        logger,
+        "State consistency verification passed! ✓";
+        "honest_replicas" => honest_replica_count,
+        "finalized_blocks" => finalized_count,
+        "byzantine_views_nullified" => byzantine_views_nullified,
+        "equivocations_attempted" => total_equivocations,
+    );
+
+    // Verify transaction inclusion
+    let mut included_tx_hashes = std::collections::HashSet::new();
+    if let Some(ref blocks) = first_honest_blocks {
+        for block in blocks {
+            for tx in &block.transactions {
+                included_tx_hashes.insert(tx.tx_hash);
+            }
+        }
+    }
+
+    let included_count = included_tx_hashes.intersection(&expected_tx_hashes).count();
+    let inclusion_rate = if expected_tx_hashes.is_empty() {
+        1.0
+    } else {
+        included_count as f64 / expected_tx_hashes.len() as f64
+    };
+
+    slog::info!(
+        logger,
+        "Transaction inclusion check";
+        "total_submitted" => expected_tx_hashes.len(),
+        "included_finalized" => included_count,
+        "inclusion_rate" => format!("{:.2}%", inclusion_rate * 100.0)
+    );
+
+    // With persistent equivocation, we expect reasonable progress
+    // The protocol should still make progress on non-Byzantine views
+    assert!(
+        inclusion_rate > 0.3,
+        "Transaction inclusion rate too low with persistent equivocation: {:.2}%",
+        inclusion_rate * 100.0
+    );
+
+    // Verify that at least some Byzantine views were nullified
+    assert!(
+        total_equivocations == 0 || byzantine_views_nullified > 0,
+        "At least some Byzantine views should have been nullified"
+    );
+
+    // Final success message
+    slog::info!(
+        logger,
+        "Test completed successfully! ✓";
+        "total_messages_routed" => final_msgs_routed,
+        "test_duration_secs" => 60,
+        "byzantine_leader" => BYZANTINE_LEADER_IDX,
+        "honest_replicas" => honest_replica_count,
+        "finalized_blocks" => finalized_count,
+        "equivocations_attempted" => total_equivocations,
+        "byzantine_views_nullified" => byzantine_views_nullified,
+        "result" => "Protocol correctly handled persistent Byzantine equivocation",
+    );
+}
