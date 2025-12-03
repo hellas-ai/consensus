@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ark_serialize::CanonicalSerialize;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rkyv::de::Pool;
 use rkyv::rancor::Strategy;
@@ -344,17 +343,15 @@ impl ConsensusStore {
 
     /// Retrieves an account from the database, if it exists.
     pub fn get_account(&self, public_key: &TxPublicKey) -> Result<Option<Account>> {
-        let mut writer = Vec::new();
-        public_key
-            .to_bytes()
-            .serialize_compressed(&mut writer)
-            .unwrap();
-        unsafe { self.get_blob_value::<Account, _>(ACCOUNTS, writer) }
+        let key = public_key.to_bytes();
+        unsafe { self.get_blob_value::<Account, _>(ACCOUNTS, key) }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ark_serialize::CanonicalSerialize;
+
     use super::*;
     use crate::{
         crypto::{
@@ -387,9 +384,7 @@ mod tests {
     }
 
     fn serialize_tx_pk(pk: &TxPublicKey) -> Vec<u8> {
-        let mut v = Vec::new();
-        pk.to_bytes().serialize_compressed(&mut v).unwrap();
-        v
+        pk.to_bytes().to_vec()
     }
 
     fn serialize_bls_pk(pk: &BlsPublicKey) -> Vec<u8> {
