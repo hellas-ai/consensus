@@ -2,14 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ark_serialize::CanonicalSerialize;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use rkyv::de::Pool;
 use rkyv::rancor::Strategy;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Serialize, deserialize};
 
-use crate::crypto::aggregated::BlsPublicKey;
+use crate::crypto::transaction_crypto::TxPublicKey;
 use crate::state::account::Account;
 use crate::state::notarizations::Vote;
 use crate::state::nullify::Nullify;
@@ -343,21 +342,24 @@ impl ConsensusStore {
     }
 
     /// Retrieves an account from the database, if it exists.
-    pub fn get_account(&self, public_key: &BlsPublicKey) -> Result<Option<Account>> {
-        let mut writer = Vec::new();
-        public_key.serialize_compressed(&mut writer).unwrap();
-        unsafe { self.get_blob_value::<Account, _>(ACCOUNTS, writer) }
+    pub fn get_account(&self, public_key: &TxPublicKey) -> Result<Option<Account>> {
+        let key = public_key.to_bytes();
+        unsafe { self.get_blob_value::<Account, _>(ACCOUNTS, key) }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ark_serialize::CanonicalSerialize;
+
     use super::*;
     use crate::{
-        crypto::aggregated::{AggregatedSignature, BlsPublicKey, BlsSecretKey, PeerId},
-        state::peer::PeerSet,
+        crypto::{
+            aggregated::{AggregatedSignature, BlsPublicKey, BlsSecretKey, PeerId},
+            transaction_crypto::{TxPublicKey, TxSecretKey},
+        },
+        state::{address::Address, peer::PeerSet},
     };
-    use rand::thread_rng;
 
     fn temp_db_path(suffix: &str) -> String {
         let mut p = std::env::temp_dir();
@@ -369,14 +371,23 @@ mod tests {
         p.to_string_lossy().to_string()
     }
 
-    fn gen_keypair() -> (BlsSecretKey, BlsPublicKey) {
-        let mut rng = thread_rng();
-        let sk = BlsSecretKey::generate(&mut rng);
+    fn gen_keypair() -> (TxSecretKey, TxPublicKey) {
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         (sk, pk)
     }
 
-    fn serialize_pk(pk: &BlsPublicKey) -> Vec<u8> {
+    fn gen_bls_keypair() -> (BlsSecretKey, BlsPublicKey) {
+        let sk = BlsSecretKey::generate(&mut rand::thread_rng());
+        let pk = sk.public_key();
+        (sk, pk)
+    }
+
+    fn serialize_tx_pk(pk: &TxPublicKey) -> Vec<u8> {
+        pk.to_bytes().to_vec()
+    }
+
+    fn serialize_bls_pk(pk: &BlsPublicKey) -> Vec<u8> {
         let mut v = Vec::new();
         pk.serialize_compressed(&mut v).unwrap();
         v
@@ -403,14 +414,28 @@ mod tests {
 
             // Prepare a transaction to embed in block
             let (sk, pk) = gen_keypair();
-            let body = b"tx-body-1";
-            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
-            let sig = sk.sign(&tx_hash);
-            let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
+            let tx = Transaction::new_transfer(
+                Address::from_public_key(&pk),
+                Address::from_bytes([7u8; 32]),
+                42,
+                9,
+                1_000,
+                &sk,
+            );
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let signature = sk.sign(b"block proposal");
-            let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
+            let (leader_sk, leader_pk) = gen_bls_keypair();
+            let signature = leader_sk.sign(b"block proposal");
+            let block = Block::new(
+                5,
+                leader_pk.to_peer_id(),
+                parent,
+                vec![tx],
+                123456,
+                signature,
+                false,
+                1,
+            );
 
             store.put_finalized_block(&block).unwrap();
             let h = block.get_hash();
@@ -433,13 +458,18 @@ mod tests {
 
             // Prepare a transaction to embed in block
             let (sk, pk) = gen_keypair();
-            let body = b"tx-body-1";
-            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
-            let sig = sk.sign(&tx_hash);
-            let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
+            let tx = Transaction::new_transfer(
+                Address::from_public_key(&pk),
+                Address::from_bytes([7u8; 32]),
+                42,
+                9,
+                1_000,
+                &sk,
+            );
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let signature = sk.sign(b"block proposal");
+            let (leader_sk, _leader_pk) = gen_bls_keypair();
+            let signature = leader_sk.sign(b"block proposal");
             let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
 
             store.put_non_finalized_block(&block).unwrap();
@@ -463,13 +493,18 @@ mod tests {
 
             // Prepare a transaction to embed in block
             let (sk, pk) = gen_keypair();
-            let body = b"tx-body-1";
-            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
-            let sig = sk.sign(&tx_hash);
-            let tx = Transaction::new(pk.clone(), [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig);
+            let tx = Transaction::new_transfer(
+                Address::from_public_key(&pk),
+                Address::from_bytes([7u8; 32]),
+                42,
+                9,
+                1_000,
+                &sk,
+            );
 
             let parent: [u8; blake3::OUT_LEN] = [1u8; blake3::OUT_LEN];
-            let signature = sk.sign(b"block proposal");
+            let (leader_sk, _leader_pk) = gen_bls_keypair();
+            let signature = leader_sk.sign(b"block proposal");
             let block = Block::new(5, 0, parent, vec![tx], 123456, signature, false, 1);
 
             store.put_nullified_block(&block).unwrap();
@@ -491,15 +526,16 @@ mod tests {
         {
             let store = ConsensusStore::open(&path).unwrap();
 
-            let (_sk, _pk) = gen_keypair();
-            let leader = Leader::new(10, 10);
+            let (_leader_sk, leader_pk) = gen_bls_keypair();
+            let leader_id = leader_pk.to_peer_id();
+            let leader = Leader::new(leader_id, 10);
 
             store.put_leader(&leader).unwrap();
             let fetched = store.get_leader(10).unwrap().expect("get leader");
 
             // Compare fields; `BlsPublicKey` lacks PartialEq, compare bytes instead.
             assert_eq!(fetched.view(), 10);
-            assert_eq!(fetched.peer_id(), leader.peer_id());
+            assert_eq!(fetched.peer_id(), leader_pk.to_peer_id());
         }
         std::fs::remove_file(&path).ok();
     }
@@ -510,8 +546,8 @@ mod tests {
         {
             let store = ConsensusStore::open(&path).unwrap();
 
-            let (_sk, pk) = gen_keypair();
-            let view = View::new(11, pk.clone(), true, false);
+            let (_leader_sk, leader_pk) = gen_bls_keypair();
+            let view = View::new(11, leader_pk.clone(), true, false);
 
             store.put_view(&view).unwrap();
             let fetched = store.get_view(11).unwrap().expect("get view");
@@ -519,7 +555,10 @@ mod tests {
             assert_eq!(fetched.view(), 11);
             assert!(fetched.is_current_view());
             assert!(!fetched.is_nullified());
-            assert_eq!(serialize_pk(fetched.leader()), serialize_pk(view.leader()));
+            assert_eq!(
+                serialize_bls_pk(fetched.leader()),
+                serialize_bls_pk(&leader_pk.clone())
+            );
         }
         std::fs::remove_file(&path).ok();
     }
@@ -531,13 +570,17 @@ mod tests {
             let store = ConsensusStore::open(&path).unwrap();
 
             let (sk, pk) = gen_keypair();
-            let body = b"tx-body-2";
-            let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
-            let sig = sk.sign(&tx_hash);
-            let tx = Transaction::new(pk.clone(), [9u8; 32], 100, 2, 2_000, 5, tx_hash, sig);
+            let tx = Transaction::new_transfer(
+                Address::from_public_key(&pk),
+                Address::from_bytes([9u8; 32]),
+                100,
+                2,
+                2_000,
+                &sk,
+            );
 
             store.put_transaction(&tx).unwrap();
-            let fetched = store.get_transaction(&tx_hash).unwrap().expect("get tx");
+            let fetched = store.get_transaction(&tx.tx_hash).unwrap().expect("get tx");
 
             assert_eq!(fetched, tx);
             assert!(fetched.verify());
@@ -558,16 +601,31 @@ mod tests {
             // Base block
             let parent: [u8; blake3::OUT_LEN] = [2u8; blake3::OUT_LEN];
             let (sk0, pk0) = gen_keypair();
-            let tx_hash0: [u8; blake3::OUT_LEN] = blake3::hash(b"mbody").into();
-            let sig0 = sk0.sign(&tx_hash0);
-            let tx0 = Transaction::new(pk0.clone(), [1u8; 32], 1, 0, 1, 0, tx_hash0, sig0);
-            let signature = sk0.sign(b"block proposal");
-            let block = Block::new(6, 0, parent, vec![tx0], 999, signature, false, 1);
+            let tx0 = Transaction::new_transfer(
+                Address::from_public_key(&pk0),
+                Address::from_bytes([1u8; 32]),
+                1,
+                0,
+                1,
+                &sk0,
+            );
+            let (leader_sk, leader_pk) = gen_bls_keypair();
+            let signature = leader_sk.sign(b"block proposal");
+            let block = Block::new(
+                6,
+                leader_pk.to_peer_id(),
+                parent,
+                vec![tx0],
+                999,
+                signature,
+                false,
+                1,
+            );
 
             // 3 signers aggregate over block hash
-            let (sk1, pk1) = gen_keypair();
-            let (sk2, pk2) = gen_keypair();
-            let (sk3, pk3) = gen_keypair();
+            let (sk1, pk1) = gen_bls_keypair();
+            let (sk2, pk2) = gen_bls_keypair();
+            let (sk3, pk3) = gen_bls_keypair();
 
             let msg = block.get_hash();
             let s1 = sk1.sign(&msg);
@@ -617,8 +675,8 @@ mod tests {
             let fetched = store.get_account(&pk).unwrap().expect("get account");
 
             assert_eq!(
-                serialize_pk(&fetched.public_key),
-                serialize_pk(&acct.public_key)
+                serialize_tx_pk(&TxPublicKey::from_bytes(&fetched.public_key.bytes).unwrap()),
+                serialize_tx_pk(&TxPublicKey::from_bytes(&acct.public_key.bytes).unwrap())
             );
             assert_eq!(fetched.balance, 1234);
             assert_eq!(fetched.nonce, 7);
@@ -637,9 +695,9 @@ mod tests {
             let store = ConsensusStore::open(&path).unwrap();
 
             // Generate matching keypairs
-            let (sk1, pk1) = gen_keypair();
-            let (sk2, pk2) = gen_keypair();
-            let (sk3, pk3) = gen_keypair();
+            let (sk1, pk1) = gen_bls_keypair();
+            let (sk2, pk2) = gen_bls_keypair();
+            let (sk3, pk3) = gen_bls_keypair();
 
             // Aggregate signature over view bytes
             let view: u64 = 77;
@@ -687,7 +745,7 @@ mod tests {
         {
             let store = ConsensusStore::open(&path).unwrap();
 
-            let (sk, pk) = gen_keypair();
+            let (sk, pk) = gen_bls_keypair();
             let view: u64 = 42;
             let block_hash: [u8; blake3::OUT_LEN] = [5u8; blake3::OUT_LEN];
             let sig = sk.sign(&block_hash);

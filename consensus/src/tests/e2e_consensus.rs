@@ -4,7 +4,10 @@
 //! of the Minimmit BFT consensus protocol by simulating networks of replicas.
 
 use super::{network_simulator::LocalNetwork, test_helpers::*};
-use crate::consensus_manager::consensus_engine::ConsensusEngine;
+use crate::{
+    consensus_manager::consensus_engine::ConsensusEngine, crypto::transaction_crypto::TxSecretKey,
+    state::address::Address,
+};
 use slog::{Drain, Level, Logger, o};
 use std::{env, str::FromStr, thread, time::Duration};
 
@@ -168,7 +171,7 @@ fn test_e2e_consensus_happy_path() {
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    let transactions = create_test_transactions(num_transactions);
 
     // Keep a copy of transaction hashes for verification
     let expected_tx_hashes: std::collections::HashSet<_> =
@@ -549,7 +552,7 @@ fn test_e2e_consensus_continuous_load() {
     while start_time.elapsed() < test_duration {
         // Submit a batch of transactions
         let batch_size = 5;
-        let transactions = create_test_transactions(&fixture.keypairs, batch_size);
+        let transactions = create_test_transactions(batch_size);
 
         for tx in transactions {
             let tx_hash = tx.tx_hash;
@@ -916,12 +919,10 @@ fn test_e2e_consensus_with_crashed_replica() {
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    let transactions = create_test_transactions(num_transactions);
     // Keep a copy of transaction hashes for verification
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
-
-    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
 
     for (i, tx) in transactions.into_iter().enumerate() {
         // Distribute transactions across healthy replicas only (skip crashed one)
@@ -1390,21 +1391,29 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
     // Create two different transactions to make the blocks different
     let tx1 = {
-        let mut rng = rand::thread_rng();
-        let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
-        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(b"equivocating tx 1").into();
-        let sig = sk.sign(&tx_hash);
-        Transaction::new(pk, [1u8; 32], 1, 1, 1000, 1, tx_hash, sig)
+        Transaction::new_transfer(
+            Address::from_public_key(&pk),
+            Address::from_bytes([1u8; 32]),
+            1,
+            1,
+            1000,
+            &sk,
+        )
     };
 
     let tx2 = {
-        let mut rng = rand::thread_rng();
-        let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
-        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(b"equivocating tx 2").into();
-        let sig = sk.sign(&tx_hash);
-        Transaction::new(pk, [2u8; 32], 2, 2, 2000, 2, tx_hash, sig)
+        Transaction::new_transfer(
+            Address::from_public_key(&pk),
+            Address::from_bytes([2u8; 32]),
+            2,
+            2,
+            2000,
+            &sk,
+        )
     };
 
     // Create Block 1
@@ -1543,7 +1552,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    let transactions = create_test_transactions(num_transactions);
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
 
@@ -2105,40 +2114,28 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
                 // Create two different transactions
                 let tx1 = {
-                    let mut rng = rand::thread_rng();
-                    let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+                    let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
                     let pk = sk.public_key();
-                    let tx_data = format!("equivocating tx A view {}", next_byzantine_view);
-                    let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(tx_data.as_bytes()).into();
-                    let sig = sk.sign(&tx_hash);
-                    Transaction::new(
-                        pk,
-                        [1u8; 32],
+                    Transaction::new_transfer(
+                        Address::from_public_key(&pk),
+                        Address::from_bytes([1u8; 32]),
                         equivocation_counter,
-                        1,
                         1000,
                         1,
-                        tx_hash,
-                        sig,
+                        &sk,
                     )
                 };
 
                 let tx2 = {
-                    let mut rng = rand::thread_rng();
-                    let sk = crate::crypto::aggregated::BlsSecretKey::generate(&mut rng);
+                    let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
                     let pk = sk.public_key();
-                    let tx_data = format!("equivocating tx B view {}", next_byzantine_view);
-                    let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(tx_data.as_bytes()).into();
-                    let sig = sk.sign(&tx_hash);
-                    Transaction::new(
-                        pk,
-                        [2u8; 32],
+                    Transaction::new_transfer(
+                        Address::from_public_key(&pk),
+                        Address::from_bytes([2u8; 32]),
+                        2,
                         equivocation_counter + 1,
-                        2,
                         2000,
-                        2,
-                        tx_hash,
-                        sig,
+                        &sk,
                     )
                 };
 
@@ -2247,7 +2244,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(&fixture.keypairs, num_transactions);
+    let transactions = create_test_transactions(num_transactions);
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
 

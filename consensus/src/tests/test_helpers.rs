@@ -5,12 +5,14 @@
 use crate::{
     consensus::ConsensusMessage,
     consensus_manager::{config::ConsensusConfig, leader_manager::LeaderSelectionStrategy},
-    crypto::aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
-    state::{peer::PeerSet, transaction::Transaction},
+    crypto::{
+        aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
+        transaction_crypto::{TxPublicKey, TxSecretKey},
+    },
+    state::{address::Address, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
 };
 use ark_serialize::CanonicalSerialize;
-use rand::thread_rng;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -36,14 +38,19 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn generate() -> Self {
-        let mut rng = thread_rng();
-        let sk = BlsSecretKey::generate(&mut rng);
+        let sk = BlsSecretKey::generate(&mut rand::thread_rng());
         let pk = sk.public_key();
         Self {
             secret_key: sk,
             public_key: pk,
         }
     }
+}
+
+fn gen_tx_keypair() -> (TxSecretKey, TxPublicKey) {
+    let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+    let pk = sk.public_key();
+    (sk, pk)
 }
 
 /// Complete setup for a single replica including all communication channels and storage
@@ -189,8 +196,8 @@ impl TestFixture {
 /// * `nonce` - The transaction nonce
 /// * `payload` - The transaction payload (used to derive recipient and tx_hash)
 pub fn create_test_transaction(
-    secret_key: &crate::crypto::aggregated::BlsSecretKey,
-    sender: &crate::crypto::aggregated::BlsPublicKey,
+    secret_key: &TxSecretKey,
+    public_key: &TxPublicKey,
     nonce: u64,
     payload: Vec<u8>,
 ) -> Transaction {
@@ -199,54 +206,26 @@ pub fn create_test_transaction(
     let payload_hash = blake3::hash(&payload);
     recipient.copy_from_slice(&payload_hash.as_bytes()[..32]);
 
-    // Compute transaction hash from the payload
-    let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(&payload).into();
-
-    // Get timestamp
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Create the transaction body to sign
-    // We sign over all the transaction fields (excluding the signature itself)
-    let mut message = Vec::new();
-    message.extend_from_slice(&tx_hash);
-    message.extend_from_slice(&recipient);
-    message.extend_from_slice(&nonce.to_le_bytes());
-    message.extend_from_slice(&timestamp.to_le_bytes());
-
-    // Sign the transaction body
-    let signature = secret_key.sign(&message);
-
-    Transaction::new(
-        sender.clone(),
-        recipient,
-        100, // amount
+    Transaction::new_transfer(
+        Address::from_public_key(public_key),
+        Address::from_bytes([2u8; 32]),
+        100,
         nonce,
-        timestamp,
-        10, // fee
-        tx_hash,
-        signature,
+        10,
+        secret_key,
     )
 }
 
 /// Creates multiple test transactions with proper signatures
 ///
 /// # Arguments
-/// * `keypairs` - The keypairs to use for signing (sender's secret key and public key)
 /// * `count` - Number of transactions to create
-pub fn create_test_transactions(keypairs: &[KeyPair], count: usize) -> Vec<Transaction> {
+pub fn create_test_transactions(count: usize) -> Vec<Transaction> {
     let mut transactions = Vec::new();
     for i in 0..count {
-        let keypair = &keypairs[i % keypairs.len()];
+        let (sk, pk) = gen_tx_keypair();
         let payload = format!("transaction-{}", i).into_bytes();
-        transactions.push(create_test_transaction(
-            &keypair.secret_key,
-            &keypair.public_key,
-            i as u64,
-            payload,
-        ));
+        transactions.push(create_test_transaction(&sk, &pk, i as u64, payload));
     }
     transactions
 }

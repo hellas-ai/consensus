@@ -191,31 +191,32 @@ impl Hash for Block {
 mod tests {
     use super::*;
     use crate::crypto::aggregated::BlsSecretKey;
+    use crate::crypto::transaction_crypto::TxSecretKey;
+    use crate::state::address::Address;
     use crate::storage::conversions::serialize_for_db;
     use rand::thread_rng;
 
-    fn gen_tx(body: &[u8]) -> Transaction {
+    fn gen_tx() -> Transaction {
         let (sk, pk) = {
-            let mut rng = thread_rng();
-            let sk = BlsSecretKey::generate(&mut rng);
+            let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
             let pk = sk.public_key();
             (sk, pk)
         };
-        let tx_hash: [u8; blake3::OUT_LEN] = blake3::hash(body).into();
-        let sig = sk.sign(&tx_hash);
-        Transaction::new(pk, [7u8; 32], 42, 9, 1_000, 3, tx_hash, sig)
+        let address = Address::from_public_key(&pk);
+        let recipient = Address::from_bytes([7u8; 32]);
+        Transaction::new_transfer(address, recipient, 42, 9, 1_000, &sk)
     }
 
     fn gen_block(
         view: u64,
         leader: PeerId,
         parent: [u8; blake3::OUT_LEN],
-        tx_bodies: &[&[u8]],
+        num_transactions: usize,
         ts: u64,
         leader_signature: BlsSignature,
         height: u64,
     ) -> Block {
-        let txs = tx_bodies.iter().map(|b| gen_tx(b)).collect::<Vec<_>>();
+        let txs = (0..num_transactions).map(|_| gen_tx()).collect::<Vec<_>>();
         Block::new(
             view,
             leader,
@@ -233,16 +234,22 @@ mod tests {
         let parent = [1u8; blake3::OUT_LEN];
         let sk = BlsSecretKey::generate(&mut thread_rng());
         let leader_signature = sk.sign(b"block proposal");
-        let b1 = gen_block(
+
+        // Generate transactions ONCE
+        let txs: Vec<Transaction> = (0..2).map(|_| gen_tx()).collect();
+
+        let b1 = Block::new(
             5,
             0,
             parent,
-            &[b"a", b"b"],
+            txs.clone(),
             123456,
             leader_signature.clone(),
+            false,
             1,
         );
-        let b2 = gen_block(5, 0, parent, &[b"a", b"b"], 123456, leader_signature, 1);
+        let b2 = Block::new(5, 0, parent, txs, 123456, leader_signature, false, 1);
+
         assert_eq!(b1.get_hash(), b2.get_hash());
         assert_eq!(b1, b2);
     }
@@ -252,16 +259,8 @@ mod tests {
         let parent = [2u8; blake3::OUT_LEN];
         let sk = BlsSecretKey::generate(&mut thread_rng());
         let leader_signature = sk.sign(b"block proposal");
-        let b1 = gen_block(
-            6,
-            0,
-            parent,
-            &[b"a", b"b"],
-            999,
-            leader_signature.clone(),
-            2,
-        );
-        let b2 = gen_block(6, 0, parent, &[b"a", b"c"], 999, leader_signature, 2);
+        let b1 = gen_block(6, 0, parent, 2, 999, leader_signature.clone(), 2);
+        let b2 = gen_block(6, 0, parent, 2, 999, leader_signature, 2);
         assert_ne!(b1.get_hash(), b2.get_hash());
         assert_ne!(b1, b2);
     }
@@ -271,16 +270,8 @@ mod tests {
         let parent = [3u8; blake3::OUT_LEN];
         let sk = BlsSecretKey::generate(&mut thread_rng());
         let leader_signature = sk.sign(b"block proposal");
-        let b1 = gen_block(
-            7,
-            0,
-            parent,
-            &[b"x", b"y"],
-            111,
-            leader_signature.clone(),
-            3,
-        );
-        let b2 = gen_block(7, 0, parent, &[b"y", b"x"], 111, leader_signature, 3);
+        let b1 = gen_block(7, 0, parent, 2, 111, leader_signature.clone(), 3);
+        let b2 = gen_block(7, 0, parent, 2, 111, leader_signature, 3);
         assert_ne!(b1.get_hash(), b2.get_hash());
     }
 
@@ -289,7 +280,7 @@ mod tests {
         let parent = [9u8; blake3::OUT_LEN];
         let sk = BlsSecretKey::generate(&mut thread_rng());
         let leader_signature = sk.sign(b"block proposal");
-        let b = gen_block(42, 0, parent, &[b"a"], 777, leader_signature, 42);
+        let b = gen_block(42, 0, parent, 1, 777, leader_signature, 42);
         assert_eq!(b.view(), 42);
         assert_eq!(b.parent_block_hash(), parent);
         assert!(b.is_view_block(42));
@@ -301,16 +292,30 @@ mod tests {
         let parent = [4u8; blake3::OUT_LEN];
         let sk = BlsSecretKey::generate(&mut thread_rng());
         let leader_signature = sk.sign(b"block proposal");
-        let mut b = gen_block(8, 0, parent, &[b"z"], 222, leader_signature.clone(), 8);
+
+        // Generate transaction(s) ONCE
+        let txs: Vec<Transaction> = (0..1).map(|_| gen_tx()).collect();
+
+        let mut b = Block::new(
+            8,
+            0,
+            parent,
+            txs.clone(),
+            222,
+            leader_signature.clone(),
+            false,
+            8,
+        );
         // Simulate an archived block with hash = None
         b.hash = None;
         let bytes = serialize_for_db(&b).expect("serialize");
         let restored = Block::from_block_bytes(bytes.as_slice());
+
         // The restored hash should be present and match a fresh computation
         let expected = restored.get_hash();
         let recomputed = {
             // Recompute via creating the same content block again
-            let b2 = gen_block(8, 0, parent, &[b"z"], 222, leader_signature, 8);
+            let b2 = Block::new(8, 0, parent, txs, 222, leader_signature, false, 8);
             b2.get_hash()
         };
         assert_eq!(expected, recomputed);

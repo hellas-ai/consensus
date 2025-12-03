@@ -1,5 +1,4 @@
 use anyhow::Result;
-use ark_serialize::CanonicalSerialize;
 use rkyv::{
     Archive, Archived, api::high::to_bytes_with_alloc, ser::allocator::Arena, util::AlignedVec,
 };
@@ -179,9 +178,7 @@ impl Storable for Account {
     type Value = AlignedVec;
 
     fn key(&self) -> Self::Key {
-        let mut writer = Vec::new();
-        self.public_key.serialize_compressed(&mut writer).unwrap();
-        writer
+        self.public_key.bytes.to_vec()
     }
 
     fn value(&self) -> Result<Self::Value> {

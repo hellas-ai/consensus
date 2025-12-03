@@ -10,10 +10,12 @@ ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
 ark-serialize = { workspace = true }
 blake3        = { workspace = true }
+ed25519-dalek = { workspace = true, features = [ "rand_core" ] }
 figment       = { workspace = true, features = [ "env", "toml", "yaml" ] }
 hex           = { workspace = true }
 metrics       = { workspace = true }
 rand          = { workspace = true, features = [ "std" ] }
+rand_core     = { workspace = true, features = [ "std" ] }
 redb          = { workspace = true }
 rkyv          = { workspace = true }
 rtrb          = { workspace = true }
@@ -23,6 +25,7 @@ slog-async    = { workspace = true }
 slog-stdlog   = { workspace = true }
 slog-term     = { workspace = true }
 tempfile      = { workspace = true }
+thiserror     = { workspace = true }
 tracing       = { workspace = true }
 validator     = { workspace = true, features = [ "derive" ] }
 zeroize       = { workspace = true }
