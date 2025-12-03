@@ -34,9 +34,9 @@ impl TxSecretKey {
     }
 
     /// Create from raw bytes
-    pub fn from_bytes(bytes: &[u8; SECRET_KEY_LENGTH]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8; SECRET_KEY_LENGTH]) -> Self {
         let signing_key = SigningKey::from_bytes(bytes);
-        Ok(Self(signing_key))
+        Self(signing_key)
     }
 
     /// Get the corresponding public key
@@ -58,8 +58,7 @@ impl TxSecretKey {
 impl TxPublicKey {
     /// Create from raw bytes
     pub fn from_bytes(bytes: &[u8; PUBLIC_KEY_LENGTH]) -> Result<Self> {
-        let verifying_key =
-            VerifyingKey::from_bytes(bytes).map_err(|_| SignatureError::InvalidPublicKey)?;
+        let verifying_key = VerifyingKey::from_bytes(bytes)?;
         Ok(Self(verifying_key))
     }
 
@@ -90,7 +89,7 @@ impl TxSignature {
 #[derive(Debug, Error)]
 pub enum SignatureError {
     InvalidPublicKey,
-    InvalidSignature,
+    InvalidSignature(#[from] ed25519_dalek::SignatureError),
     InvalidSecretKey,
 }
 
@@ -98,7 +97,7 @@ impl std::fmt::Display for SignatureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidPublicKey => write!(f, "Invalid public key"),
-            Self::InvalidSignature => write!(f, "Invalid signature"),
+            Self::InvalidSignature(e) => write!(f, "Invalid signature: {}", e),
             Self::InvalidSecretKey => write!(f, "Invalid secret key"),
         }
     }
