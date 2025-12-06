@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow        = { workspace = true }
+arc-swap      = "1.7.1"
 ark-bls12-381 = { workspace = true, features = [ "curve" ] }
 ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
@@ -29,3 +30,10 @@ thiserror     = { workspace = true }
 tracing       = { workspace = true }
 validator     = { workspace = true, features = [ "derive" ] }
 zeroize       = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+harness = false
+name    = "pending_state"

@@ -75,13 +75,29 @@ impl Transaction {
 
     /// Creates a new create account transaction
     pub fn new_create_account(
-        address: Address,
+        sender: Address,
+        new_address: Address,
         nonce: u64,
         fee: u64,
         secret_key: &TxSecretKey,
     ) -> Self {
-        let tx_type = TransactionInstruction::CreateAccount { address };
-        Self::create_signed(address, tx_type, nonce, fee, secret_key)
+        let tx_type = TransactionInstruction::CreateAccount {
+            address: new_address,
+        };
+        Self::create_signed(sender, tx_type, nonce, fee, secret_key)
+    }
+
+    /// Creates a new burn transaction
+    pub fn new_burn(
+        sender: Address,
+        address: Address,
+        amount: u64,
+        nonce: u64,
+        fee: u64,
+        secret_key: &TxSecretKey,
+    ) -> Self {
+        let tx_type = TransactionInstruction::Burn { address, amount };
+        Self::create_signed(sender, tx_type, nonce, fee, secret_key)
     }
 
     fn create_signed(
@@ -336,12 +352,13 @@ mod tests {
     fn new_create_account_creates_valid_transaction() {
         let (sk, pk) = gen_keypair();
         let address = Address::from_public_key(&pk);
+        let new_address = Address::from_bytes([1u8; 32]);
 
-        let tx = Transaction::new_create_account(address, 0, 100, &sk);
+        let tx = Transaction::new_create_account(address, new_address, 0, 100, &sk);
 
         assert!(tx.verify());
         assert_eq!(tx.amount(), 0); // CreateAccount has no amount
-        assert_eq!(tx.recipient(), Some(address));
+        assert_eq!(tx.recipient(), Some(new_address));
         assert_eq!(tx.nonce, 0);
         assert_eq!(tx.fee, 100);
     }
@@ -395,13 +412,14 @@ mod tests {
     #[test]
     fn create_account_instruction_fields() {
         let (sk, pk) = gen_keypair();
-        let address = Address::from_public_key(&pk);
+        let sender_address = Address::from_public_key(&pk);
+        let new_address = Address::from_bytes([1u8; 32]);
 
-        let tx = Transaction::new_create_account(address, 1, 50, &sk);
+        let tx = Transaction::new_create_account(sender_address, new_address, 1, 50, &sk);
 
         match &tx.instruction {
             TransactionInstruction::CreateAccount { address: a } => {
-                assert_eq!(*a, address);
+                assert_eq!(*a, new_address);
             }
             _ => panic!("Expected CreateAccount instruction"),
         }
