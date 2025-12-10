@@ -268,6 +268,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -284,6 +285,7 @@ use crate::{
         nullify::{Nullification, Nullify},
         peer::PeerSet,
     },
+    validation::StateDiff,
 };
 
 /// State tracking for a single view in the consensus protocol.
@@ -340,6 +342,9 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Received nullify messages for the current view
     pub nullify_messages: HashSet<Nullify>,
 
+    /// Pre-computed state diff for this block (set by validation service)
+    pub state_diff: Option<Arc<StateDiff>>,
+
     /// A nullification for the current view (if any)
     pub nullification: Option<Nullification<N, F, M_SIZE>>,
 
@@ -371,6 +376,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             parent_block_hash,
             has_nullified: false,
             has_proposed: false,
+            state_diff: None,
             leader_id,
             pending_block: None,
         }

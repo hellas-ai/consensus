@@ -384,7 +384,7 @@ mod tests {
         // Fund account via pending state (simulating m-notarized block)
         let mut diff = StateDiff::new();
         diff.add_created_account(sender_addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Create block with transfer - should work against pending state
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
@@ -572,7 +572,7 @@ mod tests {
         diff1.add_balance_change(addr1, -110, 1); // -100 transfer - 10 fee, nonce 0→1
         diff1.add_balance_change(addr2, 100, 0); // Receives 100
         diff1.total_fees = 10;
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // Now addr2 should be able to send (balance 100 from pending state)
         let tx = Transaction::new_transfer(addr2, addr3, 50, 0, 5, &sk2);

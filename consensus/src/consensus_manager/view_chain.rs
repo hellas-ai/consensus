@@ -41,7 +41,7 @@
 //! Where `vn` is the current view, and `v1` is the oldest non-L-notarized view.
 //! Views may be nullified (have nullification) but remain in the chain until garbage collected.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 
@@ -58,7 +58,7 @@ use crate::{
         peer::PeerSet,
         view::View,
     },
-    storage::store::ConsensusStore,
+    validation::{PendingStateWriter, types::StateDiff},
 };
 
 /// [`ViewChain`] manages the chain of `non-finalized` views in the consensus protocol.
@@ -78,26 +78,22 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
     /// This map contains at least one entry, namely that corresponding to the current view number.
     pub(crate) non_finalized_views: HashMap<u64, ViewContext<N, F, M_SIZE>>,
 
-    /// The persistence storage for the consensus protocol
+    /// The persistence writer for the consensus protocol
     /// This is used to persist the view contexts and the votes/nullifications/notarizations
     /// whenever a view in the [`ViewChain`] is finalized by the state machine replication
     /// protocol.
-    persistence_storage: ConsensusStore,
+    persistence_writer: PendingStateWriter,
 
     /// The most recent finalized block hash in the current replica's state machine
     // TODO: Move this to [`ViewProgressManager`]
     pub(crate) previously_committed_block_hash: [u8; blake3::OUT_LEN],
-
-    /// The timeout period for a view to be considered nullified by the current replica
-    _view_timeout: Duration,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE> {
     /// Creates a new [`ViewChain`] starting from the given initial view.
     pub fn new(
         initial_view: ViewContext<N, F, M_SIZE>,
-        persistence_storage: ConsensusStore,
-        view_timeout: Duration,
+        persistence_writer: PendingStateWriter,
     ) -> Self {
         let current_view = initial_view.view_number;
         let mut non_finalized_views = HashMap::new();
@@ -106,9 +102,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Self {
             current_view,
             non_finalized_views,
-            persistence_storage,
+            persistence_writer,
             previously_committed_block_hash: Block::genesis_hash(),
-            _view_timeout: view_timeout,
         }
     }
 
@@ -170,6 +165,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             return None;
         }
         Some(least_non_finalized_view..=upper_bound)
+    }
+
+    /// Stores a pre-computed [`StateDiff`] instance for a view
+    pub fn store_state_diff(&mut self, view: u64, state_diff: StateDiff) {
+        if let Some(ctx) = self.non_finalized_views.get_mut(&view) {
+            let state_diff = Arc::new(state_diff);
+            ctx.state_diff = Some(state_diff.clone());
+
+            // If this view has already received M-notarization (progressed past),
+            // we need to add the StateDiff to pending now
+            if ctx.m_notarization.is_some() && view < self.current_view {
+                self.persistence_writer
+                    .add_m_notarized_diff(view, state_diff);
+            }
+        }
     }
 
     /// Adds a block proposal to a non-finalized view and validates the chain structure.
@@ -544,7 +554,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             );
         }
 
-        // 3. Update the current view to the next view.
+        // 3. Add StateDiff to pending state before progressing
+        self.on_m_notarization(self.current_view);
+
+        // 4. Update the current view to the next view.
         // NOTE: We don't persist yet the current view, as it has not been finalized yet.
         // Moreover, we keep the current view context in the `non_finalized_views` map, as it has
         // not been finalized yet.
@@ -785,10 +798,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// Persists an L-notarized view to storage as a finalized block.
     ///
     /// This method commits the block to the ledger by persisting all consensus artifacts:
-    /// - Block (marked as `is_finalized = true`) and its transactions
+    /// - Block (marked as `is_finalized = true`) and its state diff
     /// - M-notarization (required before L-notarization can occur)
-    /// - All votes collected (n-f or more)
     /// - Leader and view metadata
+    /// - All votes collected (n-f or more)
     ///
     /// # Arguments
     /// * `ctx` - The view context containing the finalized block and consensus data
@@ -803,55 +816,66 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// L-notarization implies the view previously achieved M-notarization, as replicas
     /// only vote after seeing M-notarization or the block proposal.
     fn persist_l_notarized_view(
-        &self,
+        &mut self,
         ctx: &ViewContext<N, F, M_SIZE>,
         peers: &PeerSet,
     ) -> Result<()> {
         let view_number = ctx.view_number;
 
-        // 1. Persist both the block with `is_finalized` set to true, and the transactions
-        //    associated with the block.
+        // Finalize state diffs up to this view number (applies to DB and removes from pending)
+        self.persistence_writer.finalize_up_to(view_number)?;
+
+        // Persist the block as finalized
         if let Some(ref block) = ctx.block {
             for tx in block.transactions.iter() {
-                self.persistence_storage.put_transaction(tx)?;
-
-                // TODO: Handle account creation as well.
+                self.persistence_writer.put_transaction(tx)?;
             }
             let mut finalized_block = block.clone();
             finalized_block.is_finalized = true;
-            self.persistence_storage
+            self.persistence_writer
                 .put_finalized_block(&finalized_block)?;
         } else {
             return Err(anyhow::anyhow!(
-                "View number {view_number} has no block, but the view has been finalized with a l-notarization"
+                "View number {view_number} has no block, but the view has been finalized"
             ));
         }
 
-        // 2. Persist the M-notarization for the view
+        // Persist the M-notarization
         if let Some(ref m_notarization) = ctx.m_notarization {
-            self.persistence_storage.put_notarization(m_notarization)?;
+            self.persistence_writer.put_m_notarization(m_notarization)?;
         } else {
             return Err(anyhow::anyhow!(
-                "View number {view_number} has no m-notarization, but the view has been finalized with a l-notarization"
+                "View number {view_number} has no m-notarization, but the view has been finalized"
             ));
         }
 
-        // 3. Persist the leader metadata
+        // Persist leader metadata
         let leader_id = ctx.leader_id;
         let leader = Leader::new(leader_id, view_number);
-        self.persistence_storage.put_leader(&leader)?;
+        self.persistence_writer.put_leader(&leader)?;
 
-        // 4. Persist the view metadata
+        // Persist view metadata (marked as finalized)
         let leader_pk = peers.id_to_public_key.get(&leader_id).unwrap();
         let view = View::new(view_number, leader_pk.clone(), true, false);
-        self.persistence_storage.put_view(&view)?;
+        self.persistence_writer.put_view(&view)?;
 
-        // 5. Persist the votes for the view
+        // Persist all votes
         for vote in ctx.votes.iter() {
-            self.persistence_storage.put_vote(vote)?;
+            self.persistence_writer.put_vote(vote)?;
         }
 
         Ok(())
+    }
+
+    /// Called when a view is M-notarized: only adds StateDiff to pending.
+    /// Consensus artifacts remain in ViewContext until L-notarization.
+    pub fn on_m_notarization(&mut self, view_number: u64) {
+        if let Some(ctx) = self.non_finalized_views.get(&view_number) {
+            if let Some(ref state_diff) = ctx.state_diff {
+                self.persistence_writer
+                    .add_m_notarized_diff(view_number, Arc::clone(state_diff));
+            }
+        }
     }
 
     /// Persists an M-notarized view to storage as a non-finalized block.
@@ -886,24 +910,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     ) -> Result<()> {
         let view_number = ctx.view_number;
 
-        // 1. Persist both the block with `is_finalized` set to true, and the transactions
-        //    associated with the block.
+        // NOTE: StateDiff was already added to pending via on_m_notarization()
+        // when this view first achieved M-notarization. It will be applied to DB
+        // when persist_l_notarized_view() calls finalize_up_to().
+
+        // Persist block as non-finalized
         if let Some(ref block) = ctx.block {
             for tx in block.transactions.iter() {
-                self.persistence_storage.put_transaction(tx)?;
-
-                // TODO: Handle account creation as well.
+                self.persistence_writer.put_transaction(tx)?;
             }
-            self.persistence_storage.put_finalized_block(block)?;
+            self.persistence_writer.put_non_finalized_block(block)?;
         } else {
             return Err(anyhow::anyhow!(
-                "View number {view_number} has no block, but the view has been finalized with a l-notarization"
+                "View number {view_number} has no block, but the view has been m-notarized"
             ));
         }
 
         // Persist the M-notarization
         if let Some(ref m_notarization) = ctx.m_notarization {
-            self.persistence_storage.put_notarization(m_notarization)?;
+            self.persistence_writer.put_m_notarization(m_notarization)?;
         } else {
             return Err(anyhow::anyhow!(
                 "View number {view_number} has no m-notarization"
@@ -913,15 +938,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         // Persist leader and view metadata
         let leader_id = ctx.leader_id;
         let leader = Leader::new(leader_id, view_number);
-        self.persistence_storage.put_leader(&leader)?;
+        self.persistence_writer.put_leader(&leader)?;
 
         let leader_pk = peers.id_to_public_key.get(&leader_id).unwrap();
-        let view = View::new(view_number, leader_pk.clone(), false, false); // Not finalized
-        self.persistence_storage.put_view(&view)?;
+        let view = View::new(view_number, leader_pk.clone(), false, false); // Not finalized, not nullified
+        self.persistence_writer.put_view(&view)?;
 
         // Persist the votes
         for vote in ctx.votes.iter() {
-            self.persistence_storage.put_vote(vote)?;
+            self.persistence_writer.put_vote(vote)?;
         }
 
         Ok(())
@@ -952,7 +977,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// The block may be absent if the leader was faulty and never proposed. This is
     /// expected behavior and not treated as an error.
     fn persist_nullified_view(
-        &self,
+        &mut self,
         ctx: &ViewContext<N, F, M_SIZE>,
         peers: &PeerSet,
     ) -> Result<()> {
@@ -964,35 +989,36 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
-        // 1. Persist the block with `is_finalized` set to true.
-        // NOTE: It is possibly that the current replica never received a block for the view,
-        // in case of a faulty leader. So we don't error on that case
+        // Remove any pending state diff for this nullified view (never applied to DB)
+        self.persistence_writer.remove_nullified_view(view_number);
+
+        // Persist block as nullified (if present)
         if let Some(ref block) = ctx.block {
-            self.persistence_storage.put_nullified_block(block)?;
+            self.persistence_writer.put_nullified_block(block)?;
         }
 
-        // 2. Persist the nullification for the view
+        // Persist the nullification
         let nullification = ctx.nullification.as_ref().unwrap();
-        self.persistence_storage.put_nullification(nullification)?;
+        self.persistence_writer.put_nullification(nullification)?;
 
-        // 3. Persist the leader metadata
+        // Persist leader metadata
         let leader_id = ctx.leader_id;
         let leader = Leader::new(leader_id, view_number);
-        self.persistence_storage.put_leader(&leader)?;
+        self.persistence_writer.put_leader(&leader)?;
 
-        // 4. Persist the view metadata
+        // Persist view metadata (marked as nullified)
         let leader_pk = peers.id_to_public_key.get(&leader_id).unwrap();
-        let view = View::new(view_number, leader_pk.clone(), true, false);
-        self.persistence_storage.put_view(&view)?;
+        let view = View::new(view_number, leader_pk.clone(), false, true); // nullified=true
+        self.persistence_writer.put_view(&view)?;
 
-        // 5. Persist the votes for the view
+        // Persist votes (if any were collected before nullification)
         for vote in ctx.votes.iter() {
-            self.persistence_storage.put_vote(vote)?;
+            self.persistence_writer.put_vote(vote)?;
         }
 
-        // 6. Persist the nullify messages for the view
+        // Persist nullify messages
         for nullify in ctx.nullify_messages.iter() {
-            self.persistence_storage.put_nullify(nullify)?;
+            self.persistence_writer.put_nullify(nullify)?;
         }
 
         Ok(())
@@ -1064,9 +1090,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// are not saved. This is sufficient for recovery since the replica can re-sync
     /// these artifacts from peers upon restart.
     pub fn persist_all_views(&mut self) -> Result<()> {
-        for (_view_number, ctx) in self.non_finalized_views.drain() {
+        for (view_number, ctx) in self.non_finalized_views.drain() {
+            if let Some(state_diff) = ctx.state_diff {
+                self.persistence_writer
+                    .add_m_notarized_diff(view_number, state_diff);
+            }
             if let Some(ref block) = ctx.block {
-                self.persistence_storage.put_non_finalized_block(block)?;
+                self.persistence_writer.put_non_finalized_block(block)?;
+            }
+            if let Some(ref m_notarization) = ctx.m_notarization {
+                self.persistence_writer.put_m_notarization(m_notarization)?;
+            }
+            if let Some(ref nullification) = ctx.nullification {
+                self.persistence_writer.put_nullification(nullification)?;
+            }
+            for vote in ctx.votes.iter() {
+                self.persistence_writer.put_vote(vote)?;
             }
         }
 
@@ -1162,7 +1201,7 @@ mod tests {
             transaction_crypto::TxSecretKey,
         },
         state::{address::Address, block::Block, transaction::Transaction},
-        storage::conversions::Storable,
+        storage::{conversions::Storable, store::ConsensusStore},
     };
     use rand::thread_rng;
     use std::collections::{HashMap, HashSet};
@@ -1178,7 +1217,7 @@ mod tests {
         peer_set: PeerSet,
         peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
         temp_dir: TempDir,
-        storage: ConsensusStore,
+        persistence_writer: PendingStateWriter,
     }
 
     impl TestSetup {
@@ -1200,13 +1239,14 @@ mod tests {
             // Create temporary storage
             let temp_dir = TempDir::new().expect("Failed to create temp dir");
             let db_path = temp_dir.path().join("test_consensus.db");
-            let storage = ConsensusStore::open(db_path).expect("Failed to create storage");
+            let store = Arc::new(ConsensusStore::open(db_path).expect("Failed to create storage"));
+            let (writer, _reader) = PendingStateWriter::new(Arc::clone(&store), 0);
 
             Self {
                 peer_set,
                 peer_id_to_secret_key,
                 temp_dir,
-                storage,
+                persistence_writer: writer,
             }
         }
 
@@ -1276,10 +1316,11 @@ mod tests {
         view: u64,
         block_hash: [u8; blake3::OUT_LEN],
         leader_id: PeerId,
-        setup: &TestSetup,
+        peer_set: &PeerSet,
+        peer_id_to_secret_key: &HashMap<PeerId, BlsSecretKey>,
     ) -> Vote {
-        let peer_id = setup.peer_set.sorted_peer_ids[peer_index];
-        let secret_key = setup.peer_id_to_secret_key.get(&peer_id).unwrap();
+        let peer_id = peer_set.sorted_peer_ids[peer_index];
+        let secret_key = peer_id_to_secret_key.get(&peer_id).unwrap();
         let signature = secret_key.sign(&block_hash);
         Vote::new(view, block_hash, signature, peer_id, leader_id)
     }
@@ -1289,10 +1330,11 @@ mod tests {
         peer_index: usize,
         view: u64,
         leader_id: PeerId,
-        setup: &TestSetup,
+        peer_set: &PeerSet,
+        peer_id_to_secret_key: &HashMap<PeerId, BlsSecretKey>,
     ) -> Nullify {
-        let peer_id = setup.peer_set.sorted_peer_ids[peer_index];
-        let secret_key = setup.peer_id_to_secret_key.get(&peer_id).unwrap();
+        let peer_id = peer_set.sorted_peer_ids[peer_index];
+        let secret_key = peer_id_to_secret_key.get(&peer_id).unwrap();
         let message = blake3::hash(&[view.to_le_bytes(), leader_id.to_le_bytes()].concat());
         let signature = secret_key.sign(message.as_bytes());
         Nullify::new(view, leader_id, signature, peer_id)
@@ -1332,12 +1374,13 @@ mod tests {
         replica_id: PeerId,
         parent_hash: [u8; blake3::OUT_LEN],
         num_votes: usize,
-        setup: &TestSetup,
+        peer_set: &PeerSet,
+        peer_id_to_secret_key: &HashMap<PeerId, BlsSecretKey>,
     ) -> ViewContext<N, F, M_SIZE> {
         let mut ctx = ViewContext::new(view_number, leader_id, replica_id, parent_hash);
 
         // Add block
-        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let leader_sk = peer_id_to_secret_key.get(&leader_id).unwrap();
         let block = create_test_block(
             view_number,
             leader_id,
@@ -1346,12 +1389,19 @@ mod tests {
             view_number,
         );
         let block_hash = block.get_hash();
-        ctx.add_new_view_block(block, &setup.peer_set).unwrap();
+        ctx.add_new_view_block(block, peer_set).unwrap();
 
         // Add votes
         for i in 1..num_votes {
-            let vote = create_vote(i, view_number, block_hash, leader_id, setup);
-            ctx.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                view_number,
+                block_hash,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx.add_vote(vote, peer_set).unwrap();
         }
 
         ctx
@@ -1365,8 +1415,7 @@ mod tests {
         let parent_hash = [0u8; blake3::OUT_LEN];
 
         let initial_view = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let view_chain =
-            ViewChain::<N, F, M_SIZE>::new(initial_view, setup.storage, Duration::from_secs(10));
+        let view_chain = ViewChain::<N, F, M_SIZE>::new(initial_view, setup.persistence_writer);
 
         assert_eq!(view_chain.current_view_number(), 1);
         assert_eq!(view_chain.non_finalized_count(), 1);
@@ -1383,8 +1432,7 @@ mod tests {
         let parent_hash = [0u8; blake3::OUT_LEN];
 
         let initial_view = ViewContext::new(5, leader_id, replica_id, parent_hash);
-        let view_chain =
-            ViewChain::<N, F, M_SIZE>::new(initial_view, setup.storage, Duration::from_secs(10));
+        let view_chain = ViewChain::<N, F, M_SIZE>::new(initial_view, setup.persistence_writer);
 
         assert_eq!(view_chain.current().view_number, 5);
         assert_eq!(view_chain.current().leader_id, leader_id);
@@ -1405,11 +1453,12 @@ mod tests {
         let block_hash = block.get_hash();
         ctx.add_new_view_block(block, &setup.peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
-        let vote = create_vote(3, 1, block_hash, leader_id, &setup);
-        let result = view_chain.route_vote(vote, &setup.peer_set);
+        let vote = create_vote(3, 1, block_hash, leader_id, peer_set, peer_id_to_secret_key);
+        let result = view_chain.route_vote(vote, peer_set);
 
         assert!(result.is_ok());
         let votes_result = result.unwrap();
@@ -1433,29 +1482,53 @@ mod tests {
         let parent_hash = [2u8; blake3::OUT_LEN];
 
         // Create view 1 with M-notarization
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
         // Create M-notarization for view 1
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_notarization, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // Now route a vote to view 1 (unfinalized)
-        let late_vote = create_vote(4, 1, block_hash_v1, leader_id, &setup);
-        let result = view_chain.route_vote(late_vote, &setup.peer_set);
+        let late_vote = create_vote(
+            4,
+            1,
+            block_hash_v1,
+            leader_id,
+            peer_set,
+            peer_id_to_secret_key,
+        );
+        let result = view_chain.route_vote(late_vote, peer_set);
 
         assert!(result.is_ok());
 
@@ -1500,12 +1573,20 @@ mod tests {
         let parent_hash = [3u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Try to route vote to view 5 (not in chain)
-        let vote = create_vote(0, 5, [99u8; blake3::OUT_LEN], leader_id, &setup);
-        let result = view_chain.route_vote(vote, &setup.peer_set);
+        let vote = create_vote(
+            0,
+            5,
+            [99u8; blake3::OUT_LEN],
+            leader_id,
+            peer_set,
+            peer_id_to_secret_key,
+        );
+        let result = view_chain.route_vote(vote, peer_set);
 
         assert!(result.is_err());
 
@@ -1520,11 +1601,12 @@ mod tests {
         let parent_hash = [4u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
-        let nullify = create_nullify(0, 1, leader_id, &setup);
-        let result = view_chain.route_nullify(nullify.clone(), &setup.peer_set);
+        let nullify = create_nullify(0, 1, leader_id, peer_set, peer_id_to_secret_key);
+        let result = view_chain.route_nullify(nullify.clone(), peer_set);
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
@@ -1549,11 +1631,12 @@ mod tests {
         let parent_hash = [4u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         for i in 0..M_SIZE {
-            let nullify = create_nullify(i, 1, leader_id, &setup);
+            let nullify = create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key);
             let result = view_chain.route_nullify(nullify.clone(), &setup.peer_set);
             assert!(result.is_ok());
         }
@@ -1580,20 +1663,37 @@ mod tests {
         let parent_hash = [5u8; blake3::OUT_LEN];
 
         // Create view 1 with M-notarization
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_notarization, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -1633,8 +1733,7 @@ mod tests {
         let parent_hash = [6u8; blake3::OUT_LEN];
 
         let ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Try to progress without M-notarization
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -1652,20 +1751,35 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [7u8; blake3::OUT_LEN];
 
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_notarization, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_notarization, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Try to progress to view 5 (should be view 2)
         let ctx_v5 = ViewContext::new(5, leader_id, replica_id, block_hash_v1);
@@ -1684,33 +1798,62 @@ mod tests {
         let parent_hash = [8u8; blake3::OUT_LEN];
 
         // Start with view 1
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
-        let mut ctx_v2 =
-            create_view_context_with_votes(2, leader_id, replica_id, block_hash_v1, M_SIZE, &setup);
+        let mut ctx_v2 = create_view_context_with_votes(
+            2,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v2 = ctx_v2.block.as_ref().unwrap().get_hash();
 
         let votes_v2: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 2, block_hash_v2, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    2,
+                    block_hash_v2,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v2 = create_m_notarization(&votes_v2, 2, block_hash_v2, leader_id);
-        ctx_v2
-            .add_m_notarization(m_not_v2, &setup.peer_set)
-            .unwrap();
+        ctx_v2.add_m_notarization(m_not_v2, peer_set).unwrap();
 
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
@@ -1757,26 +1900,24 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [9u8; blake3::OUT_LEN];
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
 
         // Add M_SIZE nullify messages to create nullification
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
 
         for nullify in nullifies.iter() {
-            ctx_v1
-                .add_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            ctx_v1.add_nullify(nullify.clone(), peer_set).unwrap();
         }
 
         let nullification = create_nullification(&nullifies, 1, leader_id);
-        ctx_v1
-            .add_nullification(nullification, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_nullification(nullification, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress with nullification
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -1810,8 +1951,7 @@ mod tests {
         let parent_hash = [10u8; blake3::OUT_LEN];
 
         let ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Try to progress without nullification
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -1830,20 +1970,36 @@ mod tests {
         let parent_hash = [15u8; blake3::OUT_LEN];
 
         // Create view 1 with M-notarization
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -1851,12 +2007,19 @@ mod tests {
 
         // Add more votes to view 1 to reach l-notarization
         for i in M_SIZE..(N - F) {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
-            view_chain.route_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            view_chain.route_vote(vote, peer_set).unwrap();
         }
 
         // Finalize view 1 with l-notarization
-        let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(1, peer_set);
 
         assert!(result.is_ok());
         assert_eq!(view_chain.non_finalized_count(), 1); // Only view 2 remains
@@ -1892,20 +2055,34 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [16u8; blake3::OUT_LEN];
 
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
-
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress through several views
         for view_num in 2..=5 {
@@ -1921,15 +2098,30 @@ mod tests {
             };
 
             let mut ctx = create_view_context_with_votes(
-                view_num, leader_id, replica_id, prev_hash, M_SIZE, &setup,
+                view_num,
+                leader_id,
+                replica_id,
+                prev_hash,
+                M_SIZE,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
             );
             let block_hash = ctx.block.as_ref().unwrap().get_hash();
 
             let votes: HashSet<Vote> = (0..M_SIZE)
-                .map(|i| create_vote(i, view_num, block_hash, leader_id, &setup))
+                .map(|i| {
+                    create_vote(
+                        i,
+                        view_num,
+                        block_hash,
+                        leader_id,
+                        peer_set,
+                        peer_id_to_secret_key,
+                    )
+                })
                 .collect();
             let m_not = create_m_notarization(&votes, view_num, block_hash, leader_id);
-            ctx.add_m_notarization(m_not, &setup.peer_set).unwrap();
+            ctx.add_m_notarization(m_not, peer_set).unwrap();
 
             view_chain.progress_with_m_notarization(ctx).unwrap();
 
@@ -1976,20 +2168,36 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [18u8; blake3::OUT_LEN];
 
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2019,8 +2227,7 @@ mod tests {
         let parent_hash = [0u8; blake3::OUT_LEN];
 
         let genesis_ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let view_chain =
-            ViewChain::<N, F, M_SIZE>::new(genesis_ctx, setup.storage, Duration::from_secs(10));
+        let view_chain = ViewChain::<N, F, M_SIZE>::new(genesis_ctx, setup.persistence_writer);
 
         assert_eq!(view_chain.current_view_number(), 1);
         assert_eq!(view_chain.non_finalized_count(), 1);
@@ -2037,18 +2244,36 @@ mod tests {
         let parent_hash = [19u8; blake3::OUT_LEN];
 
         // Start with view 10
-        let mut ctx_v10 =
-            create_view_context_with_votes(10, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v10 = create_view_context_with_votes(
+            10,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v10 = ctx_v10.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 10, block_hash_v10, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    10,
+                    block_hash_v10,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not = create_m_notarization(&votes, 10, block_hash_v10, leader_id);
         ctx_v10.add_m_notarization(m_not, &setup.peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v10, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v10, setup.persistence_writer);
 
         // Progress to view 11
         let ctx_v11 = ViewContext::new(11, leader_id, replica_id, block_hash_v10);
@@ -2068,20 +2293,37 @@ mod tests {
         let parent_hash = [20u8; blake3::OUT_LEN];
 
         // Create view 1 with M-notarization (but not L-notarization)
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_notarization, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2114,19 +2356,36 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [21u8; blake3::OUT_LEN];
 
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
         // Add M-notarization (2f+1 = 3 votes)
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes_m: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not = create_m_notarization(&votes_m, 1, block_hash_v1, leader_id);
         ctx_v1.add_m_notarization(m_not, &setup.peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2136,14 +2395,21 @@ mod tests {
         assert_eq!(view_chain.non_finalized_count(), 2);
 
         // Now add votes to reach L-notarization threshold (n-f = 4 votes total)
-        let vote_4 = create_vote(3, 1, block_hash_v1, leader_id, &setup);
+        let vote_4 = create_vote(
+            3,
+            1,
+            block_hash_v1,
+            leader_id,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         view_chain.route_vote(vote_4, &setup.peer_set).unwrap();
 
         // View 1 still unfinalized until we explicitly finalize
         assert_eq!(view_chain.non_finalized_count(), 2);
 
         // Now finalize with L-notarization
-        let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(1, peer_set);
         assert!(result.is_ok());
 
         // After L-notarization, view 1 is removed (finalized)
@@ -2161,23 +2427,22 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [22u8; blake3::OUT_LEN];
 
-        // View 1: Nullified
+        // View 1: Nullified+
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let nullifies_v1: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies_v1.iter() {
-            ctx_v1
-                .add_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            ctx_v1.add_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification_v1 = create_nullification(&nullifies_v1, 1, leader_id);
         ctx_v1
-            .add_nullification(nullification_v1, &setup.peer_set)
+            .add_nullification(nullification_v1, peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2 with nullification
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -2208,24 +2473,32 @@ mod tests {
             .add_new_view_block(block_v1, &setup.peer_set)
             .unwrap();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         // Add 1 vote (not enough for M-notarization which needs 3)
         for i in 1..2 {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
 
         // View 1 has NO M-notarization yet
         assert!(ctx_v1.m_notarization.is_none());
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually create view 2 context (simulating view progression via nullification)
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
 
         // Add nullification to view 1 so we can progress
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies.iter() {
             view_chain
@@ -2269,24 +2542,39 @@ mod tests {
             .add_new_view_block(block_v1, &setup.peer_set)
             .unwrap();
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         // Add 1 vote (not enough for M-notarization)
         for i in 1..2 {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
-            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v1.add_vote(vote, peer_set).unwrap();
         }
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Simulate early M-notarization arrival (out of order network)
         // Create M-notarization
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        view_chain
-            .route_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        view_chain.route_m_notarization(m_not_v1, peer_set).unwrap();
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2294,12 +2582,10 @@ mod tests {
 
         // Add nullification to view 2 using route_nullify (routes to correct view)
         let nullifies_v2: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .map(|i| create_nullify(i, 2, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies_v2.iter() {
-            view_chain
-                .route_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            view_chain.route_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification_v2 = create_nullification(&nullifies_v2, 2, leader_id);
         view_chain
@@ -2335,31 +2621,45 @@ mod tests {
         let parent_hash = [24u8; blake3::OUT_LEN];
 
         // View 1: Block with M-notarization
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2 WITHOUT M-notarization (nullified)
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .map(|i| create_nullify(i, 2, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
 
         let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         for nullify in nullifies.iter() {
-            ctx_v2
-                .add_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            ctx_v2.add_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification_v2 = create_nullification(&nullifies, 2, leader_id);
         ctx_v2
@@ -2399,19 +2699,20 @@ mod tests {
         let block_hash = block.get_hash();
         ctx.add_new_view_block(block, &setup.peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Create M-notarization
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let mut votes = HashSet::new();
         for i in 0..M_SIZE {
-            let vote = create_vote(i, 1, block_hash, leader_id, &setup);
+            let vote = create_vote(i, 1, block_hash, leader_id, peer_set, peer_id_to_secret_key);
             votes.insert(vote);
         }
         let m_notarization = create_m_notarization(&votes, 1, block_hash, leader_id);
 
         // Route M-notarization
-        let result = view_chain.route_m_notarization(m_notarization, &setup.peer_set);
+        let result = view_chain.route_m_notarization(m_notarization, peer_set);
 
         assert!(result.is_ok());
         let should_m_notarize = result.unwrap();
@@ -2430,29 +2731,42 @@ mod tests {
         let parent_hash = [26u8; blake3::OUT_LEN];
 
         // View 1: M-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: Nullified
         let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         let nullifies_v2: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .map(|i| create_nullify(i, 2, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies_v2.iter() {
-            ctx_v2
-                .add_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            ctx_v2.add_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification_v2 = create_nullification(&nullifies_v2, 2, leader_id);
         ctx_v2
@@ -2461,22 +2775,43 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // View 3: M-notarized and will be L-notarized
-        let mut ctx_v3 =
-            create_view_context_with_votes(3, leader_id, replica_id, block_hash_v1, M_SIZE, &setup);
+        let mut ctx_v3 = create_view_context_with_votes(
+            3,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v3 = ctx_v3.block.as_ref().unwrap().get_hash();
         let votes_v3: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v3 = create_m_notarization(&votes_v3, 3, block_hash_v3, leader_id);
-        ctx_v3
-            .add_m_notarization(m_not_v3, &setup.peer_set)
-            .unwrap();
+        ctx_v3.add_m_notarization(m_not_v3, peer_set).unwrap();
         view_chain.progress_with_nullification(ctx_v3).unwrap();
 
         // Add votes to view 3 for L-notarization
         for i in M_SIZE..(N - F) {
-            let vote = create_vote(i, 3, block_hash_v3, leader_id, &setup);
-            view_chain.route_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                3,
+                block_hash_v3,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            view_chain.route_vote(vote, peer_set).unwrap();
         }
 
         // View 4: Current
@@ -2484,7 +2819,7 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v4).unwrap();
 
         // Finalize view 3
-        let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(3, peer_set);
 
         // Should succeed and persist view 1, view 2 (nullified), and view 3 (finalized)
 
@@ -2506,19 +2841,37 @@ mod tests {
         let parent_hash = [27u8; blake3::OUT_LEN];
 
         // View 1: M-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_not_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: NOT nullified (just progressed somehow - simulate this)
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2535,7 +2888,7 @@ mod tests {
         // Should FAIL because view 2 (intermediate) is not nullified
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v3 = create_test_block(3, leader_id, block_hash_v1, leader_sk.clone(), 2);
-        let result = view_chain.add_block_proposal(3, block_v3, &setup.peer_set);
+        let result = view_chain.add_block_proposal(3, block_v3, peer_set);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not nullified"));
@@ -2552,29 +2905,25 @@ mod tests {
         let parent_hash = [28u8; blake3::OUT_LEN];
 
         // View 1: Nullified
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash_v1 = block_v1.get_hash();
-        ctx_v1
-            .add_new_view_block(block_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_new_view_block(block_v1, peer_set).unwrap();
 
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies.iter() {
-            ctx_v1
-                .add_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            ctx_v1.add_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification = create_nullification(&nullifies, 1, leader_id);
-        ctx_v1
-            .add_nullification(nullification, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_nullification(nullification, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -2583,7 +2932,7 @@ mod tests {
         // Try to propose block for view 2 building on nullified view 1
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
-        let result = view_chain.add_block_proposal(2, block_v2, &setup.peer_set);
+        let result = view_chain.add_block_proposal(2, block_v2, peer_set);
 
         // Should FAIL - cannot build on nullified parent
         assert!(result.is_err());
@@ -2601,55 +2950,65 @@ mod tests {
         let parent_hash = [30u8; blake3::OUT_LEN];
 
         // View 1: Block but NO M-notarization
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash_v1 = block_v1.get_hash();
-        ctx_v1
-            .add_new_view_block(block_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_new_view_block(block_v1, peer_set).unwrap();
         // Only 1 vote - not enough for M-notarization
         for i in 1..2 {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
-            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v1.add_vote(vote, peer_set).unwrap();
         }
         assert!(ctx_v1.m_notarization.is_none());
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually progress to view 2 (simulate nullification)
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies.iter() {
-            view_chain
-                .route_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            view_chain.route_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification = create_nullification(&nullifies, 1, leader_id);
         view_chain
-            .route_nullification(nullification, &setup.peer_set)
+            .route_nullification(nullification, peer_set)
             .unwrap();
 
         let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let block_hash_v2 = block_v2.get_hash();
-        ctx_v2
-            .add_new_view_block(block_v2, &setup.peer_set)
-            .unwrap();
+        ctx_v2.add_new_view_block(block_v2, peer_set).unwrap();
 
         // Add L-notarization to view 2
         for i in 1..(N - F) {
-            let vote = create_vote(i, 2, block_hash_v2, leader_id, &setup);
-            ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                2,
+                block_hash_v2,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v2.add_vote(vote, peer_set).unwrap();
         }
 
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
         // Try to finalize view 2 - should FAIL because parent (view 1) has no M-notarization
-        let result = view_chain.finalize_with_l_notarization(2, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(2, peer_set);
 
         assert!(result.is_err());
         assert!(
@@ -2671,19 +3030,35 @@ mod tests {
         let parent_hash = [31u8; blake3::OUT_LEN];
 
         // View 1: M-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: NOT nullified (just progressed)
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2694,18 +3069,23 @@ mod tests {
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v3 = create_test_block(3, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let block_hash_v3 = block_v3.get_hash();
-        ctx_v3
-            .add_new_view_block(block_v3, &setup.peer_set)
-            .unwrap();
+        ctx_v3.add_new_view_block(block_v3, peer_set).unwrap();
         for i in 1..(N - F) {
-            let vote = create_vote(i, 3, block_hash_v3, leader_id, &setup);
-            ctx_v3.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                3,
+                block_hash_v3,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v3.add_vote(vote, peer_set).unwrap();
         }
         view_chain.current_view = 3;
         view_chain.non_finalized_views.insert(3, ctx_v3);
 
         // Try to finalize view 3 - should FAIL because view 2 is not nullified
-        let result = view_chain.finalize_with_l_notarization(3, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(3, peer_set);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("is not nullified"));
@@ -2722,19 +3102,35 @@ mod tests {
         let parent_hash = [32u8; blake3::OUT_LEN];
 
         // View 1: M-notarized but not L-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -2742,7 +3138,7 @@ mod tests {
 
         // Try to finalize view 1 - should FAIL because it only has M-notarization (3 votes), not L
         // (4 votes)
-        let result = view_chain.finalize_with_l_notarization(1, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(1, peer_set);
 
         assert!(result.is_err());
         assert!(
@@ -2765,38 +3161,75 @@ mod tests {
         let parent_hash = [34u8; blake3::OUT_LEN];
 
         // View 1: Initially M-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: L-notarized
-        let mut ctx_v2 =
-            create_view_context_with_votes(2, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let mut ctx_v2 = create_view_context_with_votes(
+            2,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            N - F,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         let block_hash_v2 = ctx_v2.block.as_ref().unwrap().get_hash();
         let votes_v2_m: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 2, block_hash_v2, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    2,
+                    block_hash_v2,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v2 = create_m_notarization(&votes_v2_m, 2, block_hash_v2, leader_id);
-        ctx_v2
-            .add_m_notarization(m_not_v2, &setup.peer_set)
-            .unwrap();
+        ctx_v2.add_m_notarization(m_not_v2, peer_set).unwrap();
 
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // Now add more votes to view 1 to get L-notarization
         for i in M_SIZE..(N - F) {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
-            view_chain.route_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            view_chain.route_vote(vote, peer_set).unwrap();
         }
 
         // Progress to view 3
@@ -2804,7 +3237,7 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v3).unwrap();
 
         // Finalize view 2 - should persist both view 1 (L-notarized) and view 2 (L-notarized)
-        let result = view_chain.finalize_with_l_notarization(2, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(2, peer_set);
 
         assert!(result.is_ok());
         assert_eq!(view_chain.non_finalized_count(), 1); // Only view 3 remains
@@ -2822,20 +3255,36 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [35u8; blake3::OUT_LEN];
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         // View 1: L-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, N - F, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            N - F,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1_m: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1_m, 1, block_hash_v1, leader_id);
-        ctx_v1
-            .add_m_notarization(m_not_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_m_notarization(m_not_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Views 2, 3, 4: All nullified
         for view_num in 2..=4 {
@@ -2849,30 +3298,42 @@ mod tests {
 
             // Add nullifications
             let nullifies: HashSet<Nullify> = (0..M_SIZE)
-                .map(|i| create_nullify(i, view_num, leader_id, &setup))
+                .map(|i| create_nullify(i, view_num, leader_id, peer_set, peer_id_to_secret_key))
                 .collect();
             for nullify in nullifies.iter() {
-                view_chain
-                    .route_nullify(nullify.clone(), &setup.peer_set)
-                    .unwrap();
+                view_chain.route_nullify(nullify.clone(), peer_set).unwrap();
             }
             let nullification = create_nullification(&nullifies, view_num, leader_id);
             view_chain
-                .route_nullification(nullification, &setup.peer_set)
+                .route_nullification(nullification, peer_set)
                 .unwrap();
         }
 
         // View 5: L-notarized, building on view 1
-        let mut ctx_v5 =
-            create_view_context_with_votes(5, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let mut ctx_v5 = create_view_context_with_votes(
+            5,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            N - F,
+            peer_set,
+            peer_id_to_secret_key,
+        );
         let block_hash_v5 = ctx_v5.block.as_ref().unwrap().get_hash();
         let votes_v5_m: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 5, block_hash_v5, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    5,
+                    block_hash_v5,
+                    leader_id,
+                    peer_set,
+                    peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v5 = create_m_notarization(&votes_v5_m, 5, block_hash_v5, leader_id);
-        ctx_v5
-            .add_m_notarization(m_not_v5, &setup.peer_set)
-            .unwrap();
+        ctx_v5.add_m_notarization(m_not_v5, peer_set).unwrap();
 
         view_chain.current_view = 5;
         view_chain.non_finalized_views.insert(5, ctx_v5);
@@ -2883,7 +3344,7 @@ mod tests {
         view_chain.non_finalized_views.insert(6, ctx_v6);
 
         // Finalize view 5 - should persist all views 1-5
-        let result = view_chain.finalize_with_l_notarization(5, &setup.peer_set);
+        let result = view_chain.finalize_with_l_notarization(5, peer_set);
 
         assert!(result.is_ok());
         assert_eq!(view_chain.non_finalized_count(), 1); // Only view 6 remains
@@ -2902,30 +3363,28 @@ mod tests {
         let replica_id = setup.replica_id(1);
         let parent_hash = [40u8; blake3::OUT_LEN];
 
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         // View 1: Block without M-notarization
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash_v1 = block_v1.get_hash();
-        ctx_v1
-            .add_new_view_block(block_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_new_view_block(block_v1, peer_set).unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually progress to view 2 and 3 with nullification
         let nullifies_v1: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies_v1.iter() {
-            view_chain
-                .route_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            view_chain.route_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification_v1 = create_nullification(&nullifies_v1, 1, leader_id);
         view_chain
-            .route_nullification(nullification_v1, &setup.peer_set)
+            .route_nullification(nullification_v1, peer_set)
             .unwrap();
 
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -2938,7 +3397,7 @@ mod tests {
         // Propose blocks for view 2 and 3 - they should be pending
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
-        let result_v2 = view_chain.add_block_proposal(2, block_v2, &setup.peer_set);
+        let result_v2 = view_chain.add_block_proposal(2, block_v2, peer_set);
         // This will fail because current_view is 3, not 2
         assert!(result_v2.is_err());
 
@@ -2955,34 +3414,39 @@ mod tests {
         let parent_hash = [40u8; blake3::OUT_LEN];
 
         // View 1: Block with only 2 votes (no M-notarization yet)
+        let peer_set = &setup.peer_set;
+        let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
+
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
         let block_hash_v1 = block_v1.get_hash();
-        ctx_v1
-            .add_new_view_block(block_v1, &setup.peer_set)
-            .unwrap();
+        ctx_v1.add_new_view_block(block_v1, peer_set).unwrap();
 
         for i in 1..2 {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
-            ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v1.add_vote(vote, peer_set).unwrap();
         }
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually progress to view 2 via nullification of view 1
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies.iter() {
-            view_chain
-                .route_nullify(nullify.clone(), &setup.peer_set)
-                .unwrap();
+            view_chain.route_nullify(nullify.clone(), peer_set).unwrap();
         }
         let nullification = create_nullification(&nullifies, 1, leader_id);
         view_chain
-            .route_nullification(nullification, &setup.peer_set)
+            .route_nullification(nullification, peer_set)
             .unwrap();
 
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -2992,7 +3456,7 @@ mod tests {
         // This should fail because parent is nullified
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
-        let result = view_chain.add_block_proposal(2, block_v2, &setup.peer_set);
+        let result = view_chain.add_block_proposal(2, block_v2, peer_set);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nullified"));
@@ -3009,8 +3473,7 @@ mod tests {
         let parent_hash = Block::genesis_hash();
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Add first block proposal
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
@@ -3056,8 +3519,7 @@ mod tests {
             .add_new_view_block(block_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually insert view 2 (simulating progression without going through normal flow)
         // This avoids nullifying view 1
@@ -3115,16 +3577,30 @@ mod tests {
             .unwrap();
 
         for i in 1..2 {
-            let vote = create_vote(i, 1, block_hash_v1, leader_id, &setup);
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for nullify in nullifies.iter() {
             view_chain
@@ -3167,7 +3643,15 @@ mod tests {
             .unwrap();
 
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for nullify in nullifies.iter() {
             ctx_v1
@@ -3179,8 +3663,7 @@ mod tests {
             .add_nullification(nullification, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
@@ -3188,7 +3671,16 @@ mod tests {
 
         // Now M-notarization arrives for view 1 (late)
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
 
@@ -3240,12 +3732,19 @@ mod tests {
             .add_new_view_block(block_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Manually progress to view 2 (simulating nullification)
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 1, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for nullify in nullifies.iter() {
             view_chain
@@ -3284,7 +3783,15 @@ mod tests {
         // View 2: Nullified
         let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, finalized_hash);
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    2,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for nullify in nullifies.iter() {
             ctx_v2
@@ -3296,16 +3803,31 @@ mod tests {
             .add_nullification(nullification, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v2, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v2, setup.persistence_writer);
         view_chain.previously_committed_block_hash = finalized_hash;
 
         // View 3: L-notarized building on finalized view
-        let mut ctx_v3 =
-            create_view_context_with_votes(3, leader_id, replica_id, finalized_hash, N - F, &setup);
+        let mut ctx_v3 = create_view_context_with_votes(
+            3,
+            leader_id,
+            replica_id,
+            finalized_hash,
+            N - F,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v3 = ctx_v3.block.as_ref().unwrap().get_hash();
         let votes_v3: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v3 = create_m_notarization(&votes_v3, 3, block_hash_v3, leader_id);
         ctx_v3
@@ -3336,19 +3858,34 @@ mod tests {
         let parent_hash = [45u8; blake3::OUT_LEN];
 
         // View 1: M-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_not_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2 and 3
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -3373,8 +3910,7 @@ mod tests {
         let parent_hash = [46u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(10, leader_id, replica_id, parent_hash);
-        let view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage, Duration::from_secs(10));
+        let view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Current view is 10, try to get range until view 5
         let range = view_chain.non_finalized_views_until(5);
@@ -3392,8 +3928,7 @@ mod tests {
         let parent_hash = [47u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(5, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage, Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Try to finalize view 10 (future)
         let result = view_chain.finalize_with_l_notarization(10, &setup.peer_set);
@@ -3413,26 +3948,57 @@ mod tests {
         let parent_hash = [48u8; blake3::OUT_LEN];
 
         // View 1: L-notarized
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, N - F, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            N - F,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_not_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: L-notarized
-        let mut ctx_v2 =
-            create_view_context_with_votes(2, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let mut ctx_v2 = create_view_context_with_votes(
+            2,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            N - F,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v2 = ctx_v2.block.as_ref().unwrap().get_hash();
         let votes_v2: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 2, block_hash_v2, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    2,
+                    block_hash_v2,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v2 = create_m_notarization(&votes_v2, 2, block_hash_v2, leader_id);
         ctx_v2
@@ -3441,11 +4007,27 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // View 3: L-notarized
-        let mut ctx_v3 =
-            create_view_context_with_votes(3, leader_id, replica_id, block_hash_v2, N - F, &setup);
+        let mut ctx_v3 = create_view_context_with_votes(
+            3,
+            leader_id,
+            replica_id,
+            block_hash_v2,
+            N - F,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v3 = ctx_v3.block.as_ref().unwrap().get_hash();
         let votes_v3: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v3 = create_m_notarization(&votes_v3, 3, block_hash_v3, leader_id);
         ctx_v3
@@ -3475,12 +4057,20 @@ mod tests {
         let parent_hash = [49u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Create M-notarization for view 5 (doesn't exist)
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 5, [88u8; 32], leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    5,
+                    [88u8; 32],
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 5, [88u8; 32], leader_id);
 
@@ -3506,12 +4096,19 @@ mod tests {
         let parent_hash = [50u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Create nullification for view 7
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 7, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    7,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let nullification = create_nullification(&nullifies, 7, leader_id);
 
@@ -3537,8 +4134,7 @@ mod tests {
         let finalized_hash = [51u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, finalized_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         view_chain.previously_committed_block_hash = finalized_hash;
 
@@ -3564,8 +4160,7 @@ mod tests {
         let parent_hash = [52u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Different parent hash that doesn't exist anywhere
         let unknown_parent = [77u8; blake3::OUT_LEN];
@@ -3593,26 +4188,48 @@ mod tests {
         let parent_hash = [53u8; blake3::OUT_LEN];
 
         // View 1: M-notarization
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_notarization = create_m_notarization(&votes, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_notarization, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // Progress to view 2
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // Add 4th vote to view 1 to reach L-notarization
-        let vote_4 = create_vote(3, 1, block_hash_v1, leader_id, &setup);
+        let vote_4 = create_vote(
+            3,
+            1,
+            block_hash_v1,
+            leader_id,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let result = view_chain.route_vote(vote_4, &setup.peer_set);
 
         assert!(result.is_ok());
@@ -3648,16 +4265,31 @@ mod tests {
         let mut ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
         ctx.block_hash = Some([66u8; 32]);
         for i in 0..(N - F) {
-            let vote = create_vote(i, 1, [66u8; 32], leader_id, &setup);
+            let vote = create_vote(
+                i,
+                1,
+                [66u8; 32],
+                leader_id,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             ctx.votes.insert(vote);
         }
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Add M-notarization manually
         let votes: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, [66u8; 32], leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    [66u8; 32],
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not = create_m_notarization(&votes, 1, [66u8; 32], leader_id);
         view_chain
@@ -3688,23 +4320,45 @@ mod tests {
         let parent_hash = [55u8; blake3::OUT_LEN];
 
         // View 1
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_not_v1, &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2
-        let ctx_v2 =
-            create_view_context_with_votes(2, leader_id, replica_id, block_hash_v1, M_SIZE, &setup);
+        let ctx_v2 = create_view_context_with_votes(
+            2,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // Find parent of view 2 (should be view 1)
@@ -3732,20 +4386,35 @@ mod tests {
         let parent_hash = [60u8; blake3::OUT_LEN];
 
         // View 1: M-notarized with full votes
-        let mut ctx_v1 =
-            create_view_context_with_votes(1, leader_id, replica_id, parent_hash, M_SIZE, &setup);
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
         let block_hash_v1 = block_v1.get_hash();
         let votes_v1: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 1, block_hash_v1, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
         ctx_v1
             .add_m_notarization(m_not_v1.clone(), &setup.peer_set)
             .unwrap();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // View 2: Nullified
         let mut ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
@@ -3758,7 +4427,15 @@ mod tests {
             .unwrap();
 
         let nullifies_v2: HashSet<Nullify> = (0..M_SIZE)
-            .map(|i| create_nullify(i, 2, leader_id, &setup))
+            .map(|i| {
+                create_nullify(
+                    i,
+                    2,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for nullify in nullifies_v2.iter() {
             ctx_v2
@@ -3772,12 +4449,28 @@ mod tests {
         view_chain.progress_with_m_notarization(ctx_v2).unwrap();
 
         // View 3: L-notarized building on view 1
-        let mut ctx_v3 =
-            create_view_context_with_votes(3, leader_id, replica_id, block_hash_v1, N - F, &setup);
+        let mut ctx_v3 = create_view_context_with_votes(
+            3,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            N - F,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_v3 = ctx_v3.block.as_ref().unwrap().clone();
         let block_hash_v3 = block_v3.get_hash();
         let votes_v3_m: HashSet<Vote> = (0..M_SIZE)
-            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         let m_not_v3 = create_m_notarization(&votes_v3_m, 3, block_hash_v3, leader_id);
         ctx_v3
@@ -3794,105 +4487,107 @@ mod tests {
         assert!(result.is_ok());
 
         // Now verify ALL data was persisted to the database
-        let storage = &setup.storage;
+        let storage = &view_chain.persistence_writer;
 
         // Check block was persisted (as M-notarized, not finalized)
-        let stored_block_v1 = storage.get_finalized_block(&block_hash_v1).unwrap();
+        let stored_block_v1 = storage.store().get_finalized_block(&block_hash_v1).unwrap();
         assert!(stored_block_v1.is_some());
         let stored_block_v1 = stored_block_v1.unwrap();
         assert_eq!(stored_block_v1.get_hash(), block_hash_v1);
         assert_eq!(stored_block_v1.view(), 1);
 
-        // Check transactions from view 1 were persisted
-        for tx in block_v1.transactions.iter() {
-            let stored_tx = storage.get_transaction(&tx.tx_hash).unwrap();
-            assert!(stored_tx.is_some());
-        }
-
         // Check M-notarization for view 1 was persisted
         let stored_m_not_v1 = storage
+            .store()
             .get_notarization::<N, F, M_SIZE>(&block_hash_v1)
             .unwrap();
         assert!(stored_m_not_v1.is_some());
 
         // Check votes for view 1 were persisted
         for vote in votes_v1.iter() {
-            let stored_vote = storage.get_vote(vote.key()).unwrap();
+            let stored_vote = storage.store().get_vote(vote.key()).unwrap();
             assert!(stored_vote.is_some());
         }
 
         // Check leader metadata for view 1
-        let stored_leader_v1 = storage.get_leader(1).unwrap();
+        let stored_leader_v1 = storage.store().get_leader(1).unwrap();
         assert!(stored_leader_v1.is_some());
         assert_eq!(stored_leader_v1.unwrap().peer_id, leader_id);
 
         // Check view metadata for view 1
-        let stored_view_v1 = storage.get_view(1).unwrap();
+        let stored_view_v1 = storage.store().get_view(1).unwrap();
         assert!(stored_view_v1.is_some());
 
         // Check block was persisted as nullified
-        let stored_block_v2 = storage.get_nullified_block(&block_hash_v2).unwrap();
+        let stored_block_v2 = storage.store().get_nullified_block(&block_hash_v2).unwrap();
         assert!(stored_block_v2.is_some());
 
         // Check nullification for view 2 was persisted
-        let stored_nullification_v2 = storage.get_nullification::<N, F, M_SIZE>(2).unwrap();
+        let stored_nullification_v2 = storage
+            .store()
+            .get_nullification::<N, F, M_SIZE>(2)
+            .unwrap();
         assert!(stored_nullification_v2.is_some());
 
         // Check nullify messages for view 2 were persisted
         for nullify in nullifies_v2.iter() {
-            let stored_nullify = storage.get_nullify(nullify.view).unwrap();
+            let stored_nullify = storage.store().get_nullify(nullify.view).unwrap();
             assert!(stored_nullify.is_some());
         }
 
         // Check leader metadata for view 2
-        let stored_leader_v2 = storage.get_leader(2).unwrap();
+        let stored_leader_v2 = storage.store().get_leader(2).unwrap();
         assert!(stored_leader_v2.is_some());
         assert_eq!(stored_leader_v2.unwrap().peer_id, leader_id);
 
         // Check view metadata for view 2
-        let stored_view_v2 = storage.get_view(2).unwrap();
+        let stored_view_v2 = storage.store().get_view(2).unwrap();
         assert!(stored_view_v2.is_some());
 
         // Check block was persisted as finalized
-        let stored_block_v3 = storage.get_finalized_block(&block_hash_v3).unwrap();
+        let stored_block_v3 = storage.store().get_finalized_block(&block_hash_v3).unwrap();
         assert!(stored_block_v3.is_some());
         let stored_block_v3 = stored_block_v3.unwrap();
         assert_eq!(stored_block_v3.get_hash(), block_hash_v3);
         assert_eq!(stored_block_v3.view(), 3);
         assert!(stored_block_v3.is_finalized); // Critical: must be marked as finalized
 
-        // Check transactions from view 3 were persisted
-        for tx in block_v3.transactions.iter() {
-            let stored_tx = storage.get_transaction(&tx.tx_hash).unwrap();
-            assert!(stored_tx.is_some());
-        }
-
         // Check M-notarization for view 3 was persisted
         let stored_m_not_v3 = storage
+            .store()
             .get_notarization::<N, F, M_SIZE>(&block_hash_v3)
             .unwrap();
         assert!(stored_m_not_v3.is_some());
 
         // Check ALL votes for view 3 were persisted (including L-notarization votes)
         let all_votes_v3: Vec<Vote> = (0..(N - F))
-            .map(|i| create_vote(i, 3, block_hash_v3, leader_id, &setup))
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
             .collect();
         for vote in all_votes_v3.iter() {
-            let stored_vote = storage.get_vote(vote.key()).unwrap();
+            let stored_vote = storage.store().get_vote(vote.key()).unwrap();
             assert!(stored_vote.is_some());
         }
 
         // Check leader metadata for view 3
-        let stored_leader_v3 = storage.get_leader(3).unwrap();
+        let stored_leader_v3 = storage.store().get_leader(3).unwrap();
         assert!(stored_leader_v3.is_some());
         assert_eq!(stored_leader_v3.unwrap().peer_id, leader_id);
 
         // Check view metadata for view 3 - should be marked as finalized
-        let stored_view_v3 = storage.get_view(3).unwrap();
+        let stored_view_v3 = storage.store().get_view(3).unwrap();
         assert!(stored_view_v3.is_some());
         // Note: The view metadata should indicate it's finalized
 
-        let stored_leader_v4 = storage.get_leader(4).unwrap();
+        let stored_leader_v4 = storage.store().get_leader(4).unwrap();
         assert!(stored_leader_v4.is_none());
 
         // Verify the chain state is correct after finalization
@@ -3914,13 +4609,21 @@ mod tests {
             setup.replica_id(1),
             [0u8; 32],
             0,
-            &setup,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
         );
-        let mut chain =
-            ViewChain::new(initial_view, setup.storage.clone(), Duration::from_secs(10));
+        let older_leader = setup.leader_id(0);
+        let mut chain = ViewChain::new(initial_view, setup.persistence_writer);
 
         // Test Vote for old view
-        let old_vote = create_vote(2, 5, [0u8; 32], setup.leader_id(0), &setup);
+        let old_vote = create_vote(
+            2,
+            5,
+            [0u8; 32],
+            older_leader,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let vote_result = chain.route_vote(old_vote, &setup.peer_set);
         assert!(vote_result.is_ok());
         let res = vote_result.unwrap();
@@ -3930,9 +4633,16 @@ mod tests {
         let mut votes = HashSet::new();
         // Fix: create enough votes to satisfy the threshold (3 for N=4, F=1)
         for i in 0..3 {
-            votes.insert(create_vote(i, 5, [0u8; 32], setup.leader_id(0), &setup));
+            votes.insert(create_vote(
+                i,
+                5,
+                [0u8; 32],
+                older_leader,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            ));
         }
-        let old_m_not = create_m_notarization(&votes, 5, [0u8; 32], setup.leader_id(0));
+        let old_m_not = create_m_notarization(&votes, 5, [0u8; 32], older_leader);
         let m_res = chain.route_m_notarization(old_m_not, &setup.peer_set);
         assert!(m_res.is_ok());
         let res = m_res.unwrap();
@@ -3949,12 +4659,18 @@ mod tests {
 
         // Create view 1 with M-notarization
         // Use leader at index 0, so votes from indices 1, 2 won't conflict
-        let ctx_v1 =
-            create_view_context_with_votes(1, leader_v1, replica_id, parent_hash, M_SIZE, &setup);
+        let ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_v1,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // For view 2, we need to create the context manually to avoid vote conflicts
         // since leader_v2 is at index 1, which would conflict with the voter at index 1
@@ -3971,7 +4687,14 @@ mod tests {
         // Add votes from peers that are NOT the leader (indices 2, 3, etc.)
         // Leader at index 1 already has implicit vote from block proposal
         for i in 2..(M_SIZE + 1) {
-            let vote = create_vote(i, 2, block_hash_v2, leader_v2, &setup);
+            let vote = create_vote(
+                i,
+                2,
+                block_hash_v2,
+                leader_v2,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
         }
 
@@ -4022,12 +4745,18 @@ mod tests {
         let parent_hash = [2u8; blake3::OUT_LEN];
 
         // Create view 1 with M-notarization
-        let ctx_v1 =
-            create_view_context_with_votes(1, leader_v1, replica_id, parent_hash, M_SIZE, &setup);
+        let ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_v1,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
         let block_hash_v1 = ctx_v1.block.as_ref().unwrap().get_hash();
 
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
         // For view 2, manually create context to avoid vote conflicts
         // since leader_v2 is at index 1, which would conflict with voter at index 1
@@ -4043,7 +4772,14 @@ mod tests {
 
         // Add votes from peers that are NOT the leader (indices 2, 3, etc.)
         for i in 2..(M_SIZE + 1) {
-            let vote = create_vote(i, 2, block_hash_v2, leader_v2, &setup);
+            let vote = create_vote(
+                i,
+                2,
+                block_hash_v2,
+                leader_v2,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             ctx_v2.add_vote(vote, &setup.peer_set).unwrap();
         }
 
@@ -4052,7 +4788,13 @@ mod tests {
         // Add nullification quorum to view 1
         let mut nullify_messages = HashSet::new();
         for i in 0..M_SIZE {
-            let nullify = create_nullify(i, 1, leader_v1, &setup);
+            let nullify = create_nullify(
+                i,
+                1,
+                leader_v1,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             nullify_messages.insert(nullify);
         }
         let nullification = create_nullification(&nullify_messages, 1, leader_v1);
@@ -4073,7 +4815,13 @@ mod tests {
         // Now add nullification to view 2 as well
         let mut nullify_messages_v2 = HashSet::new();
         for i in 0..M_SIZE {
-            let nullify = create_nullify(i, 2, leader_v2, &setup);
+            let nullify = create_nullify(
+                i,
+                2,
+                leader_v2,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             nullify_messages_v2.insert(nullify);
         }
         let nullification_v2 = create_nullification(&nullify_messages_v2, 2, leader_v2);
@@ -4099,13 +4847,18 @@ mod tests {
         let parent_hash = [3u8; blake3::OUT_LEN];
 
         let ctx = ViewContext::new(1, leader_id, replica_id, parent_hash);
-        let mut view_chain =
-            ViewChain::<N, F, M_SIZE>::new(ctx, setup.storage.clone(), Duration::from_secs(10));
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx, setup.persistence_writer);
 
         // Create nullification
         let mut nullify_messages = HashSet::new();
         for i in 0..M_SIZE {
-            let nullify = create_nullify(i, 1, leader_id, &setup);
+            let nullify = create_nullify(
+                i,
+                1,
+                leader_id,
+                &setup.peer_set,
+                &setup.peer_id_to_secret_key,
+            );
             nullify_messages.insert(nullify);
         }
         let nullification = create_nullification(&nullify_messages, 1, leader_id);

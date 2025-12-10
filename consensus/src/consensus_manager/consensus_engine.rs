@@ -135,8 +135,8 @@ use crate::{
         view_manager::ViewProgressManager,
     },
     crypto::aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
-    state::{peer::PeerSet, transaction::Transaction},
-    storage::store::ConsensusStore,
+    state::peer::PeerSet,
+    validation::{PendingStateWriter, ValidatedBlock},
 };
 
 /// [`ConsensusEngine`] is the high-level interface for running the Minimmit consensus protocol.
@@ -175,10 +175,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         config: ConsensusConfig,
         replica_id: PeerId,
         secret_key: BlsSecretKey,
-        storage: ConsensusStore,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-        transaction_consumer: Consumer<Transaction>,
+        validated_block_consumer: Consumer<ValidatedBlock>,
+        persistence_writer: PendingStateWriter,
         tick_interval: Duration,
         logger: slog::Logger,
     ) -> Result<Self> {
@@ -210,9 +210,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         };
 
         // Create view progress manager
-        let view_manager =
-            ViewProgressManager::new(config, replica_id, storage, leader_manager, logger.clone())
-                .context("Failed to create ViewProgressManager")?;
+        let view_manager = ViewProgressManager::new(
+            config,
+            replica_id,
+            leader_manager,
+            persistence_writer,
+            logger.clone(),
+        )
+        .context("Failed to create ViewProgressManager")?;
 
         // Build consensus state machine
         let mut state_machine = ConsensusStateMachineBuilder::new()
@@ -220,7 +225,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
             .with_secret_key(secret_key)
             .with_message_consumer(message_consumer)
             .with_broadcast_producer(broadcast_producer)
-            .with_transaction_consumer(transaction_consumer)
+            .with_validated_block_consumer(validated_block_consumer)
             .with_tick_interval(tick_interval)
             .with_shutdown_signal(shutdown_signal.clone())
             .with_logger(logger.clone())
@@ -357,6 +362,7 @@ mod tests {
     use super::*;
     use crate::crypto::aggregated::BlsSecretKey;
     use crate::state::peer::PeerSet;
+    use crate::storage::store::ConsensusStore;
     use ark_serialize::CanonicalSerialize;
     use rand::thread_rng;
     use rtrb::RingBuffer;
@@ -407,6 +413,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("consensus.redb");
         let storage = ConsensusStore::open(&db_path).unwrap();
+        let (pending_state_writer, _pending_state_reader) =
+            PendingStateWriter::new(Arc::new(storage), 0);
 
         // Create logger
         let logger = slog::Logger::root(slog::Discard, slog::o!());
@@ -415,8 +423,9 @@ mod tests {
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create transaction consumer
-        let (_transaction_producer, transaction_consumer) = RingBuffer::new(1000);
+        // Create validated block consumer
+        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
+
         // Create tick interval
         let tick_interval = Duration::from_millis(10);
 
@@ -425,10 +434,10 @@ mod tests {
             config,
             replica_id,
             secret_key,
-            storage,
             message_consumer,
             broadcast_producer,
-            transaction_consumer,
+            validated_block_consumer,
+            pending_state_writer,
             tick_interval,
             logger,
         );
@@ -470,14 +479,17 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("consensus.redb");
         let storage = ConsensusStore::open(&db_path).unwrap();
+        let (pending_state_writer, _pending_state_reader) =
+            PendingStateWriter::new(Arc::new(storage), 0);
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         // Create message consumer
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create transaction consumer
-        let (_transaction_producer, transaction_consumer) = RingBuffer::new(1000);
+        // Create validated block consumer
+        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
+
         // Create tick interval
         let tick_interval = Duration::from_millis(10);
 
@@ -485,10 +497,10 @@ mod tests {
             config,
             replica_id,
             secret_key,
-            storage,
             message_consumer,
             broadcast_producer,
-            transaction_consumer,
+            validated_block_consumer,
+            pending_state_writer,
             tick_interval,
             logger,
         )

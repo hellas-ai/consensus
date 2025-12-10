@@ -13,8 +13,16 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::{ArcSwap, Guard};
 
-use crate::state::account::Account;
-use crate::state::address::Address;
+use crate::state::{
+    account::Account,
+    address::Address,
+    block::Block,
+    leader::Leader,
+    notarizations::{MNotarization, Vote},
+    nullify::{Nullification, Nullify},
+    transaction::Transaction,
+    view::View,
+};
 use crate::storage::store::ConsensusStore;
 
 use super::types::{AccountUpdate, StateDiff};
@@ -135,9 +143,9 @@ impl PendingStateWriter {
     }
 
     /// Called when a block is m-notarized: adds its StateDiff as pending.
-    pub fn add_m_notarized_diff(&mut self, view: u64, diff: StateDiff) {
+    pub fn add_m_notarized_diff(&mut self, view: u64, diff: Arc<StateDiff>) {
         if view > self.last_finalized_view {
-            self.pending_diffs.insert(view, Arc::new(diff));
+            self.pending_diffs.insert(view, diff);
             self.publish_snapshot();
         }
     }
@@ -230,6 +238,66 @@ impl PendingStateWriter {
 
         Ok(())
     }
+
+    /// Stores a finalized block (L-notarized).
+    pub fn put_finalized_block(&self, block: &Block) -> anyhow::Result<()> {
+        self.store.put_finalized_block(block)
+    }
+
+    /// Stores a non-finalized block (M-notarized but not L-notarized).
+    pub fn put_non_finalized_block(&self, block: &Block) -> anyhow::Result<()> {
+        self.store.put_non_finalized_block(block)
+    }
+
+    /// Stores a nullified block.
+    pub fn put_nullified_block(&self, block: &Block) -> anyhow::Result<()> {
+        self.store.put_nullified_block(block)
+    }
+
+    /// Stores an M-notarization (2F+1 vote proof for view progression).
+    pub fn put_m_notarization<const N: usize, const F: usize, const M_SIZE: usize>(
+        &self,
+        notarization: &MNotarization<N, F, M_SIZE>,
+    ) -> anyhow::Result<()> {
+        self.store.put_notarization(notarization)
+    }
+
+    /// Stores a nullification (2F+1 nullify proof for view progression).
+    pub fn put_nullification<const N: usize, const F: usize, const L_SIZE: usize>(
+        &self,
+        nullification: &Nullification<N, F, L_SIZE>,
+    ) -> anyhow::Result<()> {
+        self.store.put_nullification(nullification)
+    }
+
+    /// Stores an individual vote.
+    pub fn put_vote(&self, vote: &Vote) -> anyhow::Result<()> {
+        self.store.put_vote(vote)
+    }
+
+    /// Stores an individual nullify message.
+    pub fn put_nullify(&self, nullify: &Nullify) -> anyhow::Result<()> {
+        self.store.put_nullify(nullify)
+    }
+
+    /// Stores view metadata.
+    pub fn put_view(&self, view: &View) -> anyhow::Result<()> {
+        self.store.put_view(view)
+    }
+
+    /// Stores leader for a view.
+    pub fn put_leader(&self, leader: &Leader) -> anyhow::Result<()> {
+        self.store.put_leader(leader)
+    }
+
+    /// Stores a transaction.
+    pub fn put_transaction(&self, transaction: &Transaction) -> anyhow::Result<()> {
+        self.store.put_transaction(transaction)
+    }
+
+    pub fn store(&self) -> Arc<ConsensusStore> {
+        self.store.clone()
+    }
 }
 
 /// Reader handle for the validation thread.
@@ -304,7 +372,7 @@ mod tests {
         // Writer adds pending creation
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Reader now sees the account (lock-free!)
         let state = reader.get_account(&addr).unwrap();
@@ -323,7 +391,7 @@ mod tests {
         // Add initial state
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Take a snapshot
         let snapshot = reader.load();
@@ -332,7 +400,7 @@ mod tests {
         // Writer updates state
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, -500, 1);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         // Old snapshot still sees 1000
         assert_eq!(snapshot.get_account(&addr).unwrap().balance, 1000);
@@ -374,7 +442,7 @@ mod tests {
         // Explicit creation with initial balance
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 2000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         let state = reader.get_account(&addr).unwrap();
         assert_eq!(state.balance, 2000);
@@ -394,7 +462,7 @@ mod tests {
         // No explicit creation, just a positive balance delta (transfer received)
         let mut diff = StateDiff::new();
         diff.add_balance_change(addr, 3000, 0);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Should implicitly create account
         let state = reader.get_account(&addr).unwrap();
@@ -420,7 +488,7 @@ mod tests {
         // Add pending update (spend 200, nonce becomes 6)
         let mut diff = StateDiff::new();
         diff.add_balance_change(addr, -200, 6);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         let state = reader.get_account(&addr).unwrap();
         assert_eq!(state.balance, 800);
@@ -440,7 +508,7 @@ mod tests {
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 0);
         diff.add_balance_change(addr, 500, 0); // Received transfer
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         let state = reader.get_account(&addr).unwrap();
         assert_eq!(state.balance, 500); // 0 + 500
@@ -459,17 +527,17 @@ mod tests {
         // View 1: create with 1000
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // View 2: receive 500
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 500, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         // View 3: spend 300, nonce=1
         let mut diff3 = StateDiff::new();
         diff3.add_balance_change(addr, -300, 1);
-        writer.add_m_notarized_diff(3, diff3);
+        writer.add_m_notarized_diff(3, Arc::new(diff3));
 
         let state = reader.get_account(&addr).unwrap();
         assert_eq!(state.balance, 1200); // 1000 + 500 - 300
@@ -488,17 +556,17 @@ mod tests {
         // View 1: implicit creation via transfer
         let mut diff1 = StateDiff::new();
         diff1.add_balance_change(addr, 1000, 0);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // View 2: receive more
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 200, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         // View 3: spend some (first outgoing tx, nonce=1)
         let mut diff3 = StateDiff::new();
         diff3.add_balance_change(addr, -150, 1);
-        writer.add_m_notarized_diff(3, diff3);
+        writer.add_m_notarized_diff(3, Arc::new(diff3));
 
         let state = reader.get_account(&addr).unwrap();
         assert_eq!(state.balance, 1050); // 1000 + 200 - 150
@@ -523,7 +591,7 @@ mod tests {
         for i in 1..=5 {
             let mut diff = StateDiff::new();
             diff.add_balance_change(addr, -100, i);
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff));
         }
 
         let state = reader.get_account(&addr).unwrap();
@@ -556,7 +624,7 @@ mod tests {
         // Negative delta for nonexistent account (invalid state, should be ignored)
         let mut diff = StateDiff::new();
         diff.add_balance_change(addr, -500, 1);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Should still return None (can't implicitly create with negative balance)
         assert!(reader.get_account(&addr).is_none());
@@ -575,12 +643,12 @@ mod tests {
         // Add pending creation
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // Add pending update
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 500, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         assert_eq!(reader.get_account(&addr).unwrap().balance, 1500);
 
@@ -620,14 +688,14 @@ mod tests {
         let addr2 = Address::from_public_key(&sk2.public_key());
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr2, 200);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // Account implicitly created
         let sk3 = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let addr3 = Address::from_public_key(&sk3.public_key());
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr3, 300, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         // Nonexistent
         let sk4 = TxSecretKey::generate(&mut rand::rngs::OsRng);
@@ -652,16 +720,16 @@ mod tests {
         // Try to add diff for view 3 (< 5) - should be ignored
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(3, diff.clone());
+        writer.add_m_notarized_diff(3, Arc::new(diff.clone()));
 
         assert!(reader.get_account(&addr).is_none());
 
         // Try view 5 (== last_finalized) - should also be ignored
-        writer.add_m_notarized_diff(5, diff.clone());
+        writer.add_m_notarized_diff(5, Arc::new(diff.clone()));
         assert!(reader.get_account(&addr).is_none());
 
         // View 6 (> 5) - should work
-        writer.add_m_notarized_diff(6, diff);
+        writer.add_m_notarized_diff(6, Arc::new(diff));
         assert!(reader.get_account(&addr).is_some());
     }
 
@@ -677,15 +745,15 @@ mod tests {
         // Add diffs for views 1, 2, 3
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 500, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         let mut diff3 = StateDiff::new();
         diff3.add_balance_change(addr, -200, 1);
-        writer.add_m_notarized_diff(3, diff3);
+        writer.add_m_notarized_diff(3, Arc::new(diff3));
 
         // Verify accumulated state
         let state = reader.get_account(&addr).unwrap();
@@ -710,7 +778,7 @@ mod tests {
         // Add pending diff
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         assert_eq!(reader.load().pending_count(), 1);
 
@@ -741,12 +809,12 @@ mod tests {
         // Add 5 pending diffs
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         for i in 2..=5 {
             let mut diff = StateDiff::new();
             diff.add_balance_change(addr, 100, i - 1);
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff));
         }
 
         assert_eq!(reader.load().pending_count(), 5);
@@ -780,15 +848,15 @@ mod tests {
         // Add diffs for views 1, 3, 5 (gaps at 2, 4)
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         let mut diff3 = StateDiff::new();
         diff3.add_balance_change(addr, 300, 1);
-        writer.add_m_notarized_diff(3, diff3);
+        writer.add_m_notarized_diff(3, Arc::new(diff3));
 
         let mut diff5 = StateDiff::new();
         diff5.add_balance_change(addr, 500, 2);
-        writer.add_m_notarized_diff(5, diff5);
+        writer.add_m_notarized_diff(5, Arc::new(diff5));
 
         // Finalize up to view 4 (should finalize 1 and 3)
         writer.finalize_up_to(4).unwrap();
@@ -815,7 +883,7 @@ mod tests {
         // Implicit creation via positive balance delta
         let mut diff = StateDiff::new();
         diff.add_balance_change(addr, 5000, 0);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Finalize
         writer.finalize_up_to(1).unwrap();
@@ -839,7 +907,7 @@ mod tests {
         for i in 1..=3 {
             let mut diff = StateDiff::new();
             diff.add_created_account(addr, i * 1000);
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff));
         }
 
         assert_eq!(reader.load().pending_count(), 3);
@@ -864,7 +932,7 @@ mod tests {
 
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Remove non-existent view
         writer.remove_nullified_view(999);
@@ -886,12 +954,12 @@ mod tests {
         // Add diffs for views 1-5
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         for i in 2..=5 {
             let mut diff = StateDiff::new();
             diff.add_balance_change(addr, 100, i - 1);
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff));
         }
 
         assert_eq!(reader.load().pending_count(), 5);
@@ -915,7 +983,7 @@ mod tests {
 
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(5, diff);
+        writer.add_m_notarized_diff(5, Arc::new(diff.clone()));
 
         // Rollback after view 5 - should keep view 5
         writer.rollback_after(5);
@@ -935,7 +1003,7 @@ mod tests {
 
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Rollback after view 100 - nothing to remove
         writer.rollback_after(100);
@@ -955,7 +1023,7 @@ mod tests {
         // Add a diff
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff.clone()));
 
         // Take two snapshots
         let snapshot1 = reader.load();
@@ -980,7 +1048,7 @@ mod tests {
 
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(5, diff);
+        writer.add_m_notarized_diff(5, Arc::new(diff.clone()));
 
         assert_eq!(reader.load().last_finalized_view(), 0);
 
@@ -991,7 +1059,7 @@ mod tests {
         // New diffs at view <= 5 should be ignored
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 500, 1);
-        writer.add_m_notarized_diff(5, diff2);
+        writer.add_m_notarized_diff(5, Arc::new(diff2));
 
         // Should still just have the original 1000 from DB
         assert_eq!(reader.get_account(&addr).unwrap().balance, 1000);
@@ -1005,7 +1073,7 @@ mod tests {
 
         // Add empty diff
         let diff = StateDiff::new();
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Should have 1 pending view (even if empty)
         assert_eq!(reader.load().pending_count(), 1);
@@ -1034,7 +1102,7 @@ mod tests {
         diff.add_created_account(addr1, 1000);
         diff.add_created_account(addr2, 2000);
         diff.add_balance_change(addr3, 3000, 0); // Implicit creation
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         assert_eq!(reader.get_account(&addr1).unwrap().balance, 1000);
         assert_eq!(reader.get_account(&addr2).unwrap().balance, 2000);
@@ -1053,12 +1121,12 @@ mod tests {
         // Create with max balance
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, u64::MAX);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // Try to add more - should saturate, not overflow
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, 1000, 0);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         assert_eq!(reader.get_account(&addr).unwrap().balance, u64::MAX);
     }
@@ -1075,12 +1143,12 @@ mod tests {
         // Create with small balance
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(addr, 100);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // Try to subtract more than balance - should saturate to 0
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(addr, -1000, 1);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         assert_eq!(reader.get_account(&addr).unwrap().balance, 0);
     }
@@ -1111,7 +1179,7 @@ mod tests {
         for i in 1..=5 {
             let mut diff = StateDiff::new();
             diff.add_created_account(addr, i * 1000);
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff));
         }
 
         assert_eq!(reader.load().pending_count(), 5);
@@ -1137,7 +1205,7 @@ mod tests {
 
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Both readers should see the same state
         assert_eq!(reader1.get_account(&addr).unwrap().balance, 1000);
@@ -1158,7 +1226,7 @@ mod tests {
         let mut diff = StateDiff::new();
         diff.add_created_account(addr, 0);
         diff.add_balance_change(addr, 500, 0);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Finalize
         writer.finalize_up_to(1).unwrap();
@@ -1185,7 +1253,7 @@ mod tests {
         // Add update
         let mut diff = StateDiff::new();
         diff.add_balance_change(addr, -300, 6);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Finalize
         writer.finalize_up_to(1).unwrap();
@@ -1247,7 +1315,7 @@ mod tests {
             } else {
                 diff.add_balance_change(addr, 100, i - 1);
             }
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff.clone()));
             thread::yield_now();
         }
 
@@ -1296,7 +1364,7 @@ mod tests {
             } else {
                 diff.add_balance_change(addr, 100, i - 1);
             }
-            writer.add_m_notarized_diff(i, diff);
+            writer.add_m_notarized_diff(i, Arc::new(diff.clone()));
         }
         let add_elapsed = start.elapsed();
 
@@ -1345,7 +1413,7 @@ mod tests {
                     diff.add_balance_change(*addr, 100, view - 1);
                 }
             }
-            writer.add_m_notarized_diff(view, diff);
+            writer.add_m_notarized_diff(view, Arc::new(diff.clone()));
         }
 
         const READ_ITERATIONS: usize = 10_000;

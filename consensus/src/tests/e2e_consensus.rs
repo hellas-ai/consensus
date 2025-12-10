@@ -90,7 +90,8 @@ fn test_e2e_consensus_happy_path() {
             .get(&peer_id)
             .expect("Secret key not found")
             .clone();
-        let setup = ReplicaSetup::new(peer_id, secret_key);
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
 
         slog::debug!(
             logger,
@@ -108,15 +109,13 @@ fn test_e2e_consensus_happy_path() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
+    let mut block_producers = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
-
+    let mut validation_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
         let replica_id = setup.replica_id;
-
-        // Keep transaction producer for later
-        let tx_producer = setup.transaction_producer;
 
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
@@ -131,10 +130,10 @@ fn test_e2e_consensus_happy_path() {
             fixture.config.clone(),
             replica_id,
             setup.secret_key,
-            setup.storage,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.transaction_consumer,
+            setup.validated_block_consumer,
+            setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
         )
@@ -148,7 +147,9 @@ fn test_e2e_consensus_happy_path() {
         );
 
         engines.push(engine);
-        transaction_producers.push(tx_producer);
+        block_producers.push(setup.block_producer);
+        transaction_producers.push(setup.transaction_producer);
+        validation_services.push(setup.validation_service);
     }
 
     slog::info!(
@@ -286,7 +287,12 @@ fn test_e2e_consensus_happy_path() {
     // which would cause some replicas to finalize more blocks than others.
     network.shutdown();
 
-    // 3. Now wait for each engine to finish its thread.
+    // 3. Shutdown validation services
+    for mut service in validation_services {
+        service.shutdown();
+    }
+
+    // 4. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
@@ -459,7 +465,8 @@ fn test_e2e_consensus_continuous_load() {
             .get(&peer_id)
             .expect("Secret key not found")
             .clone();
-        let setup = ReplicaSetup::new(peer_id, secret_key);
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
 
         slog::debug!(
             logger,
@@ -478,6 +485,7 @@ fn test_e2e_consensus_continuous_load() {
     );
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
@@ -499,10 +507,10 @@ fn test_e2e_consensus_continuous_load() {
             fixture.config.clone(),
             replica_id,
             setup.secret_key,
-            setup.storage,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.transaction_consumer,
+            setup.validated_block_consumer,
+            setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
         )
@@ -517,6 +525,7 @@ fn test_e2e_consensus_continuous_load() {
 
         engines.push(engine);
         transaction_producers.push(tx_producer);
+        validation_services.push(setup.validation_service);
     }
 
     slog::info!(
@@ -648,7 +657,12 @@ fn test_e2e_consensus_continuous_load() {
     // 2. Stop the network BEFORE waiting for engines to finish.
     network.shutdown();
 
-    // 3. Now wait for each engine to finish its thread.
+    // 3. Shutdown validation services
+    for mut service in validation_services {
+        service.shutdown();
+    }
+
+    // 4. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
@@ -819,7 +833,8 @@ fn test_e2e_consensus_with_crashed_replica() {
             .get(&peer_id)
             .expect("Secret key not found")
             .clone();
-        let setup = ReplicaSetup::new(peer_id, secret_key);
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
 
         slog::debug!(
             logger,
@@ -838,6 +853,7 @@ fn test_e2e_consensus_with_crashed_replica() {
     );
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
@@ -859,10 +875,10 @@ fn test_e2e_consensus_with_crashed_replica() {
             fixture.config.clone(),
             replica_id,
             setup.secret_key,
-            setup.storage,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.transaction_consumer,
+            setup.validated_block_consumer,
+            setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
         )
@@ -877,6 +893,7 @@ fn test_e2e_consensus_with_crashed_replica() {
 
         engines.push(Some(engine));
         transaction_producers.push(tx_producer);
+        validation_services.push(Some(setup.validation_service));
     }
 
     slog::info!(
@@ -1038,7 +1055,12 @@ fn test_e2e_consensus_with_crashed_replica() {
     // 2. Stop the network
     network.shutdown();
 
-    // 3. Wait for each healthy engine to finish
+    // 3. Shutdown validation services
+    for mut service in validation_services.into_iter().flatten() {
+        service.shutdown();
+    }
+
+    // 4. Wait for each healthy engine to finish
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
@@ -1267,7 +1289,8 @@ fn test_e2e_consensus_with_equivocating_leader() {
             .get(&peer_id)
             .expect("Secret key not found")
             .clone();
-        let setup = ReplicaSetup::new(peer_id, secret_key);
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
 
         slog::debug!(
             logger,
@@ -1287,6 +1310,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
     );
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     // Store the Byzantine leader's secret key for signing blocks
@@ -1311,6 +1335,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
             engines.push(None);
             transaction_producers.push(None);
+            validation_services.push(Some(setup.validation_service));
 
             slog::info!(
                 logger,
@@ -1334,10 +1359,10 @@ fn test_e2e_consensus_with_equivocating_leader() {
             fixture.config.clone(),
             replica_id,
             setup.secret_key,
-            setup.storage,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.transaction_consumer,
+            setup.validated_block_consumer,
+            setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
         )
@@ -1352,6 +1377,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
         engines.push(Some(engine));
         transaction_producers.push(Some(tx_producer));
+        validation_services.push(Some(setup.validation_service));
     }
 
     let byzantine_secret_key =
@@ -1658,6 +1684,11 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
     network.shutdown();
 
+    // Shutdown validation services
+    for mut service in validation_services.into_iter().flatten() {
+        service.shutdown();
+    }
+
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
@@ -1943,7 +1974,8 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             .get(&peer_id)
             .expect("Secret key not found")
             .clone();
-        let setup = ReplicaSetup::new(peer_id, secret_key);
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
 
         slog::debug!(
             logger,
@@ -1962,6 +1994,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
     );
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     // Store the Byzantine leader's secret key for signing blocks
@@ -1982,6 +2015,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
             engines.push(None);
             transaction_producers.push(None);
+            validation_services.push(Some(setup.validation_service));
 
             slog::info!(
                 logger,
@@ -2002,10 +2036,10 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             fixture.config.clone(),
             replica_id,
             setup.secret_key,
-            setup.storage,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.transaction_consumer,
+            setup.validated_block_consumer,
+            setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
         )
@@ -2020,6 +2054,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
         engines.push(Some(engine));
         transaction_producers.push(Some(tx_producer));
+        validation_services.push(Some(setup.validation_service));
     }
 
     let byzantine_secret_key =
@@ -2349,6 +2384,11 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
     }
 
     network.shutdown();
+
+    // Shutdown validation services
+    for mut service in validation_services.into_iter().flatten() {
+        service.shutdown();
+    }
 
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {

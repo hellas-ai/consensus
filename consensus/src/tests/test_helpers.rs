@@ -9,9 +9,16 @@ use crate::{
         aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
         transaction_crypto::{TxPublicKey, TxSecretKey},
     },
-    state::{address::Address, peer::PeerSet, transaction::Transaction},
+    state::{address::Address, block::Block, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
+    validation::{PendingStateWriter, ValidatedBlock, service::BlockValidationService},
 };
+
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use ark_serialize::CanonicalSerialize;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::time::Duration;
@@ -53,16 +60,13 @@ fn gen_tx_keypair() -> (TxSecretKey, TxPublicKey) {
     (sk, pk)
 }
 
-/// Complete setup for a single replica including all communication channels and storage
+/// Complete setup for a single replica including BlockValidationService
 pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The replica's peer ID
     pub replica_id: PeerId,
 
     /// The replica's secret key
     pub secret_key: BlsSecretKey,
-
-    /// Persistent storage for this replica
-    pub storage: ConsensusStore,
 
     /// Consumer for incoming consensus messages (from network)
     pub message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
@@ -76,35 +80,60 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Producer for outgoing consensus messages (consensus engine writes here)
     pub broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
 
-    /// Consumer for transactions (consensus engine reads from here)
-    pub transaction_consumer: Consumer<Transaction>,
+    /// Producer for blocks to validate (P2P/leader sends blocks here)
+    pub block_producer: Producer<Block>,
 
-    /// Producer for transactions (clients write here)
+    /// Consumer for validated blocks (consensus engine reads from here)
+    pub validated_block_consumer: Consumer<ValidatedBlock>,
+
+    /// Persistence writer for consensus state
+    pub persistence_writer: PendingStateWriter,
+
+    /// Persistent storage for this replica
+    pub storage: Arc<ConsensusStore>,
+
+    /// Block validation service handle
+    pub validation_service: BlockValidationService,
+
+    /// Shutdown flag (shared with validation service)
+    pub shutdown: Arc<AtomicBool>,
+
+    /// Producer for submitting transactions (clients write here)
     pub transaction_producer: Producer<Transaction>,
+
+    /// Consumer for reading transactions (block builder reads here)
+    pub transaction_consumer: Consumer<Transaction>,
 
     /// Temporary directory for storage (must be kept alive)
     _temp_dir: TempDir,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_SIZE> {
-    /// Creates a new replica setup with all necessary components
-    ///
-    /// # Arguments
-    /// * `replica_id` - The peer ID for this replica
-    /// * `secret_key` - The BLS secret key for signing messages
-    ///
-    /// # Returns
-    /// A complete replica setup with initialized storage and communication channels
-    pub fn new(replica_id: PeerId, secret_key: BlsSecretKey) -> Self {
-        // Create ring buffers for communication
+    /// Creates a new replica setup with BlockValidationService
+    pub fn new(replica_id: PeerId, secret_key: BlsSecretKey, logger: slog::Logger) -> Self {
+        // Create ring buffers for consensus messages
         let (message_producer, message_consumer) = RingBuffer::new(BUFFER_SIZE);
         let (broadcast_producer, broadcast_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+        // Create ring buffers for transactions
         let (transaction_producer, transaction_consumer) = RingBuffer::new(BUFFER_SIZE);
 
         // Create temporary directory and storage
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("consensus.redb");
-        let storage = ConsensusStore::open(&db_path).expect("Failed to open storage");
+        let storage = Arc::new(ConsensusStore::open(&db_path).expect("Failed to open storage"));
+
+        // Create shutdown flag
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Spawn BlockValidationService - creates block channels and pending state
+        let (validation_service, block_producer, validated_block_consumer, persistence_writer) =
+            BlockValidationService::spawn(
+                Arc::clone(&storage),
+                0, // last_finalized_view
+                Arc::clone(&shutdown),
+                logger,
+            );
 
         Self {
             replica_id,
@@ -114,10 +143,75 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             message_producer,
             broadcast_consumer,
             broadcast_producer,
-            transaction_consumer,
+            block_producer,
+            validated_block_consumer,
+            persistence_writer,
+            validation_service,
+            shutdown,
             transaction_producer,
+            transaction_consumer,
             _temp_dir: temp_dir,
         }
+    }
+
+    /// Submit a transaction to this replica's mempool
+    pub fn submit_transaction(
+        &mut self,
+        tx: Transaction,
+    ) -> Result<(), rtrb::PushError<Transaction>> {
+        self.transaction_producer.push(tx)
+    }
+
+    /// Submit a block for validation (called when receiving block from P2P or when proposing)
+    pub fn submit_block_for_validation(
+        &mut self,
+        block: Block,
+    ) -> Result<(), rtrb::PushError<Block>> {
+        self.block_producer.push(block)
+    }
+
+    /// Build a block proposal from pending transactions (when this replica is leader)
+    pub fn build_block_proposal(&mut self, view: u64, parent_hash: [u8; 32], height: u64) -> Block {
+        // Take transactions from pool
+        let mut transactions = Vec::new();
+        while let Ok(tx) = self.transaction_consumer.pop() {
+            transactions.push(tx);
+        }
+
+        // Create unsigned block first to get hash
+        let temp_block = Block::new(
+            view,
+            self.replica_id,
+            parent_hash,
+            transactions.clone(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            self.secret_key.sign(b"temp"),
+            false,
+            height,
+        );
+
+        let block_hash = temp_block.get_hash();
+
+        // Sign with actual block hash
+        Block::new(
+            view,
+            self.replica_id,
+            parent_hash,
+            transactions,
+            temp_block.header.timestamp,
+            self.secret_key.sign(&block_hash),
+            false,
+            height,
+        )
+    }
+
+    /// Shutdown this replica's validation service
+    pub fn shutdown_validation(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.validation_service.shutdown();
     }
 }
 

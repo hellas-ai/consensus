@@ -856,12 +856,12 @@ mod tests {
         // View 1: Create account with 1000
         let mut diff1 = StateDiff::new();
         diff1.add_created_account(sender_addr, 1000);
-        writer.add_m_notarized_diff(1, diff1);
+        writer.add_m_notarized_diff(1, Arc::new(diff1));
 
         // View 2: Spend 200 (nonce 0 -> 1)
         let mut diff2 = StateDiff::new();
         diff2.add_balance_change(sender_addr, -200, 1);
-        writer.add_m_notarized_diff(2, diff2);
+        writer.add_m_notarized_diff(2, Arc::new(diff2));
 
         // Now validate a block at view 3 that spends from current state (800 balance, nonce 1)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 1, 10, &sk);
@@ -933,7 +933,7 @@ mod tests {
         // Create account via pending state (simulating m-notarized block)
         let mut diff = StateDiff::new();
         diff.add_created_account(sender_addr, 1000);
-        writer.add_m_notarized_diff(1, diff);
+        writer.add_m_notarized_diff(1, Arc::new(diff));
 
         // Now validate a block that spends from the pending account
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
@@ -1210,7 +1210,7 @@ mod tests {
         // Pending state adds 300 more and updates nonce to 1
         let mut pending_diff = StateDiff::new();
         pending_diff.add_balance_change(sender_addr, 300, 1);
-        writer.add_m_notarized_diff(1, pending_diff);
+        writer.add_m_notarized_diff(1, Arc::new(pending_diff));
 
         // Now validate with nonce 1 (pending) and balance 800 (500 + 300)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 700, 1, 10, &sk);
@@ -1239,7 +1239,7 @@ mod tests {
         // new_addr was created in a pending block
         let mut pending_diff = StateDiff::new();
         pending_diff.add_created_account(new_addr, 0);
-        writer.add_m_notarized_diff(1, pending_diff);
+        writer.add_m_notarized_diff(1, Arc::new(pending_diff));
 
         // Try to CreateAccount for same address - should fail
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk);
