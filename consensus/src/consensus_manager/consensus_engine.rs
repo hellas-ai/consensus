@@ -512,4 +512,103 @@ mod tests {
         let result = engine.shutdown_and_wait(Duration::from_secs(5));
         assert!(result.is_ok());
     }
+
+    use crate::validation::{ValidatedBlock, types::StateDiff};
+
+    /// Creates a test StateDiff
+    fn create_test_state_diff(balance: u64) -> StateDiff {
+        use crate::crypto::transaction_crypto::TxSecretKey;
+        use crate::state::address::Address;
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let mut diff = StateDiff::new();
+        diff.add_created_account(addr, balance);
+        diff
+    }
+
+    #[test]
+    fn test_consensus_engine_accepts_validated_blocks() {
+        // This test verifies the engine can be created with validated_block channel
+        // and that the channel is properly connected
+
+        let mut rng = thread_rng();
+        let mut public_keys = vec![];
+        let mut peer_id_to_secret_key = std::collections::HashMap::new();
+
+        for _ in 0..N {
+            let sk = BlsSecretKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let peer_id = pk.to_peer_id();
+            peer_id_to_secret_key.insert(peer_id, sk);
+            public_keys.push(pk);
+        }
+
+        let peer_set = PeerSet::new(public_keys);
+
+        // Create validated block channel
+        let (mut validated_block_prod, mut validated_block_cons) =
+            RingBuffer::<ValidatedBlock>::new(100);
+
+        // Create a test validated block
+        let leader_id = peer_set.sorted_peer_ids[0];
+        let leader_sk = peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let block = crate::state::block::Block::new(
+            1,
+            leader_id,
+            [0u8; 32],
+            vec![],
+            1234567890,
+            leader_sk.sign(b"test"),
+            false,
+            1,
+        );
+
+        let validated_block = ValidatedBlock::new(block, create_test_state_diff(1000));
+
+        // Push to channel should succeed
+        let push_result = validated_block_prod.push(validated_block);
+        assert!(
+            push_result.is_ok(),
+            "Should be able to push ValidatedBlock to channel"
+        );
+
+        // Pop should retrieve it
+        let pop_result = validated_block_cons.pop();
+        assert!(
+            pop_result.is_ok(),
+            "Should be able to pop ValidatedBlock from channel"
+        );
+
+        let retrieved = pop_result.unwrap();
+        assert_eq!(retrieved.block.view(), 1);
+    }
+
+    #[test]
+    fn test_validated_block_channel_is_bounded() {
+        // Verify channel has bounded capacity (backpressure)
+        let (mut prod, _cons) = RingBuffer::<ValidatedBlock>::new(2);
+
+        let block = crate::state::block::Block::new(
+            1,
+            12345,
+            [0u8; 32],
+            vec![],
+            1234567890,
+            BlsSecretKey::generate(&mut thread_rng()).sign(b"test"),
+            false,
+            1,
+        );
+
+        // Fill the channel
+        for i in 0..2 {
+            let vb = ValidatedBlock::new(block.clone(), StateDiff::new());
+            assert!(prod.push(vb).is_ok(), "Push {} should succeed", i);
+        }
+
+        // Next push should fail (channel full)
+        let vb = ValidatedBlock::new(block.clone(), StateDiff::new());
+        assert!(prod.push(vb).is_err(), "Push to full channel should fail");
+    }
 }

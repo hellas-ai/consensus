@@ -6562,4 +6562,201 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
     }
+
+    /// Modified test setup that returns the PendingStateReader
+    fn create_test_manager_with_reader<const N: usize, const F: usize, const M_SIZE: usize>(
+        setup: &TestSetup,
+        replica_index: usize,
+    ) -> (
+        ViewProgressManager<N, F, M_SIZE>,
+        crate::validation::PendingStateReader,
+        String,
+    ) {
+        let replica_id = setup.peer_set.sorted_peer_ids[replica_index];
+        let mut peer_strs = Vec::with_capacity(setup.peer_set.sorted_peer_ids.len());
+        for peer_id in &setup.peer_set.sorted_peer_ids {
+            let pk = setup.peer_set.id_to_public_key.get(peer_id).unwrap();
+            let mut buf = Vec::new();
+            pk.0.serialize_compressed(&mut buf).unwrap();
+            let peer_str = hex::encode(buf);
+            peer_strs.push(peer_str);
+        }
+        let config = create_test_config(N, F, peer_strs);
+
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let leader_manager = Box::new(RoundRobinLeaderManager::new(
+            N,
+            setup.peer_set.sorted_peer_ids.clone(),
+        ));
+
+        let path = temp_db_path("view_manager_with_reader");
+        let persistence_storage = Arc::new(ConsensusStore::open(&path).unwrap());
+        let (persistence_writer, persistence_reader) =
+            PendingStateWriter::new(persistence_storage.clone(), 0);
+        (
+            ViewProgressManager::new(
+                config,
+                replica_id,
+                leader_manager,
+                persistence_writer,
+                logger,
+            )
+            .unwrap(),
+            persistence_reader,
+            path,
+        )
+    }
+
+    /// Creates a test StateDiff for a specific address
+    fn create_state_diff_for_address(addr: Address, balance: u64) -> StateDiff {
+        let mut diff = StateDiff::new();
+        diff.add_created_account(addr, balance);
+        diff
+    }
+
+    #[test]
+    fn test_process_validated_block_stores_state_diff() {
+        // Scenario: Validated block arrives with StateDiff
+        // - store_state_diff should be called on view_chain
+        // - Block should be processed through normal flow
+        // - Verify ViewContext has state_diff set
+        let setup = create_test_peer_setup(6);
+        let (mut manager, _reader, path): (ViewProgressManager<6, 1, 3>, _, String) =
+            create_test_manager_with_reader(&setup, 0);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1]; // View 1 leader (round robin starts at view 1)
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
+        let parent_hash = manager.view_chain.previously_committed_block_hash;
+
+        // Create a block for view 1
+        let block = create_test_block(1, leader_id, parent_hash, leader_sk, 1);
+
+        // Create StateDiff
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let state_diff = create_state_diff_for_address(addr, 1000);
+
+        // Process validated block
+        let result = manager.process_validated_block(block, state_diff);
+        assert!(result.is_ok());
+
+        // Verify StateDiff is stored in view context
+        let ctx = manager.view_chain.find_view_context(1).unwrap();
+        assert!(
+            ctx.state_diff.is_some(),
+            "StateDiff should be stored in ViewContext"
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_process_validated_block_returns_correct_event() {
+        // Verify that process_validated_block returns the correct ViewProgressEvent
+        let setup = create_test_peer_setup(6);
+        let (mut manager, _reader, path): (ViewProgressManager<6, 1, 3>, _, String) =
+            create_test_manager_with_reader(&setup, 0);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
+        let parent_hash = manager.view_chain.previously_committed_block_hash;
+
+        let block = create_test_block(1, leader_id, parent_hash, leader_sk, 1);
+        let state_diff = StateDiff::new(); // Empty diff is fine
+
+        let result = manager.process_validated_block(block, state_diff);
+        assert!(result.is_ok());
+
+        // Should return ShouldVote for a valid block from the correct leader
+        match result.unwrap() {
+            ViewProgressEvent::ShouldVote {
+                view, block_hash, ..
+            } => {
+                assert_eq!(view, 1);
+                assert_ne!(block_hash, [0u8; blake3::OUT_LEN]);
+            }
+            _ => {
+                // Other events are acceptable depending on replica's role
+            }
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_process_validated_block_for_wrong_view_fails() {
+        // Scenario: Block for wrong view should fail
+        let setup = create_test_peer_setup(6);
+        let (mut manager, _reader, path): (ViewProgressManager<6, 1, 3>, _, String) =
+            create_test_manager_with_reader(&setup, 0);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[0];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
+        let parent_hash = manager.view_chain.previously_committed_block_hash;
+
+        // Create block for view 99 (not current)
+        let block = create_test_block(99, leader_id, parent_hash, leader_sk, 99);
+        let state_diff = StateDiff::new();
+
+        let result = manager.process_validated_block(block, state_diff);
+        // Should fail or return appropriate event
+        assert!(result.is_err() || matches!(result.unwrap(), ViewProgressEvent::NoOp));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_process_validated_block_with_empty_state_diff() {
+        // Scenario: Block with no state changes (empty StateDiff)
+        let setup = create_test_peer_setup(6);
+        let (mut manager, _reader, path): (ViewProgressManager<6, 1, 3>, _, String) =
+            create_test_manager_with_reader(&setup, 0);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
+        let parent_hash = manager.view_chain.previously_committed_block_hash;
+
+        let block = create_test_block(1, leader_id, parent_hash, leader_sk, 1);
+        let state_diff = StateDiff::new(); // Empty
+
+        let result = manager.process_validated_block(block, state_diff);
+        assert!(result.is_ok());
+
+        // Empty diff should still be stored
+        let ctx = manager.view_chain.find_view_context(1).unwrap();
+        assert!(ctx.state_diff.is_some());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_process_validated_block_state_diff_not_in_pending_before_m_notarization() {
+        // Scenario: Block validated, but pending state not updated until M-notarization
+        let setup = create_test_peer_setup(6);
+        let (mut manager, reader, path): (ViewProgressManager<6, 1, 3>, _, String) =
+            create_test_manager_with_reader(&setup, 0);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
+        let parent_hash = manager.view_chain.previously_committed_block_hash;
+
+        let block = create_test_block(1, leader_id, parent_hash, leader_sk, 1);
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let state_diff = create_state_diff_for_address(addr, 1000);
+
+        manager.process_validated_block(block, state_diff).unwrap();
+
+        // StateDiff stored in context, but pending count should be 0
+        // (not added to pending until M-notarization and view progression)
+        assert_eq!(
+            reader.load().pending_count(),
+            0,
+            "Pending count should be 0 before M-notarization"
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -4615,4 +4615,115 @@ mod tests {
         assert!(ctx.non_verified_votes.is_empty());
         assert!(ctx.votes.contains(&vote));
     }
+
+    #[test]
+    fn test_state_diff_field_is_none_on_new_context() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        assert!(
+            ctx.state_diff.is_none(),
+            "state_diff should be None on new ViewContext"
+        );
+    }
+
+    #[test]
+    fn test_state_diff_can_be_assigned_arc() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+
+        let mut diff = crate::validation::types::StateDiff::new();
+        diff.add_created_account(addr, 5000);
+
+        let diff_arc = Arc::new(diff);
+        ctx.state_diff = Some(Arc::clone(&diff_arc));
+
+        assert!(ctx.state_diff.is_some());
+
+        // Arc should now have 2 strong references
+        assert_eq!(Arc::strong_count(&diff_arc), 2);
+    }
+
+    #[test]
+    fn test_state_diff_is_independent_of_block() {
+        // state_diff can be set regardless of whether block is set
+        let mut rng = thread_rng();
+        let sk = BlsSecretKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let leader_id = pk.to_peer_id();
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // No block set
+        assert!(ctx.block.is_none());
+
+        // But we can set state_diff
+        let diff = crate::validation::types::StateDiff::new();
+        ctx.state_diff = Some(Arc::new(diff));
+
+        assert!(ctx.state_diff.is_some());
+        assert!(ctx.block.is_none()); // Still no block
+    }
+
+    #[test]
+    fn test_state_diff_persists_across_vote_additions() {
+        // Verify state_diff is not affected by adding votes
+        let mut rng = thread_rng();
+
+        // Generate keypairs for peers
+        let mut public_keys = vec![];
+        let mut peer_id_to_secret_key = HashMap::new();
+        for _ in 0..5 {
+            let sk = BlsSecretKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let peer_id = pk.to_peer_id();
+            peer_id_to_secret_key.insert(peer_id, sk);
+            public_keys.push(pk);
+        }
+        let peer_set = crate::state::peer::PeerSet::new(public_keys);
+
+        let leader_id = peer_set.sorted_peer_ids[0];
+        let leader_sk = peer_id_to_secret_key.get(&leader_id).unwrap();
+        let replica_id = peer_set.sorted_peer_ids[1];
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // Add block first
+        let block = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
+        let block_hash = block.get_hash();
+        ctx.add_new_view_block(block, &peer_set).unwrap();
+
+        // Set state_diff
+        let diff = crate::validation::types::StateDiff::new();
+        ctx.state_diff = Some(Arc::new(diff));
+
+        // Add votes
+        for i in 1..3 {
+            let peer_id = peer_set.sorted_peer_ids[i];
+            let peer_sk = peer_id_to_secret_key.get(&peer_id).unwrap();
+            let signature = peer_sk.sign(&block_hash);
+            let vote = crate::state::notarizations::Vote::new(
+                1, block_hash, signature, peer_id, leader_id,
+            );
+            ctx.add_vote(vote, &peer_set).unwrap();
+        }
+
+        // state_diff should still be set
+        assert!(
+            ctx.state_diff.is_some(),
+            "state_diff should persist after adding votes"
+        );
+    }
 }
