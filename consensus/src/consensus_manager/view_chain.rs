@@ -4886,4 +4886,627 @@ mod tests {
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
+
+    /// Modified TestSetup that keeps the PendingStateReader for verification
+    struct TestSetupWithReader {
+        peer_set: PeerSet,
+        peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
+        temp_dir: TempDir,
+        persistence_writer: PendingStateWriter,
+        pending_reader: crate::validation::PendingStateReader,
+    }
+
+    impl TestSetupWithReader {
+        fn new(num_peers: usize) -> Self {
+            let mut rng = thread_rng();
+            let mut public_keys = vec![];
+            let mut peer_id_to_secret_key = HashMap::new();
+
+            for _ in 0..num_peers {
+                let sk = BlsSecretKey::generate(&mut rng);
+                let pk = sk.public_key();
+                let peer_id = pk.to_peer_id();
+                peer_id_to_secret_key.insert(peer_id, sk);
+                public_keys.push(pk);
+            }
+
+            let peer_set = PeerSet::new(public_keys);
+
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let db_path = temp_dir.path().join("test_consensus.db");
+            let store = Arc::new(ConsensusStore::open(db_path).expect("Failed to create storage"));
+            let (writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+            Self {
+                peer_set,
+                peer_id_to_secret_key,
+                temp_dir,
+                persistence_writer: writer,
+                pending_reader: reader,
+            }
+        }
+
+        fn leader_id(&self, index: usize) -> PeerId {
+            self.peer_set.sorted_peer_ids[index]
+        }
+
+        fn replica_id(&self, index: usize) -> PeerId {
+            self.peer_set.sorted_peer_ids[index]
+        }
+    }
+
+    /// Creates a test StateDiff that creates an account with the given balance
+    fn create_test_state_diff(balance: u64) -> StateDiff {
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let mut diff = StateDiff::new();
+        diff.add_created_account(addr, balance);
+        diff
+    }
+
+    /// Creates a test StateDiff for a specific address
+    fn create_state_diff_for_address(addr: Address, balance: u64) -> StateDiff {
+        let mut diff = StateDiff::new();
+        diff.add_created_account(addr, balance);
+        diff
+    }
+
+    /// Creates a test StateDiff that updates balance for an existing address
+    fn create_balance_update_diff(addr: Address, delta: i128, nonce: u64) -> StateDiff {
+        let mut diff = StateDiff::new();
+        diff.add_balance_change(addr, delta, nonce);
+        diff
+    }
+
+    #[test]
+    fn test_store_state_diff_before_m_notarization() {
+        // Scenario: StateDiff arrives before M-notarization (normal case)
+        // - StateDiff should be stored in ViewContext
+        // - add_m_notarized_diff should NOT be called yet (pending count = 0)
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Store StateDiff for view 1 (current view, no M-notarization yet)
+        let state_diff = create_test_state_diff(1000);
+        view_chain.store_state_diff(1, state_diff);
+
+        // Verify StateDiff is stored in context
+        let ctx = view_chain.find_view_context(1).unwrap();
+        assert!(
+            ctx.state_diff.is_some(),
+            "StateDiff should be stored in ViewContext"
+        );
+
+        // Verify pending state is NOT updated yet (no M-notarization)
+        assert_eq!(
+            setup.pending_reader.load().pending_count(),
+            0,
+            "Pending count should be 0 before M-notarization"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_store_state_diff_after_m_notarization_triggers_pending() {
+        // Scenario: StateDiff arrives AFTER M-notarization (late validation)
+        // View already progressed, store_state_diff should immediately add to pending
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        // Create view 1 with M-notarization and progress to view 2
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Now view 1 has M-notarization and we're at view 2
+        // Store StateDiff for view 1 (late arrival)
+        let state_diff = create_test_state_diff(1000);
+        view_chain.store_state_diff(1, state_diff);
+
+        // Verify StateDiff is stored
+        let ctx = view_chain.find_view_context(1).unwrap();
+        assert!(ctx.state_diff.is_some());
+
+        // Verify pending state IS updated (because view already had M-notarization)
+        assert_eq!(
+            setup.pending_reader.load().pending_count(),
+            1,
+            "Pending count should be 1 after late StateDiff for M-notarized view"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_store_state_diff_for_nonexistent_view_is_ignored() {
+        // Scenario: StateDiff for view not in non_finalized_views
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Try to store StateDiff for view 99 (doesn't exist)
+        let state_diff = create_test_state_diff(1000);
+        view_chain.store_state_diff(99, state_diff);
+
+        // Should not panic, and pending count should be 0
+        assert_eq!(setup.pending_reader.load().pending_count(), 0);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_store_state_diff_for_current_view_with_m_notarization_not_progressed() {
+        // Edge case: View has M-notarization but IS still the current view
+        // This happens when M-notarization is added but progress hasn't been called yet
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // View 1 has M-notarization but is STILL the current view (no progress yet)
+        assert_eq!(view_chain.current_view_number(), 1);
+
+        // Store StateDiff
+        let state_diff = create_test_state_diff(1000);
+        view_chain.store_state_diff(1, state_diff);
+
+        // Should NOT add to pending yet (view == current_view)
+        assert_eq!(
+            setup.pending_reader.load().pending_count(),
+            0,
+            "Should not add to pending when view == current_view"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_on_m_notarization_with_state_diff_adds_to_pending() {
+        // Scenario: View has StateDiff when M-notarization is achieved
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        // Add StateDiff before creating ViewChain
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let state_diff = create_state_diff_for_address(addr, 1000);
+        ctx_v1.state_diff = Some(Arc::new(state_diff));
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Call on_m_notarization
+        view_chain.on_m_notarization(1);
+
+        // Verify pending state is updated
+        assert_eq!(
+            setup.pending_reader.load().pending_count(),
+            1,
+            "Pending count should be 1 after on_m_notarization with StateDiff"
+        );
+
+        // Verify the account is visible in pending state
+        let account = setup.pending_reader.get_account(&addr);
+        assert!(
+            account.is_some(),
+            "Account should be visible in pending state"
+        );
+        assert_eq!(account.unwrap().balance, 1000);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_on_m_notarization_without_state_diff_does_nothing() {
+        // Scenario: View achieves M-notarization but has no StateDiff
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        // No StateDiff set (ctx_v1.state_diff is None)
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Call on_m_notarization - should not panic
+        view_chain.on_m_notarization(1);
+
+        // Verify pending count is still 0
+        assert_eq!(
+            setup.pending_reader.load().pending_count(),
+            0,
+            "Pending count should be 0 when no StateDiff"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_on_m_notarization_for_nonexistent_view_does_nothing() {
+        // Scenario: on_m_notarization called for view not in chain
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Call on_m_notarization for nonexistent view - should not panic
+        view_chain.on_m_notarization(99);
+
+        assert_eq!(setup.pending_reader.load().pending_count(), 0);
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_state_diffs_accumulate_across_m_notarized_views() {
+        // Scenario: Multiple views M-notarized with StateDiffs
+        // v1: create account with 1000
+        // v2: add 500
+        // v3: subtract 200
+        // Final pending state should show 1300
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        // Create a fixed address for all diffs
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+
+        // View 1 with StateDiff (create account with 1000)
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+        ctx_v1.state_diff = Some(Arc::new(create_state_diff_for_address(addr, 1000)));
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Progress to view 2
+        let mut ctx_v2 = create_view_context_with_votes(
+            2,
+            leader_id,
+            replica_id,
+            block_hash_v1,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v2 = ctx_v2.block.as_ref().unwrap().clone();
+        let block_hash_v2 = block_v2.get_hash();
+
+        let votes_v2: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    2,
+                    block_hash_v2,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v2 = create_m_notarization(&votes_v2, 2, block_hash_v2, leader_id);
+        ctx_v2
+            .add_m_notarization(m_not_v2, &setup.peer_set)
+            .unwrap();
+        ctx_v2.state_diff = Some(Arc::new(create_balance_update_diff(addr, 500, 1)));
+
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+        view_chain.on_m_notarization(1); // Trigger pending for v1
+
+        // Progress to view 3
+        let mut ctx_v3 = create_view_context_with_votes(
+            3,
+            leader_id,
+            replica_id,
+            block_hash_v2,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v3 = ctx_v3.block.as_ref().unwrap().clone();
+        let block_hash_v3 = block_v3.get_hash();
+
+        let votes_v3: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    3,
+                    block_hash_v3,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v3 = create_m_notarization(&votes_v3, 3, block_hash_v3, leader_id);
+        ctx_v3
+            .add_m_notarization(m_not_v3, &setup.peer_set)
+            .unwrap();
+        ctx_v3.state_diff = Some(Arc::new(create_balance_update_diff(addr, -200, 2)));
+
+        view_chain.progress_with_m_notarization(ctx_v3).unwrap();
+        view_chain.on_m_notarization(2); // Trigger pending for v2
+
+        // Progress to view 4 (to trigger v3's on_m_notarization)
+        let ctx_v4 = ViewContext::new(4, leader_id, replica_id, block_hash_v3);
+        view_chain.progress_with_m_notarization(ctx_v4).unwrap();
+        view_chain.on_m_notarization(3); // Trigger pending for v3
+
+        // Verify accumulated state
+        assert_eq!(setup.pending_reader.load().pending_count(), 3);
+
+        let account = setup.pending_reader.get_account(&addr).unwrap();
+        assert_eq!(
+            account.balance,
+            1300, // 1000 + 500 - 200
+            "Balance should be 1300 (1000 + 500 - 200)"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_state_diff_timing_block_then_m_notarization() {
+        // Normal flow: Block validated (StateDiff stored) → then M-notarization
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+
+        // View 1 with block
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Step 1: Store StateDiff (simulating block validation completing)
+        view_chain.store_state_diff(1, create_state_diff_for_address(addr, 1000));
+
+        // Pending should still be 0 (no progression yet)
+        assert_eq!(setup.pending_reader.load().pending_count(), 0);
+
+        // Step 2: Progress to view 2 (M-notarization)
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Step 3: on_m_notarization is called
+        view_chain.on_m_notarization(1);
+
+        // Now pending should be 1
+        assert_eq!(setup.pending_reader.load().pending_count(), 1);
+        assert_eq!(
+            setup.pending_reader.get_account(&addr).unwrap().balance,
+            1000
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_view_context_state_diff_initially_none() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let ctx: ViewContext<N, F, M_SIZE> =
+            ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        assert!(
+            ctx.state_diff.is_none(),
+            "state_diff should be None initially"
+        );
+    }
+
+    #[test]
+    fn test_view_context_state_diff_can_be_set_and_retrieved() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<N, F, M_SIZE> =
+            ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let diff = create_state_diff_for_address(addr, 5000);
+        let diff_arc = Arc::new(diff);
+
+        ctx.state_diff = Some(Arc::clone(&diff_arc));
+
+        assert!(ctx.state_diff.is_some());
+
+        // Verify Arc reference counting works
+        assert_eq!(Arc::strong_count(&diff_arc), 2);
+    }
 }
