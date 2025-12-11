@@ -175,10 +175,6 @@
 //!         .with_broadcast_producer(broadcast_producer)
 //!         .with_validated_block_consumer(validated_block_consumer)
 //!         .with_tick_interval(Duration::from_millis(10))
-//!         .with_shutdown_signal(Arc::new(AtomicBool::new(false)))
-//!         .with_logger(logger)
-//!         .build()?;
-//!
 //!     // Run the state machine (blocks until shutdown)
 //!     state_machine.run()?;
 //!     Ok(())
