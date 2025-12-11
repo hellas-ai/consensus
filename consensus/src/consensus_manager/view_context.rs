@@ -62,8 +62,13 @@
 //! │  │  - has_proposed: bool (if leader)                      │    │
 //! │  │  - entered_at: Instant (for timeout detection)         │    │
 //! │  └────────────────────────────────────────────────────────┘    │
+//! │                                                                  │
+//! │  ┌────────────────────────────────────────────────────────┐    │
+//! │  │  Pending State (Validation)                            │    │
+//! │  │  - state_diff: Option<Arc<StateDiff>>                  │    │
+//! │  └────────────────────────────────────────────────────────┘    │
 //! └──────────────────────────────────────────────────────────────────┘
-//! //!
+//!
 //! ## State Transitions
 //!
 //! A typical view progresses through these states:
@@ -126,6 +131,24 @@
 //!    - Can be called BEFORE or AFTER voting
 //!    - Indicates definite Byzantine behavior in the system
 //!
+//! ### State Diff (Pending State)
+//!
+//! The `state_diff` field stores pre-computed state changes from block validation:
+//!
+//! 1. **Setting**: When a block is validated by the validation service, the resulting [`StateDiff`]
+//!    is stored in the `ViewContext` via [`ViewChain::store_state_diff`].
+//!
+//! 2. **Usage**: When the view achieves M-notarization, the [`ViewChain`] calls
+//!    [`on_m_notarization`](super::view_chain::ViewChain::on_m_notarization) which adds the
+//!    `state_diff` to pending state via [`PendingStateWriter::add_m_notarized_diff`].
+//!
+//! 3. **Purpose**: This enables transaction validation to see speculative state from M-notarized
+//!    (but not yet L-notarized) blocks, improving transaction throughput by allowing validation
+//!    against the latest known state.
+//!
+//! Note: The `state_diff` is independent of the `block` field—it can be set before or
+//! after the block arrives, depending on network message ordering.
+//!
 //! ## Thresholds
 //!
 //! For N replicas with F Byzantine faults (N ≥ 3F+1):
@@ -181,7 +204,7 @@
 //!
 //! ## Usage Example
 //!
-//!,no_run
+//! ```rust,ignore
 //! use consensus::consensus_manager::view_context::ViewContext;
 //! use consensus::state::peer::PeerSet;
 //!
@@ -226,7 +249,8 @@
 //! }
 //! # Ok(())
 //! # }
-//! //!
+//! ```
+//!
 //! ## Minimmit Paper Correspondence
 //!
 //! This implementation follows the Minimmit research paper:
@@ -342,7 +366,10 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Received nullify messages for the current view
     pub nullify_messages: HashSet<Nullify>,
 
-    /// Pre-computed state diff for this block (set by validation service)
+    /// Pre-computed state diff from block validation.
+    ///
+    /// This field stores the [`StateDiff`] produced when the block's transactions are validated
+    /// and executed. It is set by [`ViewChain::store_state_diff`] when block validation completes.
     pub state_diff: Option<Arc<StateDiff>>,
 
     /// A nullification for the current view (if any)

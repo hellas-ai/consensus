@@ -43,8 +43,8 @@
 //!   L-notarizations, nullifications) from the message channel and routes them to the state machine
 //! - **Validated Block Processing**: Consumes validated blocks (with their associated `StateDiff`)
 //!   from the validation service and integrates them into the consensus flow
-//! - **Broadcast Distribution**: Produces consensus messages to be broadcast to other replicas
-//!   via the broadcast channel, which the networking layer consumes
+//! - **Broadcast Distribution**: Produces consensus messages to be broadcast to other replicas via
+//!   the broadcast channel, which the networking layer consumes
 //! - **Lifecycle Management**: Provides graceful shutdown with configurable timeout via
 //!   [`shutdown_and_wait`](Self::shutdown_and_wait)
 //! - **Protocol Isolation**: Decouples the consensus logic from external concerns like network I/O
@@ -121,8 +121,8 @@
 //! - **External Channel Ownership**: Channels are created externally and passed to the engine,
 //!   allowing callers to control buffer sizes based on their workload requirements
 //! - **Configurable Tick Interval**: The `tick_interval` parameter controls how often the state
-//!   machine checks for timeouts. Lower values (e.g., 1-10ms) provide faster timeout detection
-//!   at the cost of higher CPU usage
+//!   machine checks for timeouts. Lower values (e.g., 1-10ms) provide faster timeout detection at
+//!   the cost of higher CPU usage
 //! - **Batching**: The state machine processes all available messages in each tick before yielding,
 //!   maximizing throughput under load
 //!
@@ -149,10 +149,10 @@
 //! 2. **Submission**: `ValidatedBlock` is pushed to the channel by the validation service
 //! 3. **Consumption**: `ConsensusEngine` pops the block and passes it to `ViewProgressManager`
 //! 4. **Storage**: `StateDiff` is stored in the `ViewContext` for the block's view
-//! 5. **M-Notarization**: When the block receives 2F+1 votes (M-notarization), the `StateDiff`
-//!    is added to pending state via `PendingStateWriter`
-//! 6. **Finalization**: When the block receives N-F votes (L-notarization), the `StateDiff`
-//!    is applied to finalized state and removed from pending
+//! 5. **M-Notarization**: When the block receives 2F+1 votes (M-notarization), the `StateDiff` is
+//!    added to pending state via `PendingStateWriter`
+//! 6. **Finalization**: When the block receives N-F votes (L-notarization), the `StateDiff` is
+//!    applied to finalized state and removed from pending
 //!
 //! This design ensures that state changes are only visible to subsequent transactions after
 //! the block achieves M-notarization, providing consistency guarantees for the validation service.
@@ -219,7 +219,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
     /// * `secret_key` - The BLS secret key for signing messages
     /// * `message_consumer` - Channel consumer for incoming consensus messages from the network
     /// * `broadcast_producer` - Channel producer for outgoing consensus messages to broadcast
-    /// * `validated_block_consumer` - Channel consumer for validated blocks from the validation service
+    /// * `validated_block_consumer` - Channel consumer for validated blocks from the validation
+    ///   service
     /// * `persistence_writer` - Writer for persisting pending state to storage
     /// * `tick_interval` - Interval for checking timeouts and processing events
     /// * `logger` - Logger instance

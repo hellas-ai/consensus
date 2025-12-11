@@ -29,9 +29,9 @@
 //!                           │ tick()
 //!                           │
 //!                           ▼
-//! ┌────────────────────────────────────────────────────────────────┐
-//! │               ViewProgressManager                              │
-//! │                                                                │
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │               ViewProgressManager                            │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
 //! │  │  Message Routing                                     │    │
 //! │  │  - handle_block_proposal()                           │    │
@@ -40,7 +40,7 @@
 //! │  │  - handle_m_notarization()                           │    │
 //! │  │  - handle_nullification()                            │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! │                                                                │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
 //! │  │  View Chain Management                               │    │
 //! │  │  - Current view tracking                             │    │
@@ -48,41 +48,41 @@
 //! │  │  - View progression logic                            │    │
 //! │  │  - Parent selection (SelectParent)                   │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! │                                                                │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
 //! │  │  Timeout & Nullification                             │    │
 //! │  │  - Periodic tick() calls                             │    │
 //! │  │  - Timeout detection per view                        │    │
 //! │  │  - Byzantine behavior detection                      │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! │                                                                │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
 //! │  │  Pending Block Management                            │    │
-//! │  │  - Store blocks awaiting parent M-notarization      │    │
-//! │  │  - Process cascade when parent is M-notarized       │    │
+//! │  │  - Store blocks awaiting parent M-notarization       │    │
+//! │  │  - Process cascade when parent is M-notarized        │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! │                                                                │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
-//! │  │  Transaction Pool                                    │    │
-//! │  │  - Collect transactions from clients                 │    │
-//! │  │  - Provide to leader for block proposal             │    │
+//! │  │  Validated Block Processing                          │    │
+//! │  │  - process_validated_block() from validation service │    │
+//! │  │  - Store StateDiff for pending state management      │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! │                                                                │
+//! │                                                              │
 //! │  ┌──────────────────────────────────────────────────────┐    │
 //! │  │  Persistence                                         │    │
-//! │  │  - Store non-finalized views to disk                │    │
+//! │  │  - Store non-finalized views to disk                 │    │
 //! │  │  - Recover after crash/restart                       │    │
 //! │  └──────────────────────────────────────────────────────┘    │
-//! └────────────────────────────────────────────────────────────────┘
+//! └──────────────────────────────────────────────────────────────┘
 //!                           │
 //!                           │ returns ViewProgressEvent
 //!                           │
 //!                           ▼
 //! ┌────────────────────────────────────────────────────────────────┐
 //! │             ConsensusStateMachine                              │
-//! │  (executes actions: propose, vote, broadcast, etc.)           │
+//! │  (executes actions: propose, vote, broadcast, etc.)            │
 //! └────────────────────────────────────────────────────────────────┘
-//! //!
+//!
 //! ## Core Responsibilities
 //!
 //! ### 1. Message Processing
@@ -156,6 +156,24 @@
 //! - Finds the greatest view V' < V that has an M-notarization
 //! - Uses that M-notarized block as the parent for the new view
 //! - Ensures safety even when views are skipped due to nullification
+//!
+//! ### 7. Validated Block Processing
+//!
+//! The manager receives validated blocks from the validation service via
+//! [`process_validated_block`](ViewProgressManager::process_validated_block):
+//!
+//! 1. **Block Validation**: The validation service validates the block's transactions and produces
+//!    a [`StateDiff`] representing the state changes.
+//!
+//! 2. **StateDiff Storage**: The manager stores the [`StateDiff`] in the [`ViewContext`] via
+//!    [`ViewChain::store_state_diff`].
+//!
+//! 3. **Pending State**: When the view achieves M-notarization, the [`StateDiff`] is added to
+//!    pending state via [`ViewChain::on_m_notarization`]. This allows future transaction validation
+//!    to see speculative state before finalization.
+//!
+//! 4. **Finalization**: When L-notarization is achieved, the [`StateDiff`] is finalized along with
+//!    the block and other consensus artifacts.
 //!
 //! ## Event-Driven Design
 //!
@@ -233,78 +251,82 @@
 //!
 //! ## Usage Example
 //!
-//!,no_run
+//! ```rust,ignore
 //! use consensus::consensus_manager::view_manager::ViewProgressManager;
 //! use consensus::consensus::ConsensusMessage;
 //!
-//! # fn example() -> anyhow::Result<()> {
-//! // Create manager (typically done by ConsensusEngine)
-//! let mut manager = ViewProgressManager::<6, 1, 3>::new(
-//!     config,
-//!     replica_id,
-//!     storage,
-//!     leader_manager,
-//! )?;
+//! fn example() -> anyhow::Result<()> {
+//!     // Create manager (typically done by ConsensusEngine)
+//!     let mut manager = ViewProgressManager::<6, 1, 3>::new(
+//!         config,
+//!         replica_id,
+//!         leader_manager,
+//!         persistence_writer,
+//!         logger,
+//!     )?;
 //!
-//! // Process incoming messages from network
-//! let event = manager.process_consensus_msg(incoming_message)?;
-//! match event {
-//!     ViewProgressEvent::ShouldVote { view, block_hash } => {
-//!         // Create and broadcast vote
-//!         let vote = create_vote(view, block_hash);
-//!         broadcast(vote);
-//!         manager.mark_voted(view)?;
-//!     }
-//!     ViewProgressEvent::ShouldMNotarize { view, block_hash, should_forward } => {
-//!         // Get M-notarization and broadcast if new
-//!         if should_forward {
-//!             let m_not = manager.get_m_notarization(view)?;
-//!             broadcast(m_not);
+//!     // Process incoming messages from network
+//!     let event = manager.process_consensus_msg(incoming_message)?;
+//!     match event {
+//!         ViewProgressEvent::ShouldVote { view, block_hash } => {
+//!             // Create and broadcast vote
+//!             let vote = create_vote(view, block_hash);
+//!             broadcast(vote);
+//!             manager.mark_voted(view)?;
 //!         }
-//!     }
-//!     ViewProgressEvent::ProgressToNextView { new_view, leader, .. } => {
-//!         // View progressed, check if we're the new leader
-//!         if leader == replica_id {
-//!             let txs = manager.take_pending_transactions();
-//!             let block = create_block(new_view, txs);
-//!             broadcast(block);
-//!             manager.mark_proposed(new_view)?;
+//!         ViewProgressEvent::ShouldMNotarize { view, block_hash, should_forward } => {
+//!             // Get M-notarization and broadcast if new
+//!             if should_forward {
+//!                 let m_not = manager.get_m_notarization(view)?;
+//!                 broadcast(m_not);
+//!             }
 //!         }
+//!         ViewProgressEvent::ProgressToNextView { new_view, leader, .. } => {
+//!             // View progressed, check if we're the new leader
+//!             if leader == replica_id {
+//!                 let block = create_block(new_view);
+//!                 broadcast(block);
+//!                 manager.mark_proposed(new_view)?;
+//!             }
+//!         }
+//!         // ... handle other events
 //!     }
-//!     // ... handle other events
-//! }
 //!
-//! // Periodic tick for timeout detection
-//! let event = manager.tick()?;
-//! match event {
-//!     ViewProgressEvent::ShouldNullify { view } => {
-//!         // Timeout occurred, create nullify message
-//!         let nullify = create_nullify(view);
-//!         broadcast(nullify);
-//!         manager.mark_nullified(view)?;
+//!     // Process validated block from validation service
+//!     let event = manager.process_validated_block(block, state_diff)?;
+//!     // Handle event...
+//!
+//!     // Periodic tick for timeout detection
+//!     let event = manager.tick()?;
+//!     match event {
+//!         ViewProgressEvent::ShouldNullify { view } => {
+//!             // Timeout occurred, create nullify message
+//!             let nullify = create_nullify(view);
+//!             broadcast(nullify);
+//!             manager.mark_nullified(view)?;
+//!         }
+//!         // ... handle other events
 //!     }
-//!     // ... handle other events
+//!
+//!     // Graceful shutdown
+//!     manager.shutdown()?;
+//!     Ok(())
 //! }
+//! ```
 //!
-//! // Add client transactions
-//! manager.add_transaction(tx);
-//!
-//! // Graceful shutdown
-//! manager.shutdown()?;
-//! # Ok(())
-//! # }
-//! //!
 //! ## Interaction with Other Components
 //!
 //! ### ViewChain
 //! - Manages the chain of non-finalized views
 //! - Handles view context creation and retrieval
 //! - Implements SelectParent logic for nullification-based progression
+//! - Stores [`StateDiff`] instances and adds them to pending state on M-notarization
 //!
 //! ### ViewContext
 //! - Manages state for a single view
 //! - Tracks votes, nullifications, and notarizations
 //! - Detects threshold crossings and Byzantine behavior
+//! - Holds the [`StateDiff`] for the view's block (if validated)
 //!
 //! ### ConsensusStateMachine
 //! - Calls `process_consensus_msg()` for each incoming message
@@ -341,6 +363,8 @@
 //! - Timeout detection and prioritization
 //! - Byzantine behavior detection
 //! - Edge cases (duplicates, wrong leaders, invalid signatures)
+//! - Validated block processing and StateDiff storage
+//! - Pending state timing (StateDiff not in pending until M-notarization)
 
 use std::str::FromStr;
 
@@ -793,7 +817,34 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     }
 
     /// Processes a block that has already been validated by the validation service.
-    /// Stores the [`StateDiff`] instance for later application on finalization
+    ///
+    /// This method is the primary entry point for validated blocks from the validation
+    /// service. It stores the [`StateDiff`] in the [`ViewContext`] and then processes
+    /// the block through the normal consensus flow.
+    ///
+    /// # Arguments
+    /// * `block` - The validated block to process
+    /// * `state_diff` - The state changes produced by executing the block's transactions
+    ///
+    /// # Returns
+    /// A [`ViewProgressEvent`] indicating what action the replica should take:
+    /// - `ShouldVote` - Replica should vote for this block
+    /// - `ShouldVoteAndMNotarize` - Vote will cross M-notarization threshold
+    /// - `ShouldVoteAndFinalize` - Vote will cross L-notarization threshold
+    /// - `Await` - Block stored as pending (parent not M-notarized yet)
+    /// - `NoOp` - No action needed (already voted, duplicate, etc.)
+    ///
+    /// # Pending State Lifecycle
+    /// 1. The [`StateDiff`] is stored in [`ViewContext`] via [`ViewChain::store_state_diff`]
+    /// 2. When the view achieves M-notarization, [`ViewChain::on_m_notarization`] adds the diff to
+    ///    pending state
+    /// 3. When L-notarization is achieved, the diff is finalized with the block
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Block is for a view that doesn't exist
+    /// - Block validation fails (wrong leader, invalid signature, etc.)
+    /// - Block's parent hash doesn't match expected parent
     pub fn process_validated_block(
         &mut self,
         block: Block,

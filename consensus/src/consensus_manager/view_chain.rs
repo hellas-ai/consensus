@@ -8,6 +8,9 @@
 //! - Finalize blocks with L-notarization and persist them. Note: ONLY L-notarization finalizes
 //!   blocks. Nullifications and M-notarizations cause view progression but do NOT finalize blocks.
 //! - Manage garbage collection of old views once blocks are L-notarized.
+//! - **Pending State Management**: Store [`StateDiff`] instances from block validation and add them
+//!   to pending state when views achieve M-notarization. This enables transaction validation
+//!   against speculative state before blocks are finalized.
 //!
 //! IMPORTANT DISTINCTION (from Minimit paper):
 //! - **View Progression**: Can happen via M-notarization OR nullification. The view advances but
@@ -78,10 +81,15 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
     /// This map contains at least one entry, namely that corresponding to the current view number.
     pub(crate) non_finalized_views: HashMap<u64, ViewContext<N, F, M_SIZE>>,
 
-    /// The persistence writer for the consensus protocol
-    /// This is used to persist the view contexts and the votes/nullifications/notarizations
-    /// whenever a view in the [`ViewChain`] is finalized by the state machine replication
-    /// protocol.
+    /// The persistence writer for the consensus protocol.
+    ///
+    /// This component serves two purposes:
+    /// 1. **Pending State**: When a view achieves M-notarization, its [`StateDiff`] is added to
+    ///    pending state via [`PendingStateWriter::add_m_notarized_diff`]. This allows transaction
+    ///    validation to see speculative state before finalization.
+    /// 2. **Finalization**: When a view achieves L-notarization, all consensus artifacts (blocks,
+    ///    votes, notarizations, nullifications) are persisted to the database and the pending
+    ///    state is finalized via [`PendingStateWriter::finalize_up_to`].
     persistence_writer: PendingStateWriter,
 
     /// The most recent finalized block hash in the current replica's state machine
@@ -91,6 +99,14 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE> {
     /// Creates a new [`ViewChain`] starting from the given initial view.
+    ///
+    /// # Arguments
+    /// * `initial_view` - The first view context to add to the chain (typically view 1)
+    /// * `persistence_writer` - The writer for persisting state diffs and consensus artifacts
+    ///
+    /// # Returns
+    /// A new [`ViewChain`] with the initial view as the current view and
+    /// `previously_committed_block_hash` set to the genesis block hash.
     pub fn new(
         initial_view: ViewContext<N, F, M_SIZE>,
         persistence_writer: PendingStateWriter,
@@ -107,24 +123,35 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         }
     }
 
-    /// Returns a reference to the current view context
+    /// Returns a reference to the current view context.
+    ///
+    /// The current view is the active view where consensus messages are being processed.
+    /// This view has not yet achieved M-notarization or nullification.
     pub fn current(&self) -> &ViewContext<N, F, M_SIZE> {
         &self.non_finalized_views[&self.current_view]
     }
 
-    /// Returns a mutable reference to the current view context
+    /// Returns a mutable reference to the current view context.
+    ///
+    /// # Panics
+    /// Panics if the current view context is not found in `non_finalized_views`.
+    /// This should never happen in normal operation.
     pub fn current_view_mut(&mut self) -> &mut ViewContext<N, F, M_SIZE> {
         self.non_finalized_views
             .get_mut(&self.current_view)
             .expect("Current view context not found")
     }
 
-    /// Finds a view context by view number
+    /// Finds a view context by view number.
+    ///
+    /// Returns `None` if the view has been finalized (garbage collected) or doesn't exist.
     pub fn find_view_context(&self, view_number: u64) -> Option<&ViewContext<N, F, M_SIZE>> {
         self.non_finalized_views.get(&view_number)
     }
 
-    /// Finds a mutable view context by view number
+    /// Finds a mutable view context by view number.
+    ///
+    /// Returns `None` if the view has been finalized (garbage collected) or doesn't exist.
     pub fn find_view_context_mut(
         &mut self,
         view_number: u64,
@@ -132,17 +159,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.non_finalized_views.get_mut(&view_number)
     }
 
-    /// Returns the current view number
+    /// Returns the current view number.
+    ///
+    /// This is the view where consensus is actively processing messages.
     pub fn current_view_number(&self) -> u64 {
         self.current_view
     }
 
-    /// Returns the number of non-finalized views
+    /// Returns the number of non-finalized views in the chain.
+    ///
+    /// This includes views that have achieved M-notarization or nullification but are
+    /// waiting for L-notarization or garbage collection.
     pub fn non_finalized_count(&self) -> usize {
         self.non_finalized_views.len()
     }
 
-    /// Returns the range of view numbers for the unfinalized views
+    /// Returns the range of view numbers for the non-finalized views.
+    ///
+    /// The range spans from the oldest non-finalized view to the current view.
+    /// All views in this range should exist in `non_finalized_views`.
     pub fn non_finalized_view_numbers_range(&self) -> std::ops::RangeInclusive<u64> {
         let current_view = self.current_view;
         let least_non_finalized_view = self
@@ -152,7 +187,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         least_non_finalized_view..=current_view
     }
 
-    /// Returns the range of view numbers for the non-finalized views until the given view number
+    /// Returns the range of view numbers for the non-finalized views up to the given view number.
+    ///
+    /// # Arguments
+    /// * `view_number` - The upper bound view number (inclusive, capped at current view)
+    ///
+    /// # Returns
+    /// * `Some(range)` - The range from oldest non-finalized view to `min(view_number,
+    ///   current_view)`
+    /// * `None` - If the requested view is older than the oldest non-finalized view
     pub fn non_finalized_views_until(
         &self,
         view_number: u64,
@@ -167,7 +210,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
-    /// Stores a pre-computed [`StateDiff`] instance for a view
+    /// Stores a pre-computed [`StateDiff`] instance for a view.
+    ///
+    /// This method is called when block validation completes and produces a [`StateDiff`]
+    /// representing the state changes from executing the block's transactions.
+    ///
+    /// # Behavior
+    /// - If the view doesn't exist in `non_finalized_views`, the call is silently ignored.
+    /// - If the view exists but hasn't achieved M-notarization yet, the [`StateDiff`] is stored in
+    ///   the [`ViewContext`] and will be added to pending state when M-notarization occurs.
+    /// - If the view already has M-notarization and has progressed (view < current_view), the
+    ///   [`StateDiff`] is immediately added to pending state via [`PendingStateWriter`].
+    ///
+    /// # Arguments
+    /// * `view` - The view number for which the [`StateDiff`] was computed
+    /// * `state_diff` - The state changes from executing the block's transactions
     pub fn store_state_diff(&mut self, view: u64, state_diff: StateDiff) {
         if let Some(ctx) = self.non_finalized_views.get_mut(&view) {
             let state_diff = Arc::new(state_diff);
@@ -523,6 +580,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// * New view number is not exactly current_view + 1
     /// * Current view lacks an M-notarization
     ///
+    /// # Pending State
+    /// Before progressing, this method calls [`on_m_notarization`](Self::on_m_notarization) to add
+    /// the current view's [`StateDiff`] (if present) to pending state. This ensures transaction
+    /// validation can see the speculative state from M-notarized blocks.
+    ///
     /// # Note
     /// If the current view has a pending block, it will be logged as a warning but progression
     /// continues. The pending block will not be processed in the new view.
@@ -867,8 +929,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
-    /// Called when a view is M-notarized: only adds StateDiff to pending.
-    /// Consensus artifacts remain in ViewContext until L-notarization.
+    /// Called when a view achieves M-notarization to add its [`StateDiff`] to pending state.
+    ///
+    /// This method is called by
+    /// [`progress_with_m_notarization`](Self::progress_with_m_notarization)
+    /// and [`store_state_diff`](Self::store_state_diff) (for late-arriving diffs).
+    ///
+    /// # Behavior
+    /// - If the view exists and has a [`StateDiff`], it's added to pending state via
+    ///   [`PendingStateWriter::add_m_notarized_diff`].
+    /// - If the view doesn't exist or has no [`StateDiff`], this is a no-op.
+    /// - Consensus artifacts (block, votes, M-notarization) remain in [`ViewContext`] until
+    ///   L-notarization triggers persistence.
+    ///
+    /// # Arguments
+    /// * `view_number` - The view that achieved M-notarization
     pub fn on_m_notarization(&mut self, view_number: u64) {
         if let Some(ctx) = self.non_finalized_views.get(&view_number)
             && let Some(ref state_diff) = ctx.state_diff
@@ -1085,10 +1160,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// # Errors
     /// * Storage operation fails during persistence
     ///
+    /// # Persisted Artifacts
+    /// For each view, the following are persisted if present:
+    /// - **StateDiff**: Added to pending state via [`PendingStateWriter::add_m_notarized_diff`]
+    /// - **Block**: Persisted as non-finalized
+    /// - **M-notarization**: Persisted if achieved
+    /// - **Nullification**: Persisted if the view was nullified
+    /// - **Votes**: All collected votes are persisted
+    ///
     /// # Note
-    /// Only blocks are persisted; votes, nullifications, and other consensus artifacts
-    /// are not saved. This is sufficient for recovery since the replica can re-sync
-    /// these artifacts from peers upon restart.
+    /// This is called during graceful shutdown to ensure no consensus progress is lost.
+    /// Upon restart, the replica can resume from this state and re-sync any missing
+    /// artifacts from peers.
     pub fn persist_all_views(&mut self) -> Result<()> {
         for (view_number, ctx) in self.non_finalized_views.drain() {
             if let Some(state_diff) = ctx.state_diff {
