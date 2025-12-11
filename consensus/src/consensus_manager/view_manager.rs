@@ -8,7 +8,7 @@
 //! ## Overview
 //!
 //! The `ViewProgressManager` is the "brain" of the consensus system. It:
-//! - Receives incoming consensus messages from the network (via [`ConsensusStateMachine`])
+//! - Receives incoming consensus messages from the network (via `ConsensusStateMachine`)
 //! - Routes messages to the appropriate [`ViewContext`] in the [`ViewChain`]
 //! - Detects when thresholds are reached (M-notarization, L-notarization, nullification)
 //! - Determines what actions the replica should take (vote, nullify, progress view)
