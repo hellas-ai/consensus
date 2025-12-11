@@ -1,57 +1,54 @@
-//! Consensus Engine - High-Level Interface for the Minimmit BFT Consensus Protocol
-//!
-//! This module provides the [`ConsensusEngine`], which serves as the primary entry point
-//! for running the Minimmit consensus protocol. It encapsulates the consensus state machine
-//! in a dedicated thread and provides a simple, thread-safe API for external components
-//! (such as P2P networking layers) to interact with the consensus system.
-//!
 //! ## Architecture
 //!
 //! The consensus engine follows a producer-consumer pattern using lock-free ring buffers
-//! ([`rtrb`](https://docs.rs/rtrb)) for efficient inter-thread communication:
+//! ([`rtrb`](https://docs.rs/rtrb)) for efficient inter-thread communication. Channels are
+//! created externally and passed to the engine at construction time:
 //!
 //!
-//! ┌───────────────────────────────────────────────────────────┐
-//! │                    ConsensusEngine                        │
-//! │  (Main Thread - API Interface)                            │
-//! │                                                           │
-//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-//! │  │   Message    │  │ Transaction  │  │  Broadcast   │     │
-//! │  │   Producer   │  │   Producer   │  │   Consumer   │     │
-//! │  └──────┬───────┘  └──────┬───────┘  └──────▲───────┘     │
-//! └─────────┼──────────────────┼──────────────────┼───────────┘
+//! ┌───────────────────────────────────────────────────────────────────┐
+//! │                 External Components (Caller)                      │
+//! │                                                                   │
+//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
+//! │  │   Message    │  │  Validated   │  │  Broadcast   │            │
+//! │  │   Producer   │  │    Block     │  │   Consumer   │            │
+//! │  │  (Network)   │  │   Producer   │  │  (Network)   │            │
+//! │  └──────┬───────┘  └──────┬───────┘  └──────▲───────┘            │
+//! └─────────┼──────────────────┼──────────────────┼───────────────────┘
 //!           │                  │                  │
 //!           │ Ring Buffers     │                  │
 //!           │ (Lock-free)      │                  │
 //!           ▼                  ▼                  │
-//! ┌─────────┴──────────────────┴──────────────────┴─────────────┐
-//! │              Consensus State Machine Thread                 │
-//! │  (Dedicated Thread - Consensus Logic)                       │
-//! │                                                             │
-//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-//! │  │   Message    │  │ Transaction  │  │  Broadcast   │       │
-//! │  │   Consumer   │  │   Consumer   │  │   Producer   │       │
-//! │  └──────────────┘  └──────────────┘  └──────────────┘       │
-//! │                                                             │
-//! │  ┌────────────────────────────────────────────────┐         │
-//! │  │      ViewProgressManager                       │         │
-//! │  │  (Minimmit Protocol Implementation)            │         │
-//! │  └────────────────────────────────────────────────┘         │
-//! └─────────────────────────────────────────────────────────────┘
-//! //!
+//! ┌─────────┴──────────────────┴──────────────────┴───────────────────┐
+//! │              Consensus State Machine Thread                       │
+//! │  (Dedicated Thread - Consensus Logic)                             │
+//! │                                                                   │
+//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+//! │  │   Message    │  │  Validated   │  │  Broadcast   │             │
+//! │  │   Consumer   │  │    Block     │  │   Producer   │             │
+//! │  │              │  │   Consumer   │  │              │             │
+//! │  └──────────────┘  └──────────────┘  └──────────────┘             │
+//! │                                                                   │
+//! │  ┌────────────────────────────────────────────────────┐           │
+//! │  │      ViewProgressManager                           │           │
+//! │  │  (Minimmit Protocol Implementation)                │           │
+//! │  └────────────────────────────────────────────────────┘           │
+//! └───────────────────────────────────────────────────────────────────┘
+//!
 //! ## Responsibilities
 //!
 //! The `ConsensusEngine` handles:
 //!
 //! - **Thread Management**: Spawns and manages a dedicated thread for consensus operations
-//! - **Message Routing**: Routes incoming consensus messages (blocks, votes, M-notarizations,
-//!   L-notarizations, nullifications) to the state machine
-//! - **Transaction Submission**: Queues client transactions for inclusion in future blocks
-//! - **Broadcast Distribution**: Receives consensus messages that need to be broadcast to other
-//!   replicas and makes them available to the networking layer
-//! - **Lifecycle Management**: Provides graceful shutdown with configurable timeout
+//! - **Message Processing**: Consumes incoming consensus messages (blocks, votes, M-notarizations,
+//!   L-notarizations, nullifications) from the message channel and routes them to the state machine
+//! - **Validated Block Processing**: Consumes validated blocks (with their associated `StateDiff`)
+//!   from the validation service and integrates them into the consensus flow
+//! - **Broadcast Distribution**: Produces consensus messages to be broadcast to other replicas
+//!   via the broadcast channel, which the networking layer consumes
+//! - **Lifecycle Management**: Provides graceful shutdown with configurable timeout via
+//!   [`shutdown_and_wait`](Self::shutdown_and_wait)
 //! - **Protocol Isolation**: Decouples the consensus logic from external concerns like network I/O
-//!   and application logic
+//!   and block validation
 //!
 //! ## Usage Example
 //!
@@ -61,48 +58,104 @@
 //!         consensus_engine::ConsensusEngine,
 //!         config::ConsensusConfig,
 //!     },
+//!     consensus::ConsensusMessage,
 //!     crypto::aggregated::BlsSecretKey,
 //!     storage::store::ConsensusStore,
+//!     validation::{PendingStateWriter, ValidatedBlock},
 //! };
-//! use std::time::Duration;
+//! use rtrb::RingBuffer;
+//! use std::{sync::Arc, time::Duration};
 //!
 //! # fn example() -> anyhow::Result<()> {
 //!     // Initialize consensus components
 //!     let config = ConsensusConfig::default();
-//!     let replica_id = 0;
+//!     let replica_id = peer_set.sorted_peer_ids[0];
 //!     let secret_key = BlsSecretKey::generate(&mut rand::thread_rng());
-//!     let storage = ConsensusStore::open("/path/to/db")?;
+//!     let storage = Arc::new(ConsensusStore::open("/path/to/db")?);
+//!     let (persistence_writer, _reader) = PendingStateWriter::new(storage, 0);
 //!     let logger = slog::Logger::root(slog::Discard, slog::o!());
 //!
+//!     // Create communication channels (owned by external components)
+//!     let (mut message_producer, message_consumer) = RingBuffer::<ConsensusMessage<6, 1, 3>>::new(10000);
+//!     let (broadcast_producer, mut broadcast_consumer) = RingBuffer::<ConsensusMessage<6, 1, 3>>::new(10000);
+//!     let (mut validated_block_producer, validated_block_consumer) = RingBuffer::<ValidatedBlock>::new(1000);
+//!
 //!     // Create and start the consensus engine
-//!     let mut engine = ConsensusEngine::<6, 1, 3>::new(config, replica_id, secret_key, storage,
-//! logger)?;     // Submit incoming consensus messages from the network
-//!     engine.submit_consensus_message(incoming_message)?;
-//!     // Submit client transactions
-//!     engine.submit_transaction(transaction)?;
-//!     // Check for messages to broadcast to other replicas
-//!     for broadcast_msg in engine.recv_all_broadcasts() {
-//!         network.broadcast(broadcast_msg)?;
+//!     let engine = ConsensusEngine::<6, 1, 3>::new(
+//!         config,
+//!         replica_id,
+//!         secret_key,
+//!         message_consumer,
+//!         broadcast_producer,
+//!         validated_block_consumer,
+//!         persistence_writer,
+//!         Duration::from_millis(10),
+//!         logger,
+//!     )?;
+//!
+//!     // External components interact via channels:
+//!     
+//!     // Network layer pushes incoming consensus messages
+//!     message_producer.push(incoming_message)?;
+//!     
+//!     // Validation service pushes validated blocks with state diffs
+//!     validated_block_producer.push(validated_block)?;
+//!     
+//!     // Network layer pops messages to broadcast
+//!     while let Ok(msg) = broadcast_consumer.pop() {
+//!         network.broadcast(msg)?;
 //!     }
+//!
 //!     // Later, gracefully shutdown
 //!     engine.shutdown_and_wait(Duration::from_secs(10))?;
 //!     Ok(())
 //! # }
 //! ```
+//!
+//! ## Performance Considerations
+//!
+//! - **Lock-Free Communication**: Uses [`rtrb`](https://docs.rs/rtrb) ring buffers for
+//!   zero-allocation, wait-free message passing between threads
+//! - **Non-Blocking Polls**: The internal state machine uses non-blocking `pop()` calls and spin
+//!   hints to minimize latency while avoiding busy-waiting
+//! - **External Channel Ownership**: Channels are created externally and passed to the engine,
+//!   allowing callers to control buffer sizes based on their workload requirements
+//! - **Configurable Tick Interval**: The `tick_interval` parameter controls how often the state
+//!   machine checks for timeouts. Lower values (e.g., 1-10ms) provide faster timeout detection
+//!   at the cost of higher CPU usage
+//! - **Batching**: The state machine processes all available messages in each tick before yielding,
+//!   maximizing throughput under load
+//!
 //! ## Thread Safety
 //!
 //! The `ConsensusEngine` is designed for single-threaded ownership in the main application
 //! thread, while the internal state machine runs in its own thread. Communication between
 //! threads uses lock-free ring buffers, avoiding mutex contention and ensuring low latency.
 //!
-//! ## Performance Considerations
+//! ## Validated Block Flow
 //!
-//! - **Non-blocking Operations**: `submit_consensus_message`, `submit_transaction`, and
-//!   `try_recv_broadcast` are all non-blocking and return immediately
-//! - **Buffer Capacity**: Default buffer size is 10,000 messages. If your workload requires higher
-//!   throughput, use [`with_capacity`](ConsensusEngine::with_capacity) to increase buffer sizes
-//! - **Tick Interval**: The state machine polls at a default interval of 10ms. For lower-latency
-//!   requirements, decrease this using `with_capacity`
+//! The `ConsensusEngine` receives validated blocks through the `validated_block_consumer` channel.
+//! This channel is used by the block validation service to submit blocks that have been verified
+//! for correctness (valid transactions, proper signatures, etc.).
+//!
+//! Each [`ValidatedBlock`] contains:
+//! - **`block`**: The block itself (header, transactions, leader signature)
+//! - **`state_diff`**: A [`StateDiff`] representing the state changes from executing the block's
+//!   transactions
+//!
+//! ### State Diff Lifecycle
+//!
+//! 1. **Validation**: Block validation service executes transactions and produces a `StateDiff`
+//! 2. **Submission**: `ValidatedBlock` is pushed to the channel by the validation service
+//! 3. **Consumption**: `ConsensusEngine` pops the block and passes it to `ViewProgressManager`
+//! 4. **Storage**: `StateDiff` is stored in the `ViewContext` for the block's view
+//! 5. **M-Notarization**: When the block receives 2F+1 votes (M-notarization), the `StateDiff`
+//!    is added to pending state via `PendingStateWriter`
+//! 6. **Finalization**: When the block receives N-F votes (L-notarization), the `StateDiff`
+//!    is applied to finalized state and removed from pending
+//!
+//! This design ensures that state changes are only visible to subsequent transactions after
+//! the block achieves M-notarization, providing consistency guarantees for the validation service.
 //!
 //! ## Minimmit Protocol Context
 //!
@@ -164,7 +217,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
     /// * `config` - Consensus configuration
     /// * `replica_id` - The ID of this replica
     /// * `secret_key` - The BLS secret key for signing messages
-    /// * `storage` - Persistent storage for consensus state
+    /// * `message_consumer` - Channel consumer for incoming consensus messages from the network
+    /// * `broadcast_producer` - Channel producer for outgoing consensus messages to broadcast
+    /// * `validated_block_consumer` - Channel consumer for validated blocks from the validation service
+    /// * `persistence_writer` - Writer for persisting pending state to storage
+    /// * `tick_interval` - Interval for checking timeouts and processing events
     /// * `logger` - Logger instance
     ///
     /// # Returns

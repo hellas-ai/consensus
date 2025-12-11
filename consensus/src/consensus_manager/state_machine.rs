@@ -16,15 +16,15 @@
 //! │              ConsensusStateMachine (Event Loop)                 │
 //! │                                                                 │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  1. Poll message_consumer (ConsensusMessages)            │  │
-//! │  │     - BlockProposal, Vote, MNotarization, LNotarization  │  │
-//! │  │     - Nullify, Nullification                             │  │
+//! │  │  1. Poll validated_block_consumer (ValidatedBlocks)      │  │
+//! │  │     - Validated blocks with StateDiff to vote for        │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
 //! │                       │                                         │
 //! │                       ▼                                         │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  2. Poll validated_block_consumer (ValidatedBlocks)     │  │
-//! │  │     - Validated blocks to vote for                       │  │
+//! │  │  2. Poll message_consumer (ConsensusMessages)            │  │
+//! │  │     - BlockProposal, Vote, MNotarization, LNotarization  │  │
+//! │  │     - Nullify, Nullification                             │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
 //! │                       │                                         │
 //! │                       ▼                                         │
@@ -55,14 +55,15 @@
 //! │                                                                 │
 //! │  Loop continues until shutdown_signal is set                   │
 //! └─────────────────────────────────────────────────────────────────┘
-//! //!
+//!
 //! ## Responsibilities
 //!
 //! The `ConsensusStateMachine` is responsible for:
 //!
 //! - **Message Processing**: Consuming and validating incoming consensus messages (block proposals,
 //!   votes, M-notarizations, L-notarizations, nullifications)
-//! - **Transaction Management**: Collecting client transactions for inclusion in blocks
+//! - **Validated Block Processing**: Receiving validated blocks with their `StateDiff` from the
+//!   validation service and integrating them into the consensus flow
 //! - **View Progression**: Advancing through views based on M-notarizations or nullifications
 //! - **Leader Duties**: Proposing blocks when this replica is the leader
 //! - **Voting**: Casting votes for valid block proposals
@@ -165,13 +166,14 @@
 //! use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
 //!
 //! # fn example() -> anyhow::Result<()> {
+//!     // Note: view_manager is created with ViewProgressManager::new() which takes
+//!     // the PendingStateWriter for state persistence
 //!     let mut state_machine = ConsensusStateMachineBuilder::<6, 1, 3>::new()
 //!         .with_view_manager(view_manager)
 //!         .with_secret_key(secret_key)
 //!         .with_message_consumer(message_consumer)
 //!         .with_broadcast_producer(broadcast_producer)
 //!         .with_validated_block_consumer(validated_block_consumer)
-//!         .with_pending_state_writer(pending_state_writer)
 //!         .with_tick_interval(Duration::from_millis(10))
 //!         .with_shutdown_signal(Arc::new(AtomicBool::new(false)))
 //!         .with_logger(logger)
