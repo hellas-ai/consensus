@@ -1266,6 +1266,7 @@ mod tests {
 
     #[test]
     fn concurrent_read_write_safety() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         let path = temp_db_path();
@@ -1275,16 +1276,22 @@ mod tests {
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let addr = Address::from_public_key(&sk.public_key());
 
+        // Signal for when writing is complete
+        let write_complete = Arc::new(AtomicBool::new(false));
+
         // Spawn 100 reader threads
         let mut reader_handles = Vec::with_capacity(100);
         for reader_id in 0..100 {
             let reader_clone = reader.clone();
             let addr_clone = addr;
+            let write_complete_clone = Arc::clone(&write_complete);
 
             let handle = thread::spawn(move || {
                 let mut last_balance = 0u64;
                 let mut read_count = 0u64;
-                for _ in 0..100 {
+
+                // Read while writes are ongoing - verify monotonicity
+                while !write_complete_clone.load(Ordering::Acquire) {
                     if let Some(state) = reader_clone.get_account(&addr_clone) {
                         // Balance should only increase (we're only adding)
                         assert!(
@@ -1299,7 +1306,8 @@ mod tests {
                     }
                     thread::yield_now();
                 }
-                // Return final observed state
+
+                // Final read after all writes complete
                 (reader_id, read_count, reader_clone.get_account(&addr_clone))
             });
 
@@ -1318,6 +1326,9 @@ mod tests {
             writer.add_m_notarized_diff(i, Arc::new(diff.clone()));
             thread::yield_now();
         }
+
+        // Signal that writing is complete
+        write_complete.store(true, Ordering::Release);
 
         // Wait for all readers and verify
         let expected_final = 100 + 49 * 100; // 5000

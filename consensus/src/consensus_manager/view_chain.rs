@@ -870,11 +870,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// Called when a view is M-notarized: only adds StateDiff to pending.
     /// Consensus artifacts remain in ViewContext until L-notarization.
     pub fn on_m_notarization(&mut self, view_number: u64) {
-        if let Some(ctx) = self.non_finalized_views.get(&view_number) {
-            if let Some(ref state_diff) = ctx.state_diff {
-                self.persistence_writer
-                    .add_m_notarized_diff(view_number, Arc::clone(state_diff));
-            }
+        if let Some(ctx) = self.non_finalized_views.get(&view_number)
+            && let Some(ref state_diff) = ctx.state_diff
+        {
+            self.persistence_writer
+                .add_m_notarized_diff(view_number, Arc::clone(state_diff));
         }
     }
 
@@ -4490,7 +4490,10 @@ mod tests {
         let storage = &view_chain.persistence_writer;
 
         // Check block was persisted (as M-notarized, not finalized)
-        let stored_block_v1 = storage.store().get_finalized_block(&block_hash_v1).unwrap();
+        let stored_block_v1 = storage
+            .store()
+            .get_non_finalized_block(&block_hash_v1)
+            .unwrap();
         assert!(stored_block_v1.is_some());
         let stored_block_v1 = stored_block_v1.unwrap();
         assert_eq!(stored_block_v1.get_hash(), block_hash_v1);

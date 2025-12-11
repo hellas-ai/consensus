@@ -34,7 +34,7 @@ fn bench_add_m_notarized_diff(c: &mut Criterion) {
                     for addr in &addresses {
                         diff.add_balance_change(*addr, 100, 0);
                     }
-                    writer.add_m_notarized_diff(view, diff);
+                    writer.add_m_notarized_diff(view, Arc::new(diff));
                     view += 1;
                 });
 
@@ -71,7 +71,7 @@ fn bench_get_account(c: &mut Criterion) {
                     } else {
                         diff.add_balance_change(addr, 100, v as u64 - 1);
                     }
-                    writer.add_m_notarized_diff(v as u64, diff);
+                    writer.add_m_notarized_diff(v as u64, Arc::new(diff));
                 }
 
                 // Only benchmark the read

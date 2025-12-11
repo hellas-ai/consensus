@@ -96,13 +96,13 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     pub validation_service: BlockValidationService,
 
     /// Shutdown flag (shared with validation service)
-    pub shutdown: Arc<AtomicBool>,
+    pub _shutdown: Arc<AtomicBool>,
 
     /// Producer for submitting transactions (clients write here)
     pub transaction_producer: Producer<Transaction>,
 
     /// Consumer for reading transactions (block builder reads here)
-    pub transaction_consumer: Consumer<Transaction>,
+    pub _transaction_consumer: Consumer<Transaction>,
 
     /// Temporary directory for storage (must be kept alive)
     _temp_dir: TempDir,
@@ -147,34 +147,37 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             validated_block_consumer,
             persistence_writer,
             validation_service,
-            shutdown,
+            _shutdown: shutdown,
             transaction_producer,
-            transaction_consumer,
+            _transaction_consumer: transaction_consumer,
             _temp_dir: temp_dir,
         }
     }
 
     /// Submit a transaction to this replica's mempool
-    pub fn submit_transaction(
-        &mut self,
-        tx: Transaction,
-    ) -> Result<(), rtrb::PushError<Transaction>> {
-        self.transaction_producer.push(tx)
+    pub fn _submit_transaction(&mut self, tx: Transaction) -> Result<(), anyhow::Error> {
+        self.transaction_producer
+            .push(tx)
+            .map_err(|e| anyhow::anyhow!("Failed to submit transaction: {:?}", e))
     }
 
     /// Submit a block for validation (called when receiving block from P2P or when proposing)
-    pub fn submit_block_for_validation(
-        &mut self,
-        block: Block,
-    ) -> Result<(), rtrb::PushError<Block>> {
-        self.block_producer.push(block)
+    pub fn _submit_block_for_validation(&mut self, block: Block) -> Result<(), anyhow::Error> {
+        self.block_producer
+            .push(block)
+            .map_err(|e| anyhow::anyhow!("Failed to submit block: {:?}", e))
     }
 
     /// Build a block proposal from pending transactions (when this replica is leader)
-    pub fn build_block_proposal(&mut self, view: u64, parent_hash: [u8; 32], height: u64) -> Block {
+    pub fn _build_block_proposal(
+        &mut self,
+        view: u64,
+        parent_hash: [u8; 32],
+        height: u64,
+    ) -> Block {
         // Take transactions from pool
         let mut transactions = Vec::new();
-        while let Ok(tx) = self.transaction_consumer.pop() {
+        while let Ok(tx) = self._transaction_consumer.pop() {
             transactions.push(tx);
         }
 
@@ -209,8 +212,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
     }
 
     /// Shutdown this replica's validation service
-    pub fn shutdown_validation(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+    pub fn _shutdown_validation(&mut self) {
+        self._shutdown.store(true, Ordering::Release);
         self.validation_service.shutdown();
     }
 }
