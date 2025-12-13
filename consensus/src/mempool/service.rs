@@ -16,12 +16,13 @@
 //!
 //! 1. Transaction Ingestion: Receive transactions from P2P/RPC
 //! 2. Signature Verification: Validate Ed25519 signatures before storing
-//! 3. Proposal Building: Select highest-fee valid transactions for blocks
-//! 4. State Validation: Verify nonces and balances during proposal building
-//! 5. Finalization Cleanup: Remove transactions included in finalized blocks
+//! 3. Pool Management: Route transactions to pending/queued pools based on nonce
+//! 4. Proposal Building: Select highest-fee valid transactions for blocks
+//! 5. State Validation: Verify balances during proposal building
+//! 6. Finalization Cleanup: Remove transactions included in finalized blocks
 
 use super::{
-    pool::{DEFAULT_POOL_CAPACITY, TransactionPool},
+    pool::{AddResult, DEFAULT_POOL_CAPACITY, TransactionPool},
     types::{FinalizedNotification, ProposalRequest, ProposalResponse},
 };
 use crate::{
@@ -53,6 +54,7 @@ const TX_PROCESS_QUOTA: usize = 64;
 /// The service:
 /// - Receives transactions from P2P/RPC via tx_producer
 /// - Validates transaction signatures before storing
+/// - Routes transactions to pending/queued pools based on nonce
 /// - Builds block proposals with state-validated transactions
 /// - Removes finalized transactions from the pool
 pub struct MempoolService {
@@ -115,8 +117,10 @@ impl MempoolService {
         // Finalization notification channel (Consensus → Mempool)
         let (finalized_producer, finalized_consumer) =
             RingBuffer::<FinalizedNotification>::new(RING_BUFFER_SIZE);
+
         let shutdown_clone = Arc::clone(&shutdown);
         let logger_clone = logger.clone();
+
         let handle = thread::Builder::new()
             .name("mempool".into())
             .spawn(move || {
@@ -132,12 +136,14 @@ impl MempoolService {
                 );
             })
             .expect("Failed to spawn mempool thread");
+
         let channels = MempoolChannels {
             tx_producer,
             proposal_resp_consumer,
             proposal_req_producer,
             finalized_producer,
         };
+
         (
             Self {
                 handle: Some(handle),
@@ -168,7 +174,7 @@ impl Drop for MempoolService {
 }
 
 /// Main mempool event loop.
-fn mempool_loop(
+pub fn mempool_loop(
     pool_capacity: usize,
     pending_state_reader: PendingStateReader,
     mut tx_consumer: Consumer<Transaction>,
@@ -185,6 +191,9 @@ fn mempool_loop(
     // Statistics
     let mut stats_proposals_built = 0u64;
     let mut stats_invalid_signatures = 0u64;
+    let mut stats_added_pending = 0u64;
+    let mut stats_added_queued = 0u64;
+    let mut stats_rejected = 0u64;
 
     slog::info!(logger, "Mempool service started"; "capacity" => pool_capacity);
 
@@ -219,23 +228,57 @@ fn mempool_loop(
                 Ok(tx) => {
                     did_work = true;
                     let tx_hash = tx.tx_hash;
+                    let sender = tx.sender;
+
                     // Verify signature before adding to pool
-                    if tx.verify() {
-                        if pool.try_add(Arc::new(tx)) {
-                            slog::trace!(
-                            logger,
-                            "Transaction added to pool";
-                            "tx_hash" => hex::encode(&tx_hash[..8]),
-                            "pool_size" => pool.len(),
-                            );
-                        }
-                    } else {
+                    if !tx.verify() {
                         stats_invalid_signatures += 1;
                         slog::debug!(
-                        logger,
-                        "Transaction rejected: invalid signature";
-                        "tx_hash" => hex::encode(&tx_hash[..8]),
+                            logger,
+                            "Transaction rejected: invalid signature";
+                            "tx_hash" => hex::encode(&tx_hash[..8]),
                         );
+                        continue;
+                    }
+
+                    // Get sender's current nonce from chain state
+                    let sender_base_nonce = pending_state_reader
+                        .get_account(&sender)
+                        .map(|a| a.nonce)
+                        .unwrap_or(0);
+
+                    // Add to pool with nonce-based routing
+                    let result = pool.try_add(Arc::new(tx), sender_base_nonce);
+
+                    match result {
+                        AddResult::AddedPending => {
+                            stats_added_pending += 1;
+                            slog::trace!(
+                                logger,
+                                "Transaction added to pending pool";
+                                "tx_hash" => hex::encode(&tx_hash[..8]),
+                                "sender" => hex::encode(&sender.as_bytes()[..8]),
+                                "pool_size" => pool.len(),
+                            );
+                        }
+                        AddResult::AddedQueued => {
+                            stats_added_queued += 1;
+                            slog::trace!(
+                                logger,
+                                "Transaction added to queued pool (nonce gap)";
+                                "tx_hash" => hex::encode(&tx_hash[..8]),
+                                "sender" => hex::encode(&sender.as_bytes()[..8]),
+                                "pool_size" => pool.len(),
+                            );
+                        }
+                        AddResult::Rejected => {
+                            stats_rejected += 1;
+                            slog::debug!(
+                                logger,
+                                "Transaction rejected (duplicate/stale/full)";
+                                "tx_hash" => hex::encode(&tx_hash[..8]),
+                            );
+                        }
                     }
                 }
                 Err(_) => break,
@@ -246,7 +289,27 @@ fn mempool_loop(
         while let Ok(notif) = finalized_consumer.pop() {
             did_work = true;
             let removed_count = notif.tx_hashes.len();
+
+            // Collect affected senders BEFORE removing transactions
+            let affected_senders = notif
+                .tx_hashes
+                .iter()
+                .filter_map(|tx_hash| pool.get(tx_hash).map(|vtx| vtx.tx.sender))
+                .collect::<Vec<Address>>();
+
+            // Remove finalized transactions from pool
             pool.remove_finalized(&notif);
+
+            // Update sender nonces based on finalized state
+            // This promotes queued transactions that are now executable
+            for sender in affected_senders {
+                let new_nonce = pending_state_reader
+                    .get_account(&sender)
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                pool.update_sender_nonce(&sender, new_nonce);
+            }
+
             slog::debug!(
             logger,
             "Removed finalized transactions";
@@ -260,15 +323,20 @@ fn mempool_loop(
         if stats_interval.elapsed() >= std::time::Duration::from_secs(30) {
             let pool_stats = pool.stats();
             slog::info!(
-            logger,
-            "Mempool stats";
-            "size" => pool_stats.current_size,
-            "capacity" => pool_stats.capacity,
-            "unique_senders" => pool_stats.unique_senders,
-            "total_added" => pool_stats.total_added,
-            "total_removed" => pool_stats.total_removed,
-            "proposals_built" => stats_proposals_built,
-            "invalid_signatures" => stats_invalid_signatures,
+                logger,
+                "Mempool stats";
+                "pending" => pool_stats.pending_size,
+                "queued" => pool_stats.queued_size,
+                "total" => pool_stats.total_size,
+                "capacity" => pool_stats.capacity,
+                "unique_senders" => pool_stats.unique_senders,
+                "total_added" => pool_stats.total_added,
+                "total_removed" => pool_stats.total_removed,
+                "proposals_built" => stats_proposals_built,
+                "added_pending" => stats_added_pending,
+                "added_queued" => stats_added_queued,
+                "rejected" => stats_rejected,
+                "invalid_signatures" => stats_invalid_signatures,
             );
             stats_interval = std::time::Instant::now();
         }
@@ -293,7 +361,8 @@ fn mempool_loop(
     slog::info!(
         logger,
         "Mempool service shutting down";
-        "final_size" => pool_stats.current_size,
+        "final_pending" => pool_stats.pending_size,
+        "final_queued" => pool_stats.queued_size,
         "total_added" => pool_stats.total_added,
         "total_removed" => pool_stats.total_removed,
         "proposals_built" => stats_proposals_built,
@@ -323,11 +392,10 @@ fn push_with_backpressure(
 
 /// Builds a block proposal with state-validated transactions.
 ///
-/// This function:
-/// 1. Iterates transactions in fee-priority order
-/// 2. Validates each transaction against current state (nonces, balances)
-/// 3. Tracks in-proposal state changes to handle multiple txs from same sender
-/// 4. Returns only transactions that form a coherent, valid block
+/// With the two-pool design:
+/// - `iter_pending()` returns only executable transactions (nonces already valid)
+/// - We still validate balances since they can change between insertion and proposal
+/// - We track in-block balance changes for multiple txs from the same sender
 fn build_validated_proposal(
     pool: &TransactionPool,
     req: &ProposalRequest,
@@ -337,30 +405,43 @@ fn build_validated_proposal(
     let mut total_bytes = 0usize;
     let mut total_fees = 0u64;
 
-    // Track in-block state changes for validation
-    let mut pending_nonces: HashMap<Address, u64> = HashMap::new();
+    // Track in-block balance changes for validation
+    // Note: Nonces are already validated by the pending pool, so we only track balances
     let mut pending_balances: HashMap<Address, i128> = HashMap::new();
 
-    // Iterate transactions in priority order (highest fee first)
-    for tx in pool.iter_by_priority() {
+    // Track which senders we've already included a tx from in this block
+    // to ensure we process their nonces sequentially
+    let mut sender_next_nonce: HashMap<Address, u64> = HashMap::new();
+
+    // Iterate transactions in fee-priority order (highest fee first)
+    // All transactions from iter_pending() have valid nonces at pool level
+    for tx in pool.iter_pending() {
         if selected.len() >= req.max_txs {
             break;
         }
 
-        // Get current nonce for sender
-        let expected_nonce = get_effective_nonce(&tx.sender, &pending_nonces, pending_state_reader);
+        let sender = tx.sender;
 
-        // Skip if nonce doesn't match (gap or already used)
-        if tx.nonce != expected_nonce {
-            continue;
+        // Verify nonce is sequential for this sender within this block
+        // This handles the case where we skip a tx (e.g., insufficient balance)
+        // and need to also skip subsequent txs from the same sender
+        let expected_in_block = sender_next_nonce.get(&sender);
+        if let Some(expected) = expected_in_block {
+            if tx.nonce != *expected {
+                // We already have txs from this sender but there's a gap
+                // (possibly due to skipping a tx with insufficient balance)
+                continue;
+            }
         }
 
         // Get current balance for sender
-        let balance = get_effective_balance(&tx.sender, &pending_balances, pending_state_reader);
+        let balance = get_effective_balance(&sender, &pending_balances, pending_state_reader);
 
         // Check sufficient balance for amount + fee
         let required = tx.amount() as i128 + tx.fee as i128;
         if balance < required {
+            // Skip this tx, but DON'T update sender_next_nonce
+            // This creates a "gap" that will cause subsequent txs to be skipped too
             continue;
         }
 
@@ -371,8 +452,7 @@ fn build_validated_proposal(
         }
 
         // Transaction is valid - update in-block state
-        pending_nonces.insert(tx.sender, expected_nonce + 1);
-        *pending_balances.entry(tx.sender).or_insert(balance) -= required;
+        *pending_balances.entry(sender).or_insert(balance) -= required;
 
         // Credit recipient (if applicable)
         if let Some(recipient) = tx.recipient() {
@@ -380,6 +460,9 @@ fn build_validated_proposal(
                 get_effective_balance(&recipient, &pending_balances, pending_state_reader);
             *pending_balances.entry(recipient).or_insert(recipient_bal) += tx.amount() as i128;
         }
+
+        // Track the next expected nonce for this sender
+        sender_next_nonce.insert(sender, tx.nonce + 1);
 
         total_bytes += tx_size;
         total_fees += tx.fee;
@@ -391,28 +474,6 @@ fn build_validated_proposal(
         transactions: selected,
         total_fees,
     }
-}
-
-/// Gets the effective nonce for an address.
-///
-/// Priority: in-block pending > pending state > 0
-fn get_effective_nonce(
-    address: &Address,
-    pending_nonces: &HashMap<Address, u64>,
-    pending_state_reader: &PendingStateReader,
-) -> u64 {
-    // Check in-block pending state first
-    if let Some(&nonce) = pending_nonces.get(address) {
-        return nonce;
-    }
-
-    // Check pending state (M-notarized blocks)
-    if let Some(account_state) = pending_state_reader.get_account(address) {
-        return account_state.nonce;
-    }
-
-    // Account doesn't exist
-    0
 }
 
 /// Gets the effective balance for an address.
@@ -440,6 +501,7 @@ fn get_effective_balance(
 /// Estimates the serialized size of a transaction.
 #[inline]
 fn estimate_tx_size(_tx: &Arc<Transaction>) -> usize {
+    // TODO: Make this method more accurate
     const BASE_SIZE: usize = 153;
     const INSTRUCTION_SIZE: usize = 40;
     BASE_SIZE + INSTRUCTION_SIZE
@@ -646,6 +708,7 @@ mod tests {
             MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions with nonce gap (0, 2 - missing 1)
+        // tx0 goes to pending, tx2 goes to queued
         let tx0 = create_tx(&sk, sender, recipient, 100, 0, 20);
         let tx2 = create_tx(&sk, sender, recipient, 100, 2, 10);
 
@@ -665,9 +728,57 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let resp = channels.proposal_resp_consumer.pop().unwrap();
-        // Only tx with nonce 0 should be included
+        // Only tx with nonce 0 should be included (tx2 is in queued pool)
         assert_eq!(resp.transactions.len(), 1);
         assert_eq!(resp.transactions[0].nonce, 0);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_queued_promoted_after_gap_filled() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit transactions out of order (2, 0, 1)
+        // This tests that the pool promotes correctly
+        let tx2 = create_tx(&sk, sender, recipient, 100, 2, 10);
+        let tx0 = create_tx(&sk, sender, recipient, 100, 0, 30);
+        let tx1 = create_tx(&sk, sender, recipient, 100, 1, 20);
+
+        channels.tx_producer.push(tx2).unwrap(); // Goes to queued
+        channels.tx_producer.push(tx0).unwrap(); // Goes to pending
+        channels.tx_producer.push(tx1).unwrap(); // Goes to pending, promotes tx2
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // All 3 should be included (tx2 was promoted when tx1 was added)
+        assert_eq!(resp.transactions.len(), 3);
 
         service.shutdown();
     }

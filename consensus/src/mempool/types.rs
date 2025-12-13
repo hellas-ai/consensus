@@ -71,4 +71,13 @@ impl ValidatedTransaction {
             tx,
         }
     }
+
+    /// Creates a new validated transaction from a raw transaction with a received at time.
+    pub fn new_with_received_at(tx: Arc<Transaction>, received_at: Instant) -> Self {
+        Self {
+            priority: tx.fee,
+            received_at,
+            tx,
+        }
+    }
 }
