@@ -242,27 +242,26 @@ impl TransactionPool {
         }
 
         // Check if nonce already exists - allow replacement if higher fee
-        if let Some(queued_txs) = self.queued_by_sender.get(&sender) {
-            if let Some(&existing_hash) = queued_txs.get(&nonce) {
-                if let Some(existing_vtx) = self.by_hash.get(&existing_hash) {
-                    let min_replacement_fee = existing_vtx.priority * MIN_FEE_BUMP_PERCENT / 100;
-                    if tx.fee >= min_replacement_fee {
-                        // Replace: remove old, continue to add new
-                        self.remove(&existing_hash);
-                    } else {
-                        return AddResult::Rejected; // Fee too low to replace
-                    }
-                }
+        if let Some(queued_txs) = self.queued_by_sender.get(&sender)
+            && let Some(&existing_hash) = queued_txs.get(&nonce)
+            && let Some(existing_vtx) = self.by_hash.get(&existing_hash)
+        {
+            let min_replacement_fee = existing_vtx.priority * MIN_FEE_BUMP_PERCENT / 100;
+            if tx.fee >= min_replacement_fee {
+                // Replace: remove old, continue to add new
+                self.remove(&existing_hash);
+            } else {
+                return AddResult::Rejected; // Fee too low to replace
             }
         }
 
         // Check capacity
         if self.by_hash.len() >= self.capacity {
             // Try to evict lowest-fee pending tx
-            if let Some(min_fee) = self.min_pending_fee() {
-                if tx.fee <= min_fee {
-                    return AddResult::Rejected;
-                }
+            if let Some(min_fee) = self.min_pending_fee()
+                && tx.fee <= min_fee
+            {
+                return AddResult::Rejected;
             }
             self.evict_lowest_pending();
         }
@@ -445,12 +444,12 @@ impl TransactionPool {
 
         while queued_txs.len() > MAX_QUEUED_PER_SENDER {
             // Remove highest nonce (least likely to be needed soon)
-            if let Some((&highest_nonce, _)) = queued_txs.last_key_value() {
-                if let Some(&tx_hash) = queued_txs.get(&highest_nonce) {
-                    queued_txs.remove(&highest_nonce);
-                    self.by_hash.remove(&tx_hash);
-                    self.stats_removed += 1;
-                }
+            if let Some((&highest_nonce, _)) = queued_txs.last_key_value()
+                && let Some(&tx_hash) = queued_txs.get(&highest_nonce)
+            {
+                queued_txs.remove(&highest_nonce);
+                self.by_hash.remove(&tx_hash);
+                self.stats_removed += 1;
             }
         }
     }
@@ -496,18 +495,16 @@ impl TransactionPool {
         }
 
         // First, remove the old sender head (if exists)
-        if let Some(old_base) = self.get_base_nonce(sender) {
-            if let Some(pending_txs) = self.pending_by_sender.get(sender) {
-                if let Some(&head_hash) = pending_txs.get(&old_base) {
-                    if let Some(head_vtx) = self.by_hash.get(&head_hash) {
-                        self.sender_heads.remove(&SenderHead {
-                            fee: head_vtx.priority,
-                            received_at: head_vtx.received_at,
-                            sender: *sender,
-                        });
-                    }
-                }
-            }
+        if let Some(old_base) = self.get_base_nonce(sender)
+            && let Some(pending_txs) = self.pending_by_sender.get(sender)
+            && let Some(&head_hash) = pending_txs.get(&old_base)
+            && let Some(head_vtx) = self.by_hash.get(&head_hash)
+        {
+            self.sender_heads.remove(&SenderHead {
+                fee: head_vtx.priority,
+                received_at: head_vtx.received_at,
+                sender: *sender,
+            });
         }
 
         // Take ownership of the sender's pending txs (releases borrow on self)
@@ -529,15 +526,15 @@ impl TransactionPool {
                 self.pending_by_sender.insert(*sender, to_keep.clone());
 
                 // Update sender_heads with new head
-                if let Some((&_new_head_nonce, &new_head_hash)) = to_keep.first_key_value() {
-                    if let Some(new_head_vtx) = self.by_hash.get(&new_head_hash) {
-                        self.sender_heads.insert(SenderHead {
-                            fee: new_head_vtx.priority,
-                            received_at: new_head_vtx.received_at,
-                            sender: *sender,
-                        });
-                        // NOTE: base nonce is derived from pending_by_sender
-                    }
+                if let Some((&_new_head_nonce, &new_head_hash)) = to_keep.first_key_value()
+                    && let Some(new_head_vtx) = self.by_hash.get(&new_head_hash)
+                {
+                    self.sender_heads.insert(SenderHead {
+                        fee: new_head_vtx.priority,
+                        received_at: new_head_vtx.received_at,
+                        sender: *sender,
+                    });
+                    // NOTE: base nonce is derived from pending_by_sender
                 }
             }
             // NOTE: no need to track base_nonces - derived from pending_by_sender
@@ -584,14 +581,13 @@ impl TransactionPool {
 
                     // Get new head (next lowest nonce)
                     if let Some((&_new_head_nonce, &new_head_hash)) = pending_txs.first_key_value()
+                        && let Some(new_head_vtx) = self.by_hash.get(&new_head_hash)
                     {
-                        if let Some(new_head_vtx) = self.by_hash.get(&new_head_hash) {
-                            self.sender_heads.insert(SenderHead {
-                                fee: new_head_vtx.priority,
-                                received_at: new_head_vtx.received_at,
-                                sender,
-                            });
-                        }
+                        self.sender_heads.insert(SenderHead {
+                            fee: new_head_vtx.priority,
+                            received_at: new_head_vtx.received_at,
+                            sender,
+                        });
                     }
                 }
 
@@ -601,15 +597,15 @@ impl TransactionPool {
         }
 
         // Try to remove from queued
-        if let Some(queued_txs) = self.queued_by_sender.get_mut(&sender) {
-            if queued_txs.remove(&nonce).is_some() {
-                if queued_txs.is_empty() {
-                    self.queued_by_sender.remove(&sender);
-                }
-
-                self.stats_removed += 1;
-                return Some(vtx);
+        if let Some(queued_txs) = self.queued_by_sender.get_mut(&sender)
+            && queued_txs.remove(&nonce).is_some()
+        {
+            if queued_txs.is_empty() {
+                self.queued_by_sender.remove(&sender);
             }
+
+            self.stats_removed += 1;
+            return Some(vtx);
         }
 
         self.stats_removed += 1;
@@ -629,12 +625,11 @@ impl TransactionPool {
         if let Some(lowest) = self.sender_heads.last().cloned() {
             let sender = lowest.sender;
             // Get the head tx hash for this sender (derived from pending_by_sender)
-            if let Some(base_nonce) = self.get_base_nonce(&sender) {
-                if let Some(pending_txs) = self.pending_by_sender.get(&sender) {
-                    if let Some(&tx_hash) = pending_txs.get(&base_nonce) {
-                        self.remove(&tx_hash);
-                    }
-                }
+            if let Some(base_nonce) = self.get_base_nonce(&sender)
+                && let Some(pending_txs) = self.pending_by_sender.get(&sender)
+                && let Some(&tx_hash) = pending_txs.get(&base_nonce)
+            {
+                self.remove(&tx_hash);
             }
         }
     }
@@ -650,6 +645,11 @@ impl TransactionPool {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Returns an iterator over all senders with queued transactions.
+    pub fn queued_senders(&self) -> impl Iterator<Item = Address> + '_ {
+        self.queued_by_sender.keys().copied()
     }
 
     /// Returns queued transactions for a specific sender, ordered by nonce.
@@ -745,37 +745,35 @@ impl<'a> Iterator for PendingIter<'a> {
     type Item = Arc<Transaction>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Pop the highest-fee sender (first in BTreeSet due to Ord impl)
-            let head = self.heap.pop_first()?;
-            let sender = head.sender;
+        // Pop the highest-fee sender (first in BTreeSet due to Ord impl)
+        let head = self.heap.pop_first()?;
+        let sender = head.sender;
 
-            // Get current nonce for this sender
-            let current_nonce = self.current_nonces.get(&sender).copied()?;
+        // Get current nonce for this sender
+        let current_nonce = self.current_nonces.get(&sender).copied()?;
 
-            // Get the tx at this nonce
-            let pending_txs = self.pool.pending_by_sender.get(&sender)?;
-            let tx_hash = pending_txs.get(&current_nonce)?;
-            let vtx = self.pool.by_hash.get(tx_hash)?;
-            let tx = Arc::clone(&vtx.tx);
+        // Get the tx at this nonce
+        let pending_txs = self.pool.pending_by_sender.get(&sender)?;
+        let tx_hash = pending_txs.get(&current_nonce)?;
+        let vtx = self.pool.by_hash.get(tx_hash)?;
+        let tx = Arc::clone(&vtx.tx);
 
-            // Advance to next nonce
-            let next_nonce = current_nonce + 1;
-            self.current_nonces.insert(sender, next_nonce);
+        // Advance to next nonce
+        let next_nonce = current_nonce + 1;
+        self.current_nonces.insert(sender, next_nonce);
 
-            // If sender has more pending txs, reinsert with next tx's fee
-            if let Some(next_hash) = pending_txs.get(&next_nonce) {
-                if let Some(next_vtx) = self.pool.by_hash.get(next_hash) {
-                    self.heap.insert(SenderHead {
-                        fee: next_vtx.priority,
-                        received_at: next_vtx.received_at,
-                        sender,
-                    });
-                }
-            }
-
-            return Some(tx);
+        // If sender has more pending txs, reinsert with next tx's fee
+        if let Some(next_hash) = pending_txs.get(&next_nonce)
+            && let Some(next_vtx) = self.pool.by_hash.get(next_hash)
+        {
+            self.heap.insert(SenderHead {
+                fee: next_vtx.priority,
+                received_at: next_vtx.received_at,
+                sender,
+            });
         }
+
+        Some(tx)
     }
 }
 

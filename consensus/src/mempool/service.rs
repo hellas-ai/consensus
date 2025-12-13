@@ -32,7 +32,7 @@ use crate::{
 use rtrb::{Consumer, Producer, RingBuffer};
 use slog::Logger;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -46,8 +46,8 @@ const RING_BUFFER_SIZE: usize = 256;
 /// Ring buffer size for transaction channel (larger due to higher volume).
 const TX_RING_BUFFER_SIZE: usize = 1024;
 
-/// Number of transactions to process per loop iteration (quota).
-const TX_PROCESS_QUOTA: usize = 64;
+/// Constant for transaction batch size.
+const TX_BATCH_SIZE: usize = 1024;
 
 /// Mempool service running on a dedicated OS thread.
 ///
@@ -174,6 +174,7 @@ impl Drop for MempoolService {
 }
 
 /// Main mempool event loop.
+#[allow(clippy::too_many_arguments)]
 pub fn mempool_loop(
     pool_capacity: usize,
     pending_state_reader: PendingStateReader,
@@ -222,10 +223,15 @@ pub fn mempool_loop(
             );
         }
 
-        // Priority 2: Process incoming transactions (quota-limited)
-        for _ in 0..TX_PROCESS_QUOTA {
-            match tx_consumer.pop() {
-                Ok(tx) => {
+        // Priority 2: Process incoming transactions
+        let available_slots = tx_consumer.slots();
+        if available_slots > 0 {
+            let num_to_read = available_slots.min(TX_BATCH_SIZE);
+
+            if let Ok(chunk) = tx_consumer.read_chunk(num_to_read) {
+                did_work = true;
+
+                for tx in chunk.into_iter() {
                     did_work = true;
                     let tx_hash = tx.tx_hash;
                     let sender = tx.sender;
@@ -281,7 +287,6 @@ pub fn mempool_loop(
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
 
@@ -291,18 +296,24 @@ pub fn mempool_loop(
             let removed_count = notif.tx_hashes.len();
 
             // Collect affected senders BEFORE removing transactions
-            let affected_senders = notif
+            let mut senders_to_update: HashSet<Address> = notif
                 .tx_hashes
                 .iter()
                 .filter_map(|tx_hash| pool.get(tx_hash).map(|vtx| vtx.tx.sender))
-                .collect::<Vec<Address>>();
+                .collect();
+
+            // Also include senders with queued transactions - they might be promotable
+            // (e.g., if their txs were included by another node)
+            for sender in pool.queued_senders() {
+                senders_to_update.insert(sender);
+            }
 
             // Remove finalized transactions from pool
             pool.remove_finalized(&notif);
 
             // Update sender nonces based on finalized state
             // This promotes queued transactions that are now executable
-            for sender in affected_senders {
+            for sender in senders_to_update {
                 let new_nonce = pending_state_reader
                     .get_account(&sender)
                     .map(|a| a.nonce)
@@ -426,11 +437,29 @@ fn build_validated_proposal(
         // This handles the case where we skip a tx (e.g., insufficient balance)
         // and need to also skip subsequent txs from the same sender
         let expected_in_block = sender_next_nonce.get(&sender);
-        if let Some(expected) = expected_in_block {
-            if tx.nonce != *expected {
-                // We already have txs from this sender but there's a gap
-                // (possibly due to skipping a tx with insufficient balance)
-                continue;
+        match expected_in_block {
+            Some(&expected) => {
+                if tx.nonce != expected {
+                    // We already have txs from this sender but there's a gap
+                    // (possibly due to skipping a tx with insufficient balance)
+                    continue;
+                }
+            }
+            None => {
+                // First tx from sender - validate against chain state to catch stale pool
+                let chain_nonce = pending_state_reader
+                    .get_account(&sender)
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                if tx.nonce < chain_nonce {
+                    // Stale transaction - already executed on chain
+                    continue;
+                }
+                // Also verify nonce matches exactly (pool might have gaps)
+                if tx.nonce != chain_nonce {
+                    // Unexpected nonce - skip this sender
+                    continue;
+                }
             }
         }
 
@@ -499,12 +528,52 @@ fn get_effective_balance(
 }
 
 /// Estimates the serialized size of a transaction.
+///
+/// Components:
+/// - Signature: 64 bytes (Ed25519)
+/// - Sender: 32 bytes
+/// - Nonce: 8 bytes
+/// - Fee: 8 bytes
+/// - Tx hash: 32 bytes
+/// - Instruction type: 1 byte
+/// - Instruction data: varies by type
 #[inline]
-fn estimate_tx_size(_tx: &Arc<Transaction>) -> usize {
-    // TODO: Make this method more accurate
-    const BASE_SIZE: usize = 153;
-    const INSTRUCTION_SIZE: usize = 40;
-    BASE_SIZE + INSTRUCTION_SIZE
+fn estimate_tx_size(tx: &Arc<Transaction>) -> usize {
+    const SIGNATURE_SIZE: usize = 64;
+    const ADDRESS_SIZE: usize = 32;
+    const NONCE_SIZE: usize = 8;
+    const FEE_SIZE: usize = 8;
+    const HASH_SIZE: usize = 32;
+    const INSTRUCTION_TYPE_SIZE: usize = 1;
+
+    let base_size = SIGNATURE_SIZE + ADDRESS_SIZE + NONCE_SIZE + FEE_SIZE + HASH_SIZE;
+
+    // Estimate instruction size based on type
+    let instruction_size = match tx.instruction {
+        crate::state::transaction::TransactionInstruction::Transfer {
+            recipient: _,
+            amount: _,
+        } => {
+            INSTRUCTION_TYPE_SIZE + ADDRESS_SIZE + 8 // recipient (32) + amount (8)
+        }
+        crate::state::transaction::TransactionInstruction::CreateAccount { address: _ } => {
+            INSTRUCTION_TYPE_SIZE + ADDRESS_SIZE // address (32)
+        }
+        crate::state::transaction::TransactionInstruction::Burn {
+            amount: _,
+            address: _,
+        } => {
+            INSTRUCTION_TYPE_SIZE + 8 + ADDRESS_SIZE // amount (8) + address (32)
+        }
+        crate::state::transaction::TransactionInstruction::Mint {
+            recipient: _,
+            amount: _,
+        } => {
+            INSTRUCTION_TYPE_SIZE + ADDRESS_SIZE + 8 // recipient (32) + amount (8)
+        }
+    };
+
+    base_size + instruction_size
 }
 
 #[cfg(test)]
@@ -779,6 +848,507 @@ mod tests {
         let resp = channels.proposal_resp_consumer.pop().unwrap();
         // All 3 should be included (tx2 was promoted when tx1 was added)
         assert_eq!(resp.transactions.len(), 3);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_multi_sender_fee_ordering() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk1, sender1) = gen_keypair();
+        let (sk2, sender2) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+
+        // Fund both senders
+        store
+            .put_account(&Account::new(sk1.public_key(), 10_000, 0))
+            .unwrap();
+        store
+            .put_account(&Account::new(sk2.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // sender1: fee 50, sender2: fee 100
+        // sender2 should come first in proposal
+        let tx1 = create_tx(&sk1, sender1, recipient, 100, 0, 50);
+        let tx2 = create_tx(&sk2, sender2, recipient, 100, 0, 100);
+
+        channels.tx_producer.push(tx1).unwrap();
+        channels.tx_producer.push(tx2).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        assert_eq!(resp.transactions.len(), 2);
+        // Higher fee tx should come first
+        assert_eq!(resp.transactions[0].fee, 100);
+        assert_eq!(resp.transactions[1].fee, 50);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_max_bytes_limit() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 100_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit 10 transactions
+        for nonce in 0..10 {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Request with very small max_bytes (only ~1-2 txs should fit)
+        // Each tx is ~185 bytes (based on estimate_tx_size)
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 100,
+            max_bytes: 400, // Should fit ~2 transactions
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // Should have fewer than 10 transactions due to size limit
+        assert!(resp.transactions.len() < 10);
+        assert!(!resp.transactions.is_empty());
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_max_txs_limit() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 100_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit 10 transactions
+        for nonce in 0..10 {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Request with max_txs = 3
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 3,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        assert_eq!(resp.transactions.len(), 3);
+        // Should be nonces 0, 1, 2
+        assert_eq!(resp.transactions[0].nonce, 0);
+        assert_eq!(resp.transactions[1].nonce, 1);
+        assert_eq!(resp.transactions[2].nonce, 2);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_balance_exhaustion_across_multiple_txs() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        // Balance of 250: can afford 2 txs @ 100 + 10 fee = 110 each (220 total)
+        // Third tx would need 330 total, which exceeds 250
+        store
+            .put_account(&Account::new(sk.public_key(), 250, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit 3 transactions, each costs 110 (100 amount + 10 fee)
+        for nonce in 0..3 {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // Only 2 txs should be included (balance exhausted after 2)
+        assert_eq!(resp.transactions.len(), 2);
+        assert_eq!(resp.transactions[0].nonce, 0);
+        assert_eq!(resp.transactions[1].nonce, 1);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_skip_subsequent_after_insufficient_balance() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        // Balance of 50: tx0 needs 510, tx1 needs 60
+        store
+            .put_account(&Account::new(sk.public_key(), 50, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // tx0: amount 500, fee 10 -> needs 510 (can't afford)
+        // tx1: amount 50, fee 10 -> needs 60 (could afford if tx0 didn't exist)
+        let tx0 = create_tx(&sk, sender, recipient, 500, 0, 10);
+        let tx1 = create_tx(&sk, sender, recipient, 50, 1, 10);
+
+        channels.tx_producer.push(tx0).unwrap();
+        channels.tx_producer.push(tx1).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // Neither tx should be included:
+        // - tx0 fails balance check
+        // - tx1 is skipped because tx0 created a nonce gap
+        assert!(resp.transactions.is_empty());
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_finalization_removes_transactions() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit 5 transactions
+        let mut tx_hashes = Vec::new();
+        for nonce in 0..5 {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
+            tx_hashes.push(tx.tx_hash);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // First proposal should have all 5
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        assert_eq!(resp.transactions.len(), 5);
+
+        // Finalize first 2 transactions
+        let finalized = FinalizedNotification {
+            view: 1,
+            tx_hashes: vec![tx_hashes[0], tx_hashes[1]],
+        };
+        channels.finalized_producer.push(finalized).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Update sender nonce in store to simulate chain state update
+        store
+            .put_account(&Account::new(sk.public_key(), 9780, 2)) // 10000 - 2*(100+10)
+            .unwrap();
+
+        // Second proposal should have remaining 3
+        let req2 = ProposalRequest {
+            view: 2,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req2).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp2 = channels.proposal_resp_consumer.pop().unwrap();
+        assert_eq!(resp2.transactions.len(), 3);
+        // Should be nonces 2, 3, 4
+        assert_eq!(resp2.transactions[0].nonce, 2);
+        assert_eq!(resp2.transactions[1].nonce, 3);
+        assert_eq!(resp2.transactions[2].nonce, 4);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_stale_nonce_excluded() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        // Start with nonce 0
+        store
+            .put_account(&Account::new(sk.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit transactions with nonces 0, 1, 2
+        for nonce in 0..3 {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Simulate chain advancing: update nonce to 2 (nonces 0, 1 already executed)
+        store
+            .put_account(&Account::new(sk.public_key(), 9780, 2))
+            .unwrap();
+
+        // Request proposal - pool still has stale txs but they should be filtered
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // Only nonce 2 should be included (0 and 1 are stale)
+        assert_eq!(resp.transactions.len(), 1);
+        assert_eq!(resp.transactions[0].nonce, 2);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_empty_proposal_on_empty_pool() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Request proposal without submitting any transactions
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        assert!(resp.transactions.is_empty());
+        assert_eq!(resp.total_fees, 0);
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_total_fees_calculated_correctly() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // Submit transactions with fees 10, 20, 30
+        for (nonce, fee) in [(0, 10), (1, 20), (2, 30)] {
+            let tx = create_tx(&sk, sender, recipient, 100, nonce, fee);
+            channels.tx_producer.push(tx).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        assert_eq!(resp.transactions.len(), 3);
+        assert_eq!(resp.total_fees, 60); // 10 + 20 + 30
+
+        service.shutdown();
+    }
+
+    #[test]
+    fn test_recipient_balance_credited() {
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        let (sk1, sender1) = gen_keypair();
+        let (sk2, sender2) = gen_keypair();
+
+        // sender1 sends to sender2, then sender2 uses received funds
+        store
+            .put_account(&Account::new(sk1.public_key(), 1000, 0))
+            .unwrap();
+        store
+            .put_account(&Account::new(sk2.public_key(), 50, 0)) // Only 50 initially
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let (mut service, mut channels) =
+            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+
+        // sender1 sends 500 to sender2 (fee 10)
+        let tx1 = create_tx(&sk1, sender1, sender2, 500, 0, 10);
+        // sender2 tries to send 400 (fee 10) - needs the 500 from tx1
+        let tx2 = create_tx(&sk2, sender2, sender1, 400, 0, 10);
+
+        channels.tx_producer.push(tx1).unwrap();
+        channels.tx_producer.push(tx2).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        channels.proposal_req_producer.push(req).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        // Both transactions should be included:
+        // - tx1: sender1 (1000) sends 500+10 to sender2
+        // - tx2: sender2 (50 + 500 received = 550) sends 400+10
+        assert_eq!(resp.transactions.len(), 2);
 
         service.shutdown();
     }
