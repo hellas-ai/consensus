@@ -14,7 +14,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Instant,
 };
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -22,7 +21,7 @@ use slog::Logger;
 
 use crate::{state::block::Block, storage::store::ConsensusStore};
 
-use super::{BlockValidator, PendingStateReader, PendingStateWriter, types::ValidatedBlock};
+use super::{BlockValidator, PendingStateReader, PendingStateWriter, types::BlockValidationResult};
 
 const RING_BUFFER_SIZE: usize = 64;
 
@@ -44,7 +43,7 @@ impl BlockValidationService {
     /// A tuple containing:
     /// - `ValidationService` - handle to manage the service lifecycle
     /// - `Producer<Block>` - for P2P to submit blocks for validation
-    /// - `Consumer<ValidatedBlock>` - for Consensus to receive validated blocks
+    /// - `Consumer<BlockValidationResult>` - for Consensus to receive validation results (valid or invalid)
     /// - `PendingStateWriter` - for Consensus to manage pending state (m-notarized diffs)
     ///
     /// # Example
@@ -73,15 +72,16 @@ impl BlockValidationService {
     ) -> (
         Self,
         Producer<Block>,
-        Consumer<ValidatedBlock>,
+        Consumer<BlockValidationResult>,
         PendingStateWriter,
     ) {
         // Create block input channel (P2P service -> Validator thread)
         let (block_producer, block_consumer) = RingBuffer::<Block>::new(RING_BUFFER_SIZE);
 
-        // Create validated output channel (Validator → Consensus)
+        // Create validation result output channel (Validator → Consensus)
+        // This channel carries both successful and failed validation results
         let (validated_producer, validated_consumer) =
-            RingBuffer::<ValidatedBlock>::new(RING_BUFFER_SIZE);
+            RingBuffer::<BlockValidationResult>::new(RING_BUFFER_SIZE);
 
         // Create pending state manager (lock-free shared state)
         let (pending_state_writer, pending_state_reader) =
@@ -138,7 +138,7 @@ impl Drop for BlockValidationService {
 fn validation_loop(
     pending_state_reader: PendingStateReader,
     mut block_consumer: Consumer<Block>,
-    mut validated_producer: Producer<ValidatedBlock>,
+    mut result_producer: Producer<BlockValidationResult>,
     shutdown: Arc<AtomicBool>,
     logger: Logger,
 ) {
@@ -152,47 +152,46 @@ fn validation_loop(
                 let view = block.view();
                 let block_hash = block.get_hash();
 
-                match validator.validate_block(&block) {
+                let result = match validator.validate_block(&block) {
                     Ok(state_diff) => {
-                        let validated = ValidatedBlock {
-                            block,
-                            state_diff,
-                            validated_at: Instant::now(),
-                        };
-
-                        // Send to consensus with back pressure handling
-                        let mut validated = validated;
-                        loop {
-                            match validated_producer.push(validated) {
-                                Ok(()) => break,
-                                Err(rtrb::PushError::Full(returned)) => {
-                                    if shutdown.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    // Yield to let consensus catch up
-                                    std::thread::yield_now();
-                                    validated = returned;
-                                }
-                            }
-                        }
-
                         slog::debug!(
                             logger,
                             "Block validated successfully";
                             "view" => view,
                             "block_hash" => ?block_hash,
                         );
+                        BlockValidationResult::valid(block, state_diff)
                     }
                     Err(errors) => {
+                        let reason = errors
+                            .first()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "Unknown validation error".to_string());
                         slog::warn!(
                             logger,
                             "Block validation failed";
                             "view" => view,
                             "block_hash" => ?block_hash,
                             "error_count" => errors.len(),
-                            "first_error" => ?errors.first(),
+                            "reason" => &reason,
                         );
-                        // Drop invalid blocks - don't forward to consensus
+                        BlockValidationResult::invalid(view, block_hash)
+                    }
+                };
+
+                // Send result to consensus with back pressure handling
+                let mut result = result;
+                loop {
+                    match result_producer.push(result) {
+                        Ok(()) => break,
+                        Err(rtrb::PushError::Full(returned)) => {
+                            if shutdown.load(Ordering::Acquire) {
+                                return;
+                            }
+                            // Yield to let consensus catch up
+                            std::thread::yield_now();
+                            result = returned;
+                        }
                     }
                 }
             }
@@ -291,8 +290,12 @@ mod tests {
 
         // Receive validated block
         let validated = consumer.pop().unwrap();
-        assert_eq!(validated.block.view(), 1);
-        assert_eq!(validated.state_diff.num_updates(), 0);
+        if let BlockValidationResult::Valid(validated) = validated {
+            assert_eq!(validated.block.view(), 1);
+            assert_eq!(validated.state_diff.num_updates(), 0);
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         service.shutdown();
     }
@@ -328,9 +331,13 @@ mod tests {
 
         // Check result
         let validated = consumer.pop().unwrap();
-        assert_eq!(validated.state_diff.total_fees, 10);
-        assert!(validated.state_diff.updates.contains_key(&sender_addr));
-        assert!(validated.state_diff.updates.contains_key(&recipient_addr));
+        if let BlockValidationResult::Valid(validated) = validated {
+            assert_eq!(validated.state_diff.total_fees, 10);
+            assert!(validated.state_diff.updates.contains_key(&sender_addr));
+            assert!(validated.state_diff.updates.contains_key(&recipient_addr));
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         service.shutdown();
     }
@@ -396,7 +403,11 @@ mod tests {
 
         // Should succeed
         let validated = consumer.pop().unwrap();
-        assert_eq!(validated.state_diff.total_fees, 10);
+        if let BlockValidationResult::Valid(validated) = validated {
+            assert_eq!(validated.state_diff.total_fees, 10);
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         service.shutdown();
     }
@@ -425,7 +436,11 @@ mod tests {
         // Verify all received in order
         for expected_view in 1..=5 {
             let validated = consumer.pop().expect("Should receive block");
-            assert_eq!(validated.block.view(), expected_view);
+            if let BlockValidationResult::Valid(validated) = validated {
+                assert_eq!(validated.block.view(), expected_view);
+            } else {
+                panic!("Expected valid block validation result");
+            }
         }
 
         service.shutdown();
@@ -537,10 +552,18 @@ mod tests {
 
         // Should receive views 1 and 3, not 2
         let v1 = consumer.pop().unwrap();
-        assert_eq!(v1.block.view(), 1);
+        if let BlockValidationResult::Valid(validated) = v1 {
+            assert_eq!(validated.block.view(), 1);
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         let v3 = consumer.pop().unwrap();
-        assert_eq!(v3.block.view(), 3);
+        if let BlockValidationResult::Valid(validated) = v3 {
+            assert_eq!(validated.block.view(), 3);
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         // No more
         assert!(consumer.pop().is_err());
@@ -584,9 +607,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let validated = consumer.pop().unwrap();
-        assert_eq!(validated.block.view(), 2);
-        assert!(validated.state_diff.updates.contains_key(&addr2));
-        assert!(validated.state_diff.updates.contains_key(&addr3));
+        if let BlockValidationResult::Valid(validated) = validated {
+            assert_eq!(validated.block.view(), 2);
+            assert!(validated.state_diff.updates.contains_key(&addr2));
+            assert!(validated.state_diff.updates.contains_key(&addr3));
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         service.shutdown();
     }
@@ -603,17 +630,21 @@ mod tests {
             slog::Logger::root(slog::Discard, slog::o!()),
         );
 
-        let before = Instant::now();
+        let before = std::time::Instant::now();
         producer.push(create_test_block(1, vec![])).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let validated = consumer.pop().unwrap();
-        let after = Instant::now();
+        let after = std::time::Instant::now();
 
         // validated_at should be between before and after
-        assert!(validated.validated_at >= before);
-        assert!(validated.validated_at <= after);
+        if let BlockValidationResult::Valid(validated) = validated {
+            assert!(validated.validated_at >= before);
+            assert!(validated.validated_at <= after);
+        } else {
+            panic!("Expected valid block validation result");
+        }
 
         service.shutdown();
     }

@@ -15,7 +15,7 @@ use crate::{
     mempool::{FinalizedNotification, MempoolService, ProposalRequest, ProposalResponse},
     state::{address::Address, block::Block, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
-    validation::{PendingStateWriter, ValidatedBlock, service::BlockValidationService},
+    validation::{BlockValidationResult, PendingStateWriter, service::BlockValidationService},
 };
 
 use std::sync::{Arc, atomic::AtomicBool};
@@ -84,8 +84,9 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Producer for blocks to validate (P2P/leader sends blocks here)
     pub block_producer: Producer<Block>,
 
-    /// Consumer for validated blocks (consensus engine reads from here)
-    pub validated_block_consumer: Consumer<ValidatedBlock>,
+    /// Consumer for block validation results (consensus engine reads from here)
+    /// Receives both successful (ValidatedBlock) and failed validation results
+    pub validation_result_consumer: Consumer<BlockValidationResult>,
 
     /// Mempool service handle
     pub mempool_service: MempoolService,
@@ -135,7 +136,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Spawn BlockValidationService - creates block channels and pending state
-        let (validation_service, block_producer, validated_block_consumer, persistence_writer) =
+        let (validation_service, block_producer, validation_result_consumer, persistence_writer) =
             BlockValidationService::spawn(
                 Arc::clone(&storage),
                 0, // last_finalized_view
@@ -159,7 +160,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             broadcast_consumer,
             broadcast_producer,
             block_producer,
-            validated_block_consumer,
+            validation_result_consumer,
             mempool_service,
             proposal_req_producer: mempool_channels.proposal_req_producer,
             proposal_resp_consumer: mempool_channels.proposal_resp_consumer,

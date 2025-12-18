@@ -50,6 +50,49 @@ impl ValidatedBlock {
     }
 }
 
+/// Result of block validation sent from the validation service to the consensus thread.
+///
+/// This enum allows the validation service to report both successful validations
+/// (with the validated block and state diff) and validation failures (with the
+/// view and reason for failure).
+#[derive(Clone, Debug)]
+pub enum BlockValidationResult {
+    /// Block passed validation successfully
+    Valid(ValidatedBlock),
+    /// Block failed validation
+    Invalid {
+        /// The view number of the invalid block
+        view: u64,
+        /// The hash of the invalid block
+        block_hash: [u8; blake3::OUT_LEN],
+    },
+}
+
+impl BlockValidationResult {
+    /// Creates a successful validation result
+    pub fn valid(block: Block, state_diff: StateDiff) -> Self {
+        Self::Valid(ValidatedBlock::new(block, state_diff))
+    }
+
+    /// Creates a failed validation result
+    pub fn invalid(view: u64, block_hash: [u8; blake3::OUT_LEN]) -> Self {
+        Self::Invalid { view, block_hash }
+    }
+
+    /// Returns true if the validation was successful
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid(_))
+    }
+
+    /// Returns the view number of the block
+    pub fn view(&self) -> u64 {
+        match self {
+            Self::Valid(vb) => vb.view(),
+            Self::Invalid { view, .. } => *view,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StateDiff {
     /// Account updates: address -> delta
@@ -125,6 +168,38 @@ pub struct NewAccount {
     pub address: Address,
     /// Initial balance (usually 0, or from a mint)
     pub initial_balance: u64,
+}
+
+// Status of block validation for a view.
+///
+/// This tracks whether a block has been locally validated, allowing the consensus
+/// to make voting decisions. When a quorum (M-notarization or 2f+1 votes) exists,
+/// voting can proceed without waiting for local validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationStatus {
+    /// Block is pending validation (validator is processing)
+    Pending,
+    /// Block passed validation, StateDiff is available
+    Valid,
+    /// Block failed validation with the given reason
+    Invalid,
+}
+
+impl ValidationStatus {
+    /// Returns true if the block is valid
+    pub fn is_valid(&self) -> bool {
+        matches!(self, ValidationStatus::Valid)
+    }
+
+    /// Returns true if the block is invalid
+    pub fn is_invalid(&self) -> bool {
+        matches!(self, ValidationStatus::Invalid)
+    }
+
+    /// Returns true if validation is still pending
+    pub fn is_pending(&self) -> bool {
+        matches!(self, ValidationStatus::Pending)
+    }
 }
 
 /// Errors that can occur during block validation.

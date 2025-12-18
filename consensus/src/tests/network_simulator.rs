@@ -6,7 +6,13 @@
 //!
 //! ## Architecture
 //!
+//! The network routes messages according to:
+//! - **BlockProposal** → Both Block Validator Thread and Consensus Thread
+//!   - Block Validator: for async validation (produces StateDiff)
+//!   - Consensus Thread: for immediate storage and quorum-based voting
+//! - **Vote/MNot/Nullify** → Consensus Thread directly (via message_producer)
 //!
+//! ```text
 //! ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 //! │  Replica 1   │     │  Replica 2   │     │  Replica 3   │
 //! │              │     │              │     │              │
@@ -21,16 +27,28 @@
 //!                   │  (Routing)       │
 //!                   └──────────────────┘
 //!                             │
-//!        ┌────────────────────┼────────────────────┐
-//!        │                    │                    │
-//!        ▼                    ▼                    ▼
-//! ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-//! │  Replica 1   │     │  Replica 2   │     │  Replica 3   │
-//! │  Message     │     │  Message     │     │  Message     │
-//! │  Consumer    │     │  Consumer    │     │  Consumer    │
-//! └──────────────┘     └──────────────┘     └──────────────┘
+//!                             ▼
+//!                      BlockProposal
+//!                    ┌────────┴────────┐
+//!                    │                 │
+//!                    ▼                 ▼
+//!             ┌──────────────┐  ┌──────────────┐
+//!             │ Block        │  │ Consensus    │
+//!             │ Validator    │  │ Thread       │
+//!             │ (async)      │  │ (immediate)  │
+//!             └──────────────┘  └──────────────┘
+//!                    │
+//!                    ▼
+//!             ValidatedBlock/ValidationFailure
+//!                    │
+//!                    ▼
+//!             ┌──────────────┐
+//!             │ Consensus    │
+//!             │ Thread       │
+//!             └──────────────┘
+//! ```
 
-use crate::{consensus::ConsensusMessage, crypto::aggregated::PeerId};
+use crate::{consensus::ConsensusMessage, crypto::aggregated::PeerId, state::block::Block};
 use rtrb::{Consumer, Producer};
 use std::{
     collections::HashMap,
@@ -75,12 +93,18 @@ impl NetworkStats {
 ///
 /// The network runs in a dedicated thread and continuously:
 /// 1. Polls each replica's broadcast queue for outgoing messages
-/// 2. Routes those messages to all other replicas' message queues
-/// 3. Tracks statistics about message routing
+/// 2. Routes BlockProposal messages to the Block Validator (via block_producer)
+/// 3. Routes other consensus messages (Vote/MNot/Nullify) directly to Consensus
+/// 4. Tracks statistics about message routing
 pub struct LocalNetwork<const N: usize, const F: usize, const M_SIZE: usize> {
-    /// Map of replica_id -> message producer (for sending messages TO that replica)
+    /// Map of replica_id -> message producer (for sending consensus messages TO that replica)
+    /// Used for Vote, MNotarization, Nullify, Nullification messages
     pub(crate) message_producers:
         Arc<Mutex<HashMap<PeerId, Producer<ConsensusMessage<N, F, M_SIZE>>>>>,
+
+    /// Map of replica_id -> block producer (for sending blocks TO that replica's validator)
+    /// Used for BlockProposal messages - routes to Block Validator thread
+    pub(crate) block_producers: Arc<Mutex<HashMap<PeerId, Producer<Block>>>>,
 
     /// Map of replica_id -> broadcast consumer (for receiving messages FROM that replica)
     broadcast_consumers: Arc<Mutex<HashMap<PeerId, Consumer<ConsensusMessage<N, F, M_SIZE>>>>>,
@@ -100,6 +124,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> LocalNetwork<N, F, M_S
     pub fn new() -> Self {
         Self {
             message_producers: Arc::new(Mutex::new(HashMap::new())),
+            block_producers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_consumers: Arc::new(Mutex::new(HashMap::new())),
             routing_thread: None,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -111,18 +136,24 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> LocalNetwork<N, F, M_S
     ///
     /// # Arguments
     /// * `replica_id` - The peer ID of the replica
-    /// * `message_producer` - Producer for sending messages TO this replica
+    /// * `message_producer` - Producer for sending consensus messages (Vote/MNot/Nullify) TO this replica
+    /// * `block_producer` - Producer for sending blocks TO this replica's Block Validator
     /// * `broadcast_consumer` - Consumer for receiving messages FROM this replica
     pub fn register_replica(
         &mut self,
         replica_id: PeerId,
         message_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
+        block_producer: Producer<Block>,
         broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
     ) {
         self.message_producers
             .lock()
             .unwrap()
             .insert(replica_id, message_producer);
+        self.block_producers
+            .lock()
+            .unwrap()
+            .insert(replica_id, block_producer);
         self.broadcast_consumers
             .lock()
             .unwrap()
@@ -132,9 +163,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> LocalNetwork<N, F, M_S
     /// Starts the network routing thread
     ///
     /// The routing thread continuously polls all replicas for outgoing messages
-    /// and broadcasts them to all other replicas.
+    /// and routes them according to ARCHITECTURE.md:
+    /// - **BlockProposal** → Block Validator (via block_producer)
+    /// - **Vote/MNot/Nullify** → Consensus (via message_producer)
     pub fn start(&mut self) {
-        let producers = Arc::clone(&self.message_producers);
+        let message_producers = Arc::clone(&self.message_producers);
+        let block_producers = Arc::clone(&self.block_producers);
         let consumers = Arc::clone(&self.broadcast_consumers);
         let shutdown = Arc::clone(&self.shutdown);
         let stats = self.stats.clone();
@@ -163,24 +197,65 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> LocalNetwork<N, F, M_S
                         }
                     };
 
-                    // Broadcast messages to all other replicas
+                    // Route messages to all other replicas based on message type
                     if !messages.is_empty() {
-                        let mut producers_lock = producers.lock().unwrap();
-                        for (receiver_id, producer) in producers_lock.iter_mut() {
+                        let mut msg_producers_lock = message_producers.lock().unwrap();
+                        let mut blk_producers_lock = block_producers.lock().unwrap();
+
+                        for (receiver_id, msg_producer) in msg_producers_lock.iter_mut() {
                             // Don't send to self
                             if receiver_id == sender_id {
                                 continue;
                             }
 
+                            // Get the corresponding block producer for this receiver
+                            let mut blk_producer = blk_producers_lock.get_mut(receiver_id);
+
                             for msg in &messages {
-                                match producer.push(msg.clone()) {
-                                    Ok(_) => {
-                                        stats.messages_routed.fetch_add(1, Ordering::Relaxed);
+                                match msg {
+                                    // BlockProposal → route to both:
+                                    // 1. Block Validator (via block_producer) for async validation
+                                    // 2. Consensus Thread (via message_producer) for immediate storage
+                                    ConsensusMessage::BlockProposal(block) => {
+                                        // Route to Block Validator for async validation
+                                        if let Some(ref mut bp) = blk_producer {
+                                            match bp.push(block.clone()) {
+                                                Ok(_) => {
+                                                    stats
+                                                        .messages_routed
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                Err(_) => {
+                                                    stats
+                                                        .messages_dropped
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
+                                        // Also route to Consensus Thread for immediate storage
+                                        // This allows voting based on quorum before validation completes
+                                        match msg_producer.push(msg.clone()) {
+                                            Ok(_) => {
+                                                stats
+                                                    .messages_routed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Err(_) => {
+                                                stats
+                                                    .messages_dropped
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
-                                    Err(_) => {
-                                        // Buffer full - message dropped
-                                        stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                    // All other messages → route directly to Consensus
+                                    _ => match msg_producer.push(msg.clone()) {
+                                        Ok(_) => {
+                                            stats.messages_routed.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(_) => {
+                                            stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    },
                                 }
                             }
                         }

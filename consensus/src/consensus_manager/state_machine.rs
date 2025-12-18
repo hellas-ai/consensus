@@ -16,8 +16,8 @@
 //! │              ConsensusStateMachine (Event Loop)                 │
 //! │                                                                 │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  1. Poll validated_block_consumer (ValidatedBlocks)      │  │
-//! │  │     - Validated blocks with StateDiff to vote for        │  │
+//! │  │  1. Poll validation_result_consumer (BlockValidationResult)│  │
+//! │  │     - Valid blocks with StateDiff, or invalid blocks     │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
 //! │                       │                                         │
 //! │                       ▼                                         │
@@ -173,7 +173,7 @@
 //!         .with_secret_key(secret_key)
 //!         .with_message_consumer(message_consumer)
 //!         .with_broadcast_producer(broadcast_producer)
-//!         .with_validated_block_consumer(validated_block_consumer)
+//!         .with_validation_result_consumer(validation_result_consumer)
 //!         .with_tick_interval(Duration::from_millis(10))
 //!     // Run the state machine (blocks until shutdown)
 //!     state_machine.run()?;
@@ -184,7 +184,7 @@
 //!
 //! The state machine is **not** thread-safe and should only be accessed from the thread
 //! that runs it. Communication with other threads occurs exclusively through the ring
-//! buffers (`message_consumer`, `broadcast_producer`, `validated_block_consumer`), which
+//! buffers (`message_consumer`, `broadcast_producer`, `validation_result_consumer`), which
 //! are lock-free and thread-safe.
 //!
 //! ## Relation to Minimmit Paper
@@ -221,7 +221,7 @@ use crate::{
     crypto::aggregated::{BlsSecretKey, PeerId},
     mempool::{FinalizedNotification, ProposalRequest, ProposalResponse},
     state::{block::Block, notarizations::Vote, transaction::Transaction},
-    validation::ValidatedBlock,
+    validation::{BlockValidationResult, ValidatedBlock},
 };
 
 /// Maximum number of attempts to broadcast a consensus message, in case the ring buffer is full
@@ -256,8 +256,9 @@ pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: u
     /// Channel for broadcasting consensus messages to the network
     broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
 
-    /// Channel for receiving validated blocks from the validation service
-    validated_block_consumer: Consumer<ValidatedBlock>,
+    /// Channel for receiving block validation results from the validation service
+    /// This receives both successful (ValidatedBlock) and failed validation results
+    validation_result_consumer: Consumer<BlockValidationResult>,
 
     /// Channel for requesting block proposals from mempool
     proposal_req_producer: Producer<ProposalRequest>,
@@ -286,7 +287,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         secret_key: BlsSecretKey,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-        validated_block_consumer: Consumer<ValidatedBlock>,
+        validation_result_consumer: Consumer<BlockValidationResult>,
         proposal_req_producer: Producer<ProposalRequest>,
         proposal_resp_consumer: Consumer<ProposalResponse>,
         finalized_producer: Producer<FinalizedNotification>,
@@ -300,7 +301,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
+            validation_result_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,
@@ -323,11 +324,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             let mut did_work = false;
 
-            // 1. Validated blocks (ready to vote for)
-            while let Ok(validated_block) = self.validated_block_consumer.pop() {
+            // 1. Block validation results (both successful and failed)
+            while let Ok(validation_result) = self.validation_result_consumer.pop() {
                 did_work = true;
-                if let Err(e) = self.handle_validated_block(validated_block) {
-                    slog::error!(self.logger, "Error handling validated block: {}", e);
+                match validation_result {
+                    BlockValidationResult::Valid(validated_block) => {
+                        if let Err(e) = self.handle_validated_block(validated_block) {
+                            slog::error!(self.logger, "Error handling validated block: {}", e);
+                        }
+                    }
+                    BlockValidationResult::Invalid { view, block_hash } => {
+                        if let Err(e) = self.handle_validation_failure(view, block_hash) {
+                            slog::error!(self.logger, "Error handling validation failure: {}", e);
+                        }
+                    }
                 }
             }
 
@@ -379,15 +389,67 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
     }
 
     fn handle_validated_block(&mut self, validated_block: ValidatedBlock) -> Result<()> {
+        let view = validated_block.view();
         let state_diff = validated_block.state_diff;
 
-        // Store the StateDiff for later application on finalization
-        // Then process the block through normal consensus flow
+        slog::debug!(
+            self.logger,
+            "Received validated block for view {}, applying StateDiff",
+            view
+        );
+
+        // Store the StateDiff and mark validation as complete
+        // The block may already be stored from BlockProposal message
         let event = self
             .view_manager
             .process_validated_block(validated_block.block, state_diff)?;
 
         self.handle_event(event)
+    }
+
+    /// Handles a validation failure - block was invalid
+    fn handle_validation_failure(
+        &mut self,
+        view: u64,
+        block_hash: [u8; blake3::OUT_LEN],
+    ) -> Result<()> {
+        slog::warn!(
+            self.logger,
+            "Block validation failed for view {}: {:?}",
+            view,
+            block_hash
+        );
+
+        // Check if we already voted for this view
+        let ctx = self.view_manager.view_context_mut(view)?;
+
+        if ctx.has_voted {
+            // We voted for an invalid block based on quorum.
+            // This should NOT happen in a correct system - if f+1 honest replicas voted,
+            // the block MUST be valid. If our validation fails, WE have a bug.
+            slog::error!(
+                self.logger,
+                "CRITICAL: Voted for invalid block based on quorum! view={}, block_hash={:?}. Local state may be corrupted.",
+                view,
+                block_hash
+            );
+            // Do NOT nullify - the quorum has at least a correct replica.
+            // The system should continue; we may need to sync state from peers
+        } else if !ctx.has_nullified {
+            // We haven't voted yet - this is Byzantine behavior from the leader
+            // Send nullify message
+            slog::info!(
+                self.logger,
+                "Sending nullify for invalid block in view {}",
+                view
+            );
+            self.nullify_view(view)?;
+        }
+
+        // Mark the validation status as invalid
+        self.view_manager.mark_validation_invalid(view)?;
+
+        Ok(())
     }
 
     /// Handles any incoming consensus messages
@@ -1046,7 +1108,7 @@ pub struct ConsensusStateMachineBuilder<const N: usize, const F: usize, const M_
     logger: Option<slog::Logger>,
     message_consumer: Option<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
     broadcast_producer: Option<Producer<ConsensusMessage<N, F, M_SIZE>>>,
-    validated_block_consumer: Option<Consumer<ValidatedBlock>>,
+    validation_result_consumer: Option<Consumer<BlockValidationResult>>,
     proposal_req_producer: Option<Producer<ProposalRequest>>,
     proposal_resp_consumer: Option<Consumer<ProposalResponse>>,
     finalized_producer: Option<Producer<FinalizedNotification>>,
@@ -1072,7 +1134,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
             logger: None,
             message_consumer: None,
             broadcast_producer: None,
-            validated_block_consumer: None,
+            validation_result_consumer: None,
             proposal_req_producer: None,
             proposal_resp_consumer: None,
             finalized_producer: None,
@@ -1120,11 +1182,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
         self
     }
 
-    pub fn with_validated_block_consumer(
+    pub fn with_validation_result_consumer(
         mut self,
-        validated_block_consumer: Consumer<ValidatedBlock>,
+        validation_result_consumer: Consumer<BlockValidationResult>,
     ) -> Self {
-        self.validated_block_consumer = Some(validated_block_consumer);
+        self.validation_result_consumer = Some(validation_result_consumer);
         self
     }
 
@@ -1162,8 +1224,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
                 .ok_or_else(|| anyhow::anyhow!("Message consumer not set"))?,
             self.broadcast_producer
                 .ok_or_else(|| anyhow::anyhow!("Broadcast producer not set"))?,
-            self.validated_block_consumer
-                .ok_or_else(|| anyhow::anyhow!("Validated block consumer not set"))?,
+            self.validation_result_consumer
+                .ok_or_else(|| anyhow::anyhow!("Validation result consumer not set"))?,
             self.proposal_req_producer
                 .ok_or_else(|| anyhow::anyhow!("Proposal request producer not set"))?,
             self.proposal_resp_consumer
@@ -1217,7 +1279,7 @@ mod tests {
         state_machines: Vec<ConsensusStateMachine<N, F, M_SIZE>>,
         peer_set: PeerSet,
         broadcast_consumers: Vec<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
-        _validated_block_producers: Vec<Producer<ValidatedBlock>>,
+        _validated_block_producers: Vec<Producer<BlockValidationResult>>,
         shutdown_signals: Vec<Arc<AtomicBool>>,
         peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
     }
@@ -1301,7 +1363,7 @@ mod tests {
 
             // Create validated block channel
             let (vb_prod, validated_block_cons) =
-                RingBuffer::<ValidatedBlock>::new(RING_BUFFER_SIZE);
+                RingBuffer::<BlockValidationResult>::new(RING_BUFFER_SIZE);
             validated_block_producers.push(vb_prod);
 
             // Create shutdown signal
@@ -1563,7 +1625,7 @@ mod tests {
         let block = create_block_for_view(1, leader_id, &leader_sk, parent_hash);
         let state_diff = create_test_state_diff(1000);
 
-        let validated_block = ValidatedBlock::new(block, state_diff);
+        let validated_block = BlockValidationResult::valid(block, state_diff);
 
         // Push the validated block to the channel
         setup._validated_block_producers[replica_idx]

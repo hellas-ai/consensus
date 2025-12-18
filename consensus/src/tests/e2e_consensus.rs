@@ -125,7 +125,6 @@ fn test_e2e_consensus_happy_path() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut block_producers = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services = Vec::with_capacity(N);
     let mut mempool_services = Vec::with_capacity(N);
@@ -137,8 +136,13 @@ fn test_e2e_consensus_happy_path() {
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -149,7 +153,7 @@ fn test_e2e_consensus_happy_path() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -167,7 +171,6 @@ fn test_e2e_consensus_happy_path() {
         );
 
         engines.push(engine);
-        block_producers.push(setup.block_producer);
         transaction_producers.push(setup.transaction_producer);
         validation_services.push(setup.validation_service);
         mempool_services.push(setup.mempool_service);
@@ -530,8 +533,13 @@ fn test_e2e_consensus_continuous_load() {
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -542,7 +550,7 @@ fn test_e2e_consensus_continuous_load() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -918,8 +926,13 @@ fn test_e2e_consensus_with_crashed_replica() {
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -930,7 +943,7 @@ fn test_e2e_consensus_with_crashed_replica() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -1400,7 +1413,12 @@ fn test_e2e_consensus_with_equivocating_leader() {
             byzantine_leader_secret_key = Some(setup.secret_key.clone());
 
             // Register Byzantine leader with network (so messages can be routed)
-            network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+            network.register_replica(
+                replica_id,
+                setup.message_producer,
+                setup.block_producer,
+                setup.broadcast_consumer,
+            );
 
             engines.push(None);
             transaction_producers.push(None);
@@ -1419,8 +1437,13 @@ fn test_e2e_consensus_with_equivocating_leader() {
         // Keep transaction producer for later
         let tx_producer = setup.transaction_producer;
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -1431,7 +1454,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -2097,7 +2120,12 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             byzantine_leader_peer_id = Some(replica_id);
             byzantine_leader_secret_key = Some(setup.secret_key.clone());
 
-            network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+            network.register_replica(
+                replica_id,
+                setup.message_producer,
+                setup.block_producer,
+                setup.broadcast_consumer,
+            );
 
             engines.push(None);
             transaction_producers.push(None);
@@ -2115,7 +2143,13 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
         let tx_producer = setup.transaction_producer;
 
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
 
@@ -2125,7 +2159,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -2734,8 +2768,13 @@ fn test_e2e_consensus_functional_blockchain() {
         let pending_reader = setup.persistence_writer.reader();
         pending_state_readers.push(pending_reader);
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -2746,7 +2785,7 @@ fn test_e2e_consensus_functional_blockchain() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,
@@ -3289,8 +3328,13 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         let pending_reader = setup.persistence_writer.reader();
         pending_state_readers.push(pending_reader);
 
-        // Register with network
-        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+        // Register with network - routes BlockProposal to Block Validator, others to Consensus
+        network.register_replica(
+            replica_id,
+            setup.message_producer,
+            setup.block_producer,
+            setup.broadcast_consumer,
+        );
 
         // Create consensus engine
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -3301,7 +3345,7 @@ fn test_e2e_consensus_invalid_tx_rejection() {
             setup.secret_key,
             setup.message_consumer,
             setup.broadcast_producer,
-            setup.validated_block_consumer,
+            setup.validation_result_consumer,
             setup.proposal_req_producer,
             setup.proposal_resp_consumer,
             setup.finalized_producer,

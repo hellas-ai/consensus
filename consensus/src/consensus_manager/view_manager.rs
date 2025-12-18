@@ -390,7 +390,7 @@ use crate::{
         nullify::{Nullification, Nullify},
         peer::PeerSet,
     },
-    validation::{PendingStateWriter, StateDiff},
+    validation::{PendingStateWriter, StateDiff, ValidationStatus},
 };
 
 // TODO: Add view progression logic
@@ -862,8 +862,27 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         // Store the state diff with the block
         self.view_chain.store_state_diff(view, state_diff);
 
-        // Process the block through normal flow
-        self.handle_block_proposal(block)
+        // Mark validation as complete
+        let ctx = self.view_context_mut(view)?;
+        ctx.mark_validation_valid();
+
+        // If the block wasn't already stored, store it now
+        if ctx.block.is_none() {
+            // Process as a block proposal
+            return self.handle_block_proposal(block);
+        }
+
+        // Block was already stored. Check if we should vote now.
+        // We may have been waiting for validation before voting.
+        if ctx.can_vote() {
+            let block_hash = ctx
+                .block_hash
+                .ok_or_else(|| anyhow::anyhow!("Block hash missing despite block being present"))?;
+
+            return Ok(ViewProgressEvent::ShouldVote { view, block_hash });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
     }
 
     /// Returns the M-notarization for a view.
@@ -974,6 +993,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         } = self
             .view_chain
             .add_block_proposal(block_view_number, block, &self.peers)?;
+
+        // Mark validation as pending - the block is stored but awaiting async validation.
+        // Voting can still proceed if a quorum exists (BFT safety: quorum implies validity).
+        if let Some(ctx) = self.view_chain.find_view_context_mut(block_view_number)
+            && ctx.block.is_none()
+            && (ctx.validation_status.is_none()
+                || !(ctx.validation_status.is_some()
+                    && !matches!(ctx.validation_status, Some(ValidationStatus::Valid))))
+        {
+            ctx.mark_validation_pending();
+        }
 
         if should_await {
             return Ok(ViewProgressEvent::Await);
@@ -1376,6 +1406,36 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(ViewProgressEvent::ShouldNullify {
             view: nullification_view_number,
         })
+    }
+
+    /// Marks a view's block validation as pending.
+    pub fn mark_validation_pending(&mut self, view: u64) -> Result<()> {
+        let ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+        ctx.mark_validation_pending();
+        Ok(())
+    }
+
+    /// Marks a view's block validation as valid.
+    pub fn mark_validation_valid(&mut self, view: u64) -> Result<()> {
+        let ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+        ctx.mark_validation_valid();
+        Ok(())
+    }
+
+    /// Marks a view's block validation as invalid.
+    pub fn mark_validation_invalid(&mut self, view: u64) -> Result<()> {
+        let ctx = self
+            .view_chain
+            .find_view_context_mut(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+        ctx.mark_validation_invalid();
+        Ok(())
     }
 
     /// Process pending child blocks recursively until no more can be processed.

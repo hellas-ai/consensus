@@ -309,7 +309,7 @@ use crate::{
         nullify::{Nullification, Nullify},
         peer::PeerSet,
     },
-    validation::StateDiff,
+    validation::{StateDiff, ValidationStatus},
 };
 
 /// State tracking for a single view in the consensus protocol.
@@ -372,6 +372,12 @@ pub struct ViewContext<const N: usize, const F: usize, const M_SIZE: usize> {
     /// and executed. It is set by [`ViewChain::store_state_diff`] when block validation completes.
     pub state_diff: Option<Arc<StateDiff>>,
 
+    /// Validation status of the block for this view.
+    ///
+    /// Tracks whether the block has been locally validated. When a quorum exists
+    /// (M-notarization or 2f+1 votes), we can vote without waiting for local validation.
+    pub validation_status: Option<ValidationStatus>,
+
     /// A nullification for the current view (if any)
     pub nullification: Option<Nullification<N, F, M_SIZE>>,
 
@@ -404,9 +410,70 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             has_nullified: false,
             has_proposed: false,
             state_diff: None,
+            validation_status: None,
             leader_id,
             pending_block: None,
         }
+    }
+
+    /// Returns true if a quorum (2f+1 votes or M-notarization) exists for this view.
+    ///
+    /// When a quorum exists, it's safe to vote without waiting for local validation
+    /// because at least f+1 honest replicas have already validated the block.
+    pub fn has_voting_quorum(&self) -> bool {
+        self.m_notarization.is_some() || self.votes.len() > 2 * F
+    }
+
+    /// Returns true if we should vote based on quorum OR local validation.
+    ///
+    /// Voting is allowed when:
+    /// 1. We have a quorum (M-notarization or 2f+1 votes) - piggyback on others' validation
+    /// 2. We have locally validated the block and it's valid
+    ///
+    /// Voting is NOT allowed when:
+    /// - We already voted
+    /// - We already nullified
+    /// - Block is missing
+    /// - Local validation failed (and no quorum)
+    pub fn can_vote(&self) -> bool {
+        // Basic preconditions
+        if self.has_voted || self.has_nullified || self.nullification.is_some() {
+            return false;
+        }
+
+        // Case 1: Quorum exists - safe to vote (at least f+1 honest validated)
+        if self.has_voting_quorum() {
+            return true;
+        }
+
+        if self.block.is_none() {
+            return false;
+        }
+
+        // Case 2: Local validation completed and valid
+        if let Some(ref status) = self.validation_status {
+            return status.is_valid();
+        }
+
+        // No quorum and no local validation yet - wait
+        false
+    }
+
+    /// Marks the block as validation pending.
+    pub fn mark_validation_pending(&mut self) {
+        if self.validation_status.is_none() {
+            self.validation_status = Some(ValidationStatus::Pending);
+        }
+    }
+
+    /// Marks the block as validated (valid).
+    pub fn mark_validation_valid(&mut self) {
+        self.validation_status = Some(ValidationStatus::Valid);
+    }
+
+    /// Marks the block as validated (invalid).
+    pub fn mark_validation_invalid(&mut self) {
+        self.validation_status = Some(ValidationStatus::Invalid);
     }
 
     /// Adds a proposed block to the current view's context.
@@ -523,7 +590,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
             block.is_finalized = true;
         }
 
-        let should_vote = !self.has_voted && !self.has_nullified;
+        let should_vote = self.can_vote();
 
         Ok(LeaderProposalResult {
             block_hash,
@@ -588,8 +655,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         if self.block_hash.is_none() {
             // NOTE: In this case, the replica has not yet received the view proposed block hash
             // from the leader, so we need to store the vote in the non-verified votes set.
-            let should_vote = !self.has_voted
+            let has_quorum = !self.has_voted
                 && !self.has_nullified
+                && self.nullification.is_none()
                 && self
                     .non_verified_votes
                     .iter()
@@ -597,6 +665,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
                     .count() + 1 // NOTE: We need to include the current vote in the count
                     > 2 * F;
             self.non_verified_votes.insert(vote);
+            // Should vote if we have a quorum and haven't voted/nullified yet
+            // (matches the logic in can_vote())
+            let should_vote = has_quorum
+                && !self.has_voted
+                && !self.has_nullified
+                && self.nullification.is_none();
 
             return Ok(CollectedVotesResult {
                 should_await: true,

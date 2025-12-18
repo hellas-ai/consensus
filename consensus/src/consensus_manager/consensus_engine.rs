@@ -61,7 +61,7 @@
 //!     consensus::ConsensusMessage,
 //!     crypto::aggregated::BlsSecretKey,
 //!     storage::store::ConsensusStore,
-//!     validation::{PendingStateWriter, ValidatedBlock},
+//!     validation::{BlockValidationResult, PendingStateWriter},
 //! };
 //! use rtrb::RingBuffer;
 //! use std::{sync::Arc, time::Duration};
@@ -78,7 +78,7 @@
 //!     // Create communication channels (owned by external components)
 //!     let (mut message_producer, message_consumer) = RingBuffer::<ConsensusMessage<6, 1, 3>>::new(10000);
 //!     let (broadcast_producer, mut broadcast_consumer) = RingBuffer::<ConsensusMessage<6, 1, 3>>::new(10000);
-//!     let (mut validated_block_producer, validated_block_consumer) = RingBuffer::<ValidatedBlock>::new(1000);
+//!     let (mut validation_result_producer, validation_result_consumer) = RingBuffer::<BlockValidationResult>::new(1000);
 //!
 //!     // Create and start the consensus engine
 //!     let engine = ConsensusEngine::<6, 1, 3>::new(
@@ -87,7 +87,7 @@
 //!         secret_key,
 //!         message_consumer,
 //!         broadcast_producer,
-//!         validated_block_consumer,
+//!         validation_result_consumer,
 //!         persistence_writer,
 //!         Duration::from_millis(10),
 //!         logger,
@@ -98,8 +98,8 @@
 //!     // Network layer pushes incoming consensus messages
 //!     message_producer.push(incoming_message)?;
 //!     
-//!     // Validation service pushes validated blocks with state diffs
-//!     validated_block_producer.push(validated_block)?;
+//!     // Validation service pushes validation results (valid or invalid)
+//!     validation_result_producer.push(validation_result)?;
 //!     
 //!     // Network layer pops messages to broadcast
 //!     while let Ok(msg) = broadcast_consumer.pop() {
@@ -190,7 +190,7 @@ use crate::{
     crypto::aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
     mempool::{FinalizedNotification, ProposalRequest, ProposalResponse},
     state::peer::PeerSet,
-    validation::{PendingStateWriter, ValidatedBlock},
+    validation::{BlockValidationResult, PendingStateWriter},
 };
 
 /// [`ConsensusEngine`] is the high-level interface for running the Minimmit consensus protocol.
@@ -220,8 +220,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
     /// * `secret_key` - The BLS secret key for signing messages
     /// * `message_consumer` - Channel consumer for incoming consensus messages from the network
     /// * `broadcast_producer` - Channel producer for outgoing consensus messages to broadcast
-    /// * `validated_block_consumer` - Channel consumer for validated blocks from the validation
-    ///   service
+    /// * `validation_result_consumer` - Channel consumer for validation results (valid/invalid)
+    ///   from the validation service
     /// * `persistence_writer` - Writer for persisting pending state to storage
     /// * `tick_interval` - Interval for checking timeouts and processing events
     /// * `logger` - Logger instance
@@ -236,7 +236,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         secret_key: BlsSecretKey,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-        validated_block_consumer: Consumer<ValidatedBlock>,
+        validation_result_consumer: Consumer<BlockValidationResult>,
         proposal_req_producer: Producer<ProposalRequest>,
         proposal_resp_consumer: Consumer<ProposalResponse>,
         finalized_producer: Producer<FinalizedNotification>,
@@ -287,7 +287,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
             .with_secret_key(secret_key)
             .with_message_consumer(message_consumer)
             .with_broadcast_producer(broadcast_producer)
-            .with_validated_block_consumer(validated_block_consumer)
+            .with_validation_result_consumer(validation_result_consumer)
             .with_proposal_req_producer(proposal_req_producer)
             .with_proposal_resp_consumer(proposal_resp_consumer)
             .with_finalized_producer(finalized_producer)
@@ -489,8 +489,8 @@ mod tests {
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create validated block consumer
-        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
+        // Create validation result consumer
+        let (_validation_result_producer, validation_result_consumer) = RingBuffer::new(1000);
         // Create proposal request producer
         let (proposal_req_producer, _proposal_req_consumer) = RingBuffer::new(1000);
         // Create proposal response consumer
@@ -508,7 +508,7 @@ mod tests {
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
+            validation_result_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,
@@ -562,8 +562,8 @@ mod tests {
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create validated block consumer
-        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
+        // Create validation result consumer
+        let (_validation_result_producer, validation_result_consumer) = RingBuffer::new(1000);
         // Create proposal request producer
         let (proposal_req_producer, _proposal_req_consumer) = RingBuffer::new(1000);
         // Create proposal response consumer
@@ -580,7 +580,7 @@ mod tests {
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
+            validation_result_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,
