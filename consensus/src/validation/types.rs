@@ -133,6 +133,12 @@ pub struct NewAccount {
 /// enough context to understand what went wrong.
 #[derive(Debug, Clone)]
 pub enum ValidationError {
+    /// Block signature verification failed
+    BlockSignatureVerificationFailed {
+        block_hash: [u8; blake3::OUT_LEN],
+        num_txs: usize,
+    },
+
     /// Ed25519 signature verification failed
     InvalidSignature { tx_index: usize, tx_hash: [u8; 32] },
 
@@ -168,6 +174,17 @@ pub enum ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BlockSignatureVerificationFailed {
+                block_hash,
+                num_txs,
+            } => {
+                write!(
+                    f,
+                    "Block signature verification failed (hash: {}, {} txs)",
+                    hex::encode(&block_hash[..8]),
+                    num_txs
+                )
+            }
             Self::InvalidSignature { tx_index, tx_hash } => {
                 write!(
                     f,

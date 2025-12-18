@@ -53,6 +53,13 @@ impl BlockValidator {
     /// atomically when the block is finalized. Returns a list of errors if any
     /// transaction is invalid.
     ///
+    /// # Validation Steps
+    ///
+    /// 1. **Batch Signature Verification** (parallel): Uses Ed25519 batch verification with Rayon
+    ///    parallelism for optimal performance (~27ms for 10K txs).
+    /// 2. **Sequential State Validation**: Checks nonces, balances, and other state-dependent rules
+    ///    for each transaction.
+    ///
     /// # Arguments
     /// * `block` - The block to validate
     ///
@@ -63,6 +70,16 @@ impl BlockValidator {
         let mut errors = Vec::new();
         let mut state_diff = StateDiff::new();
 
+        // 1. Parallel batch signature verification (fast path)
+        // This uses Ed25519 batch verification + Rayon parallelism
+        if !block.verify_block_txs_signatures() {
+            errors.push(ValidationError::BlockSignatureVerificationFailed {
+                block_hash: block.get_hash(),
+                num_txs: block.transactions.len(),
+            });
+            return Err(errors);
+        }
+
         // Track seen tx hashes within this block for duplicate detection
         let mut seen_tx_hashes = HashSet::new();
 
@@ -70,8 +87,9 @@ impl BlockValidator {
         // This handles multiple transactions from the same sender in a single block.
         let mut local_accounts = HashMap::<Address, LocalAccountState>::new();
 
+        // 2. Sequential state validation (signatures already verified above)
         for (tx_index, tx) in block.transactions.iter().enumerate() {
-            // 1. Check for duplicate transactions hashes in same block
+            // Check for duplicate transaction hashes in same block
             if !seen_tx_hashes.insert(tx.tx_hash) {
                 errors.push(ValidationError::DuplicateTransaction {
                     tx_index,
@@ -80,16 +98,7 @@ impl BlockValidator {
                 continue;
             }
 
-            // 2. Verify Ed25519 signature
-            if !tx.verify() {
-                errors.push(ValidationError::InvalidSignature {
-                    tx_index,
-                    tx_hash: tx.tx_hash,
-                });
-                continue;
-            }
-
-            // 3. Validate transaction based on its instruction type
+            // Validate transaction based on its instruction type
             match &tx.instruction {
                 TransactionInstruction::Transfer { recipient, amount } => self.validate_transfer(
                     tx_index,
