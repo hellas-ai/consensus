@@ -1,5 +1,5 @@
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error};
-use std::{hash::Hash, hash::Hasher};
+use std::{hash::Hash, hash::Hasher, sync::Arc};
 
 use crate::{
     crypto::{
@@ -37,7 +37,7 @@ pub struct Block {
     #[rkyv(with = ArkSerdeWrapper)]
     pub leader_signature: BlsSignature,
     /// The transactions associated with the block
-    pub transactions: Vec<Transaction>,
+    pub transactions: Vec<Arc<Transaction>>,
     /// The hash of the (entire) block
     pub hash: Option<[u8; blake3::OUT_LEN]>,
     /// If the block is finalized or not. A block might have been
@@ -54,7 +54,7 @@ impl Block {
         view: u64,
         leader: PeerId,
         parent_block_hash: [u8; blake3::OUT_LEN],
-        transactions: Vec<Transaction>,
+        transactions: Vec<Arc<Transaction>>,
         timestamp: u64,
         leader_signature: BlsSignature,
         is_finalized: bool,
@@ -216,7 +216,9 @@ mod tests {
         leader_signature: BlsSignature,
         height: u64,
     ) -> Block {
-        let txs = (0..num_transactions).map(|_| gen_tx()).collect::<Vec<_>>();
+        let txs = (0..num_transactions)
+            .map(|_| Arc::new(gen_tx()))
+            .collect::<Vec<_>>();
         Block::new(
             view,
             leader,
@@ -236,7 +238,7 @@ mod tests {
         let leader_signature = sk.sign(b"block proposal");
 
         // Generate transactions ONCE
-        let txs: Vec<Transaction> = (0..2).map(|_| gen_tx()).collect();
+        let txs: Vec<Arc<Transaction>> = (0..2).map(|_| Arc::new(gen_tx())).collect();
 
         let b1 = Block::new(
             5,
@@ -294,7 +296,7 @@ mod tests {
         let leader_signature = sk.sign(b"block proposal");
 
         // Generate transaction(s) ONCE
-        let txs: Vec<Transaction> = (0..1).map(|_| gen_tx()).collect();
+        let txs: Vec<Arc<Transaction>> = (0..1).map(|_| Arc::new(gen_tx())).collect();
 
         let mut b = Block::new(
             8,

@@ -9,7 +9,7 @@ use crate::{
     state::address::Address,
 };
 use slog::{Drain, Level, Logger, o};
-use std::{env, str::FromStr, thread, time::Duration};
+use std::{env, str::FromStr, sync::Arc, thread, time::Duration};
 
 /// Creates a logger for integration tests with configurable log levels.
 ///
@@ -112,6 +112,7 @@ fn test_e2e_consensus_happy_path() {
     let mut block_producers = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services = Vec::with_capacity(N);
+    let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
@@ -133,6 +134,9 @@ fn test_e2e_consensus_happy_path() {
             setup.message_consumer,
             setup.broadcast_producer,
             setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
             setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
@@ -150,6 +154,7 @@ fn test_e2e_consensus_happy_path() {
         block_producers.push(setup.block_producer);
         transaction_producers.push(setup.transaction_producer);
         validation_services.push(setup.validation_service);
+        mempool_services.push(setup.mempool_service);
     }
 
     slog::info!(
@@ -292,7 +297,12 @@ fn test_e2e_consensus_happy_path() {
         service.shutdown();
     }
 
-    // 4. Now wait for each engine to finish its thread.
+    // 4. Shutdown mempool services
+    for mut service in mempool_services {
+        service.shutdown();
+    }
+
+    // 5. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
@@ -486,6 +496,7 @@ fn test_e2e_consensus_continuous_load() {
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services = Vec::with_capacity(N);
+    let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
@@ -510,6 +521,9 @@ fn test_e2e_consensus_continuous_load() {
             setup.message_consumer,
             setup.broadcast_producer,
             setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
             setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
@@ -526,6 +540,7 @@ fn test_e2e_consensus_continuous_load() {
         engines.push(engine);
         transaction_producers.push(tx_producer);
         validation_services.push(setup.validation_service);
+        mempool_services.push(setup.mempool_service);
     }
 
     slog::info!(
@@ -662,7 +677,12 @@ fn test_e2e_consensus_continuous_load() {
         service.shutdown();
     }
 
-    // 4. Now wait for each engine to finish its thread.
+    // 4. Shutdown mempool services
+    for mut service in mempool_services {
+        service.shutdown();
+    }
+
+    // 5. Now wait for each engine to finish its thread.
     for (i, engine) in engines.into_iter().enumerate() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
@@ -854,6 +874,7 @@ fn test_e2e_consensus_with_crashed_replica() {
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
+    let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     for (i, setup) in replica_setups.into_iter().enumerate() {
@@ -878,6 +899,9 @@ fn test_e2e_consensus_with_crashed_replica() {
             setup.message_consumer,
             setup.broadcast_producer,
             setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
             setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
@@ -894,6 +918,7 @@ fn test_e2e_consensus_with_crashed_replica() {
         engines.push(Some(engine));
         transaction_producers.push(tx_producer);
         validation_services.push(Some(setup.validation_service));
+        mempool_services.push(Some(setup.mempool_service));
     }
 
     slog::info!(
@@ -1060,7 +1085,12 @@ fn test_e2e_consensus_with_crashed_replica() {
         service.shutdown();
     }
 
-    // 4. Wait for each healthy engine to finish
+    // 4. Shutdown mempool services
+    for mut service in mempool_services.into_iter().flatten() {
+        service.shutdown();
+    }
+
+    // 5. Wait for each healthy engine to finish
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
@@ -1311,6 +1341,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
+    let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     // Store the Byzantine leader's secret key for signing blocks
@@ -1336,6 +1367,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
             engines.push(None);
             transaction_producers.push(None);
             validation_services.push(Some(setup.validation_service));
+            mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
                 logger,
@@ -1362,6 +1394,9 @@ fn test_e2e_consensus_with_equivocating_leader() {
             setup.message_consumer,
             setup.broadcast_producer,
             setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
             setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
@@ -1378,6 +1413,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         engines.push(Some(engine));
         transaction_producers.push(Some(tx_producer));
         validation_services.push(Some(setup.validation_service));
+        mempool_services.push(Some(setup.mempool_service));
     }
 
     let byzantine_secret_key =
@@ -1447,7 +1483,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         view_number,
         byzantine_peer_id,
         parent_hash,
-        vec![tx1],
+        vec![Arc::new(tx1)],
         1234567890,
         byzantine_secret_key.sign(b"temp1"),
         false,
@@ -1470,7 +1506,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         view_number,
         byzantine_peer_id,
         parent_hash,
-        vec![tx2],
+        vec![Arc::new(tx2)],
         1234567891, // Different timestamp
         byzantine_secret_key.sign(b"temp2"),
         false,
@@ -1686,6 +1722,11 @@ fn test_e2e_consensus_with_equivocating_leader() {
 
     // Shutdown validation services
     for mut service in validation_services.into_iter().flatten() {
+        service.shutdown();
+    }
+
+    // Shutdown mempool services
+    for mut service in mempool_services.into_iter().flatten() {
         service.shutdown();
     }
 
@@ -1995,6 +2036,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
     let mut engines = Vec::with_capacity(N);
     let mut transaction_producers = Vec::with_capacity(N);
     let mut validation_services: Vec<Option<_>> = Vec::with_capacity(N);
+    let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
     // Store the Byzantine leader's secret key for signing blocks
@@ -2016,6 +2058,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             engines.push(None);
             transaction_producers.push(None);
             validation_services.push(Some(setup.validation_service));
+            mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
                 logger,
@@ -2039,6 +2082,9 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             setup.message_consumer,
             setup.broadcast_producer,
             setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
             setup.persistence_writer,
             DEFAULT_TICK_INTERVAL,
             replica_logger,
@@ -2055,6 +2101,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         engines.push(Some(engine));
         transaction_producers.push(Some(tx_producer));
         validation_services.push(Some(setup.validation_service));
+        mempool_services.push(Some(setup.mempool_service));
     }
 
     let byzantine_secret_key =
@@ -2179,7 +2226,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
                     next_byzantine_view,
                     byzantine_thread_peer_id,
                     parent_hash,
-                    vec![tx1],
+                    vec![Arc::new(tx1)],
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -2205,7 +2252,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
                     next_byzantine_view,
                     byzantine_thread_peer_id,
                     parent_hash,
-                    vec![tx2],
+                    vec![Arc::new(tx2)],
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -2387,6 +2434,11 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
 
     // Shutdown validation services
     for mut service in validation_services.into_iter().flatten() {
+        service.shutdown();
+    }
+
+    // Shutdown mempool services
+    for mut service in mempool_services.into_iter().flatten() {
         service.shutdown();
     }
 

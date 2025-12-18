@@ -298,6 +298,16 @@ impl PendingStateWriter {
     pub fn store(&self) -> Arc<ConsensusStore> {
         self.store.clone()
     }
+
+    /// Creates a cloned reader that shares the same underlying state.
+    ///
+    /// Use this to give other components (e.g. [`MempoolService`]) read access
+    /// to the pending state without requiring the original reader.
+    pub fn reader(&self) -> PendingStateReader {
+        PendingStateReader {
+            shared: Arc::clone(&self.shared),
+        }
+    }
 }
 
 /// Reader handle for the validation thread.

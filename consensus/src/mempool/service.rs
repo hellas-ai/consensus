@@ -205,7 +205,7 @@ pub fn mempool_loop(
         while let Ok(req) = proposal_req_consumer.pop() {
             did_work = true;
 
-            let response = build_validated_proposal(&pool, &req, &pending_state_reader);
+            let response = build_validated_proposal(&pool, &req, &pending_state_reader, &logger);
             let tx_count = response.transactions.len();
             let total_fees = response.total_fees;
 
@@ -411,6 +411,7 @@ fn build_validated_proposal(
     pool: &TransactionPool,
     req: &ProposalRequest,
     pending_state_reader: &PendingStateReader,
+    logger: &Logger,
 ) -> ProposalResponse {
     let mut selected = Vec::with_capacity(req.max_txs);
     let mut total_bytes = 0usize;
@@ -424,9 +425,28 @@ fn build_validated_proposal(
     // to ensure we process their nonces sequentially
     let mut sender_next_nonce: HashMap<Address, u64> = HashMap::new();
 
+    let pending_count = pool.pending_len();
+    slog::debug!(
+        logger,
+        "Building proposal";
+        "view" => req.view,
+        "max_txs" => req.max_txs,
+        "max_bytes" => req.max_bytes,
+        "pending_pool_size" => pending_count,
+    );
+
     // Iterate transactions in fee-priority order (highest fee first)
     // All transactions from iter_pending() have valid nonces at pool level
+    let mut checked_count = 0usize;
+    let mut skipped_nonce_gap = 0usize;
+    let mut skipped_stale_nonce = 0usize;
+    let mut skipped_wrong_nonce = 0usize;
+    let mut skipped_insufficient_balance = 0usize;
+    let mut skipped_size = 0usize;
+
     for tx in pool.iter_pending() {
+        checked_count += 1;
+
         if selected.len() >= req.max_txs {
             break;
         }
@@ -442,22 +462,50 @@ fn build_validated_proposal(
                 if tx.nonce != expected {
                     // We already have txs from this sender but there's a gap
                     // (possibly due to skipping a tx with insufficient balance)
+                    skipped_nonce_gap += 1;
+                    slog::trace!(
+                        logger,
+                        "Skipping tx: nonce gap in block";
+                        "tx_hash" => hex::encode(&tx.tx_hash[..8]),
+                        "tx_nonce" => tx.nonce,
+                        "expected_nonce" => expected,
+                    );
                     continue;
                 }
             }
             None => {
                 // First tx from sender - validate against chain state to catch stale pool
+                let account_exists = pending_state_reader.get_account(&sender).is_some();
                 let chain_nonce = pending_state_reader
                     .get_account(&sender)
                     .map(|a| a.nonce)
                     .unwrap_or(0);
+
                 if tx.nonce < chain_nonce {
                     // Stale transaction - already executed on chain
+                    skipped_stale_nonce += 1;
+                    slog::trace!(
+                        logger,
+                        "Skipping tx: stale nonce";
+                        "tx_hash" => hex::encode(&tx.tx_hash[..8]),
+                        "tx_nonce" => tx.nonce,
+                        "chain_nonce" => chain_nonce,
+                        "account_exists" => account_exists,
+                    );
                     continue;
                 }
                 // Also verify nonce matches exactly (pool might have gaps)
                 if tx.nonce != chain_nonce {
                     // Unexpected nonce - skip this sender
+                    skipped_wrong_nonce += 1;
+                    slog::trace!(
+                        logger,
+                        "Skipping tx: nonce mismatch";
+                        "tx_hash" => hex::encode(&tx.tx_hash[..8]),
+                        "tx_nonce" => tx.nonce,
+                        "chain_nonce" => chain_nonce,
+                        "account_exists" => account_exists,
+                    );
                     continue;
                 }
             }
@@ -471,12 +519,32 @@ fn build_validated_proposal(
         if balance < required {
             // Skip this tx, but DON'T update sender_next_nonce
             // This creates a "gap" that will cause subsequent txs to be skipped too
+            skipped_insufficient_balance += 1;
+            slog::debug!(
+                logger,
+                "Skipping tx: insufficient balance";
+                "tx_hash" => hex::encode(&tx.tx_hash[..8]),
+                "sender" => hex::encode(&sender.as_bytes()[..8]),
+                "balance" => balance,
+                "required" => required,
+                "amount" => tx.amount(),
+                "fee" => tx.fee,
+            );
             continue;
         }
 
         // Check size constraint
         let tx_size = estimate_tx_size(&tx);
         if total_bytes + tx_size > req.max_bytes {
+            skipped_size += 1;
+            slog::trace!(
+                logger,
+                "Skipping tx: size limit";
+                "tx_hash" => hex::encode(&tx.tx_hash[..8]),
+                "tx_size" => tx_size,
+                "total_bytes" => total_bytes,
+                "max_bytes" => req.max_bytes,
+            );
             continue;
         }
 
@@ -497,6 +565,19 @@ fn build_validated_proposal(
         total_fees += tx.fee;
         selected.push(tx);
     }
+
+    slog::debug!(
+        logger,
+        "Proposal building complete";
+        "view" => req.view,
+        "selected" => selected.len(),
+        "checked" => checked_count,
+        "skipped_nonce_gap" => skipped_nonce_gap,
+        "skipped_stale_nonce" => skipped_stale_nonce,
+        "skipped_wrong_nonce" => skipped_wrong_nonce,
+        "skipped_insufficient_balance" => skipped_insufficient_balance,
+        "skipped_size" => skipped_size,
+    );
 
     ProposalResponse {
         view: req.view,

@@ -244,7 +244,7 @@ mod tests {
         (sk, addr)
     }
 
-    fn create_test_block(view: u64, transactions: Vec<Transaction>) -> Block {
+    fn create_test_block(view: u64, transactions: Vec<Arc<Transaction>>) -> Block {
         let sk = BlsSecretKey::generate(&mut rand::thread_rng());
         let sig = sk.sign(b"test block");
         Block::new(view, 0, [0u8; 32], transactions, 0, sig, false, view)
@@ -320,7 +320,7 @@ mod tests {
 
         // Create block with transfer
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(1, vec![tx]);
+        let block = create_test_block(1, vec![Arc::new(tx)]);
         producer.push(block).unwrap();
 
         // Wait for validation
@@ -354,7 +354,7 @@ mod tests {
 
         // Create block with transfer from unfunded account
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(1, vec![tx]);
+        let block = create_test_block(1, vec![Arc::new(tx)]);
         producer.push(block).unwrap();
 
         // Wait for validation
@@ -388,7 +388,7 @@ mod tests {
 
         // Create block with transfer - should work against pending state
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(2, vec![tx]);
+        let block = create_test_block(2, vec![Arc::new(tx)]);
         producer.push(block).unwrap();
 
         // Wait for validation
@@ -517,18 +517,20 @@ mod tests {
 
         // View 1: Valid transfer
         let valid_tx = Transaction::new_transfer(sender1, recipient_addr, 100, 0, 10, &sk1);
-        producer.push(create_test_block(1, vec![valid_tx])).unwrap();
+        producer
+            .push(create_test_block(1, vec![Arc::new(valid_tx)]))
+            .unwrap();
 
         // View 2: Invalid (unfunded sender)
         let invalid_tx = Transaction::new_transfer(bad_sender, recipient_addr, 100, 0, 10, &bad_sk);
         producer
-            .push(create_test_block(2, vec![invalid_tx]))
+            .push(create_test_block(2, vec![Arc::new(invalid_tx)]))
             .unwrap();
 
         // View 3: Valid transfer from sender2 (independent, nonce 0)
         let valid_tx2 = Transaction::new_transfer(sender2, recipient_addr, 50, 0, 5, &sk2);
         producer
-            .push(create_test_block(3, vec![valid_tx2]))
+            .push(create_test_block(3, vec![Arc::new(valid_tx2)]))
             .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -576,7 +578,7 @@ mod tests {
 
         // Now addr2 should be able to send (balance 100 from pending state)
         let tx = Transaction::new_transfer(addr2, addr3, 50, 0, 5, &sk2);
-        let block = create_test_block(2, vec![tx]);
+        let block = create_test_block(2, vec![Arc::new(tx)]);
         producer.push(block).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));

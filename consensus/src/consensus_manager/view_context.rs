@@ -1191,17 +1191,17 @@ mod tests {
     use rand::thread_rng;
 
     // Helper function to generate a test transaction
-    fn gen_tx() -> Transaction {
+    fn gen_tx() -> Arc<Transaction> {
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
-        Transaction::new_transfer(
+        Arc::new(Transaction::new_transfer(
             Address::from_public_key(&pk),
             Address::from_bytes([7u8; 32]),
             42,
             9,
             1_000,
             &sk,
-        )
+        ))
     }
 
     // Helper function to create a test block

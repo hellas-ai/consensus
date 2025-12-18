@@ -9,15 +9,13 @@ use crate::{
         aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
         transaction_crypto::{TxPublicKey, TxSecretKey},
     },
+    mempool::{FinalizedNotification, MempoolService, ProposalRequest, ProposalResponse},
     state::{address::Address, block::Block, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
     validation::{PendingStateWriter, ValidatedBlock, service::BlockValidationService},
 };
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use ark_serialize::CanonicalSerialize;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -86,6 +84,21 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Consumer for validated blocks (consensus engine reads from here)
     pub validated_block_consumer: Consumer<ValidatedBlock>,
 
+    /// Mempool service handle
+    pub mempool_service: MempoolService,
+
+    /// Producer for requesting block proposals
+    pub proposal_req_producer: Producer<ProposalRequest>,
+
+    // Consumer for receiving block proposals
+    pub proposal_resp_consumer: Consumer<ProposalResponse>,
+
+    /// Producer for notifying mempool of finalized blocks (Consensus → Mempool)
+    pub finalized_producer: Producer<FinalizedNotification>,
+
+    /// Producer for submitting transactions to mempool (P2P/RPC → Mempool)
+    pub transaction_producer: Producer<Transaction>,
+
     /// Persistence writer for consensus state
     pub persistence_writer: PendingStateWriter,
 
@@ -96,34 +109,26 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     pub validation_service: BlockValidationService,
 
     /// Shutdown flag (shared with validation service)
-    pub _shutdown: Arc<AtomicBool>,
-
-    /// Producer for submitting transactions (clients write here)
-    pub transaction_producer: Producer<Transaction>,
-
-    /// Consumer for reading transactions (block builder reads here)
-    pub _transaction_consumer: Consumer<Transaction>,
+    #[allow(unused)]
+    pub shutdown: Arc<AtomicBool>,
 
     /// Temporary directory for storage (must be kept alive)
     _temp_dir: TempDir,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_SIZE> {
-    /// Creates a new replica setup with BlockValidationService
+    /// Creates a new replica setup with BlockValidationService and MempoolService
     pub fn new(replica_id: PeerId, secret_key: BlsSecretKey, logger: slog::Logger) -> Self {
         // Create ring buffers for consensus messages
         let (message_producer, message_consumer) = RingBuffer::new(BUFFER_SIZE);
         let (broadcast_producer, broadcast_consumer) = RingBuffer::new(BUFFER_SIZE);
-
-        // Create ring buffers for transactions
-        let (transaction_producer, transaction_consumer) = RingBuffer::new(BUFFER_SIZE);
 
         // Create temporary directory and storage
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("consensus.redb");
         let storage = Arc::new(ConsensusStore::open(&db_path).expect("Failed to open storage"));
 
-        // Create shutdown flag
+        // Create shutdown flag (shared across all services)
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Spawn BlockValidationService - creates block channels and pending state
@@ -132,8 +137,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
                 Arc::clone(&storage),
                 0, // last_finalized_view
                 Arc::clone(&shutdown),
-                logger,
+                logger.clone(),
             );
+
+        // Create a PendingStateReader for the mempool from the writer
+        let pending_state_reader = persistence_writer.reader();
+
+        // Spawn MempoolService - creates transaction and proposal channels
+        let (mempool_service, mempool_channels) =
+            MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger);
 
         Self {
             replica_id,
@@ -145,76 +157,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             broadcast_producer,
             block_producer,
             validated_block_consumer,
+            mempool_service,
+            proposal_req_producer: mempool_channels.proposal_req_producer,
+            proposal_resp_consumer: mempool_channels.proposal_resp_consumer,
+            finalized_producer: mempool_channels.finalized_producer,
+            transaction_producer: mempool_channels.tx_producer,
             persistence_writer,
             validation_service,
-            _shutdown: shutdown,
-            transaction_producer,
-            _transaction_consumer: transaction_consumer,
+            shutdown,
             _temp_dir: temp_dir,
         }
-    }
-
-    /// Submit a transaction to this replica's mempool
-    pub fn _submit_transaction(&mut self, tx: Transaction) -> Result<(), anyhow::Error> {
-        self.transaction_producer
-            .push(tx)
-            .map_err(|e| anyhow::anyhow!("Failed to submit transaction: {:?}", e))
-    }
-
-    /// Submit a block for validation (called when receiving block from P2P or when proposing)
-    pub fn _submit_block_for_validation(&mut self, block: Block) -> Result<(), anyhow::Error> {
-        self.block_producer
-            .push(block)
-            .map_err(|e| anyhow::anyhow!("Failed to submit block: {:?}", e))
-    }
-
-    /// Build a block proposal from pending transactions (when this replica is leader)
-    pub fn _build_block_proposal(
-        &mut self,
-        view: u64,
-        parent_hash: [u8; 32],
-        height: u64,
-    ) -> Block {
-        // Take transactions from pool
-        let mut transactions = Vec::new();
-        while let Ok(tx) = self._transaction_consumer.pop() {
-            transactions.push(tx);
-        }
-
-        // Create unsigned block first to get hash
-        let temp_block = Block::new(
-            view,
-            self.replica_id,
-            parent_hash,
-            transactions.clone(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            self.secret_key.sign(b"temp"),
-            false,
-            height,
-        );
-
-        let block_hash = temp_block.get_hash();
-
-        // Sign with actual block hash
-        Block::new(
-            view,
-            self.replica_id,
-            parent_hash,
-            transactions,
-            temp_block.header.timestamp,
-            self.secret_key.sign(&block_hash),
-            false,
-            height,
-        )
-    }
-
-    /// Shutdown this replica's validation service
-    pub fn _shutdown_validation(&mut self) {
-        self._shutdown.store(true, Ordering::Release);
-        self.validation_service.shutdown();
     }
 }
 
@@ -285,24 +237,19 @@ impl TestFixture {
     }
 }
 
-/// Creates a test transaction with the given parameters and proper BLS signature
+/// Creates a test transaction with the given parameters and proper signature
 ///
 /// # Arguments
 /// * `secret_key` - The secret key to sign the transaction with
-/// * `sender` - The sender's public key
+/// * `public_key` - The sender's public key
 /// * `nonce` - The transaction nonce
-/// * `payload` - The transaction payload (used to derive recipient and tx_hash)
+/// * `_payload` - Unused (kept for API compatibility)
 pub fn create_test_transaction(
     secret_key: &TxSecretKey,
     public_key: &TxPublicKey,
     nonce: u64,
-    payload: Vec<u8>,
+    _payload: Vec<u8>,
 ) -> Transaction {
-    // Create a recipient address from the payload hash
-    let mut recipient = [0u8; 32];
-    let payload_hash = blake3::hash(&payload);
-    recipient.copy_from_slice(&payload_hash.as_bytes()[..32]);
-
     Transaction::new_transfer(
         Address::from_public_key(public_key),
         Address::from_bytes([2u8; 32]),
@@ -322,7 +269,7 @@ pub fn create_test_transactions(count: usize) -> Vec<Transaction> {
     for i in 0..count {
         let (sk, pk) = gen_tx_keypair();
         let payload = format!("transaction-{}", i).into_bytes();
-        transactions.push(create_test_transaction(&sk, &pk, i as u64, payload));
+        transactions.push(create_test_transaction(&sk, &pk, 0, payload));
     }
     transactions
 }

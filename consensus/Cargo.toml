@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow        = { workspace = true }
-arc-swap      = "1.7.1"
+arc-swap      = { workspace = true }
 ark-bls12-381 = { workspace = true, features = [ "curve" ] }
 ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
@@ -37,3 +37,7 @@ criterion = "0.5"
 [[bench]]
 harness = false
 name    = "pending_state"
+
+[[bench]]
+harness = false
+name    = "mempool_proposal"

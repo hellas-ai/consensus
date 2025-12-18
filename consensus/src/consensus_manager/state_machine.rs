@@ -219,12 +219,25 @@ use crate::{
     consensus::ConsensusMessage,
     consensus_manager::{events::ViewProgressEvent, view_manager::ViewProgressManager},
     crypto::aggregated::{BlsSecretKey, PeerId},
-    state::{block::Block, notarizations::Vote},
+    mempool::{FinalizedNotification, ProposalRequest, ProposalResponse},
+    state::{block::Block, notarizations::Vote, transaction::Transaction},
     validation::ValidatedBlock,
 };
 
 /// Maximum number of attempts to broadcast a consensus message, in case the ring buffer is full
 const MAX_BROADCAST_ATTEMPTS: usize = 10;
+
+/// Maximum number of transactions per block
+const MAX_TRANSACTIONS_PER_BLOCK: usize = 1000;
+
+/// Maximum block size in bytes
+const MAX_BLOCK_SIZE_BYTES: usize = 1024 * 1024; // 1MB
+
+/// Maximum time to wait for a proposal response in milliseconds
+const FAST_PROPOSAL_RESPONSE_WAIT_MS: u64 = 10;
+
+/// Maximum time to wait for a proposal response in milliseconds
+const EXTENDED_PROPOSAL_RESPONSE_WAIT_MS: u64 = 50;
 
 /// Consensus state machine that orchestrates the Minimmit protocol
 pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: usize> {
@@ -246,6 +259,15 @@ pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: u
     /// Channel for receiving validated blocks from the validation service
     validated_block_consumer: Consumer<ValidatedBlock>,
 
+    /// Channel for requesting block proposals from mempool
+    proposal_req_producer: Producer<ProposalRequest>,
+
+    /// Channel for receiving block proposals from mempool
+    proposal_resp_consumer: Consumer<ProposalResponse>,
+
+    /// Channel for notifying mempool of finalized transactions
+    finalized_producer: Producer<FinalizedNotification>,
+
     /// Tick interval for checking timeouts and triggering periodic actions
     tick_interval: Duration,
 
@@ -265,6 +287,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
         validated_block_consumer: Consumer<ValidatedBlock>,
+        proposal_req_producer: Producer<ProposalRequest>,
+        proposal_resp_consumer: Consumer<ProposalResponse>,
+        finalized_producer: Producer<FinalizedNotification>,
         tick_interval: Duration,
         shutdown_signal: Arc<AtomicBool>,
         logger: slog::Logger,
@@ -276,6 +301,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             message_consumer,
             broadcast_producer,
             validated_block_consumer,
+            proposal_req_producer,
+            proposal_resp_consumer,
+            finalized_producer,
             tick_interval,
             shutdown_signal,
             logger,
@@ -632,6 +660,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             .unwrap()
             .as_secs();
 
+        let proposal_request = ProposalRequest {
+            view,
+            max_txs: MAX_TRANSACTIONS_PER_BLOCK,
+            max_bytes: MAX_BLOCK_SIZE_BYTES,
+            parent_block_hash,
+        };
+        self.proposal_req_producer.push(proposal_request)?;
+
+        // Wait for response (with timeout)
+        let transactions = self.wait_for_proposal_response(view)?;
+
         // Create a dummy signature to construct the block structure.
         // The signature is NOT part of the block hash, so this doesn't affect the hash.
         // We sign a zero-byte array just to get a valid BlsSignature type.
@@ -642,7 +681,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             view,
             self.view_manager.replica_id(),
             parent_block_hash,
-            vec![], // TODO: add transactions to the block
+            transactions,
             timestamp,
             dummy_signature,
             false,
@@ -793,6 +832,23 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             "Finalizing view {view} with block hash {block_hash:?}"
         );
 
+        // Notify mempool to remove those transactions associated with the finalized block
+        let finalized_txs = self.view_manager.get_block_tx_hashes(view)?;
+        let notification = FinalizedNotification {
+            view,
+            tx_hashes: finalized_txs,
+        };
+
+        // Best-effort notification (don't fail finalization if channel is full)
+        if let Err(rtrb::PushError::Full(notif)) = self.finalized_producer.push(notification) {
+            slog::warn!(
+                self.logger,
+                "Finalization channel full, dropped notification for view {} with {} txs",
+                notif.view,
+                notif.tx_hashes.len()
+            );
+        }
+
         self.view_manager.finalize_view(view)?;
 
         Ok(())
@@ -929,6 +985,40 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         ))
     }
 
+    /// Wait for a proposal response from the mempool
+    fn wait_for_proposal_response(&mut self, view: u64) -> Result<Vec<Arc<Transaction>>> {
+        let fast_deadline = Instant::now() + Duration::from_millis(FAST_PROPOSAL_RESPONSE_WAIT_MS);
+        while Instant::now() < fast_deadline {
+            if let Ok(response) = self.proposal_resp_consumer.pop()
+                && response.view == view
+            {
+                return Ok(response.transactions);
+            }
+            std::hint::spin_loop();
+        }
+
+        // Extended wait (50ms) with sleep to reduce CPU usage
+        let extended_deadline =
+            Instant::now() + Duration::from_millis(EXTENDED_PROPOSAL_RESPONSE_WAIT_MS);
+        while Instant::now() < extended_deadline {
+            if let Ok(response) = self.proposal_resp_consumer.pop()
+                && response.view == view
+            {
+                return Ok(response.transactions);
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+
+        // Timeout: propose empty block (liveness > latency)
+        slog::debug!(
+            self.logger,
+            "Proposal response timeout for view {}, proposing empty block",
+            view
+        );
+
+        Ok(vec![])
+    }
+
     /// Gracefully shuts down the Minimmit consensus state machine
     pub fn shutdown(&mut self) -> Result<()> {
         self.shutdown_signal.store(true, Ordering::Relaxed);
@@ -952,6 +1042,9 @@ pub struct ConsensusStateMachineBuilder<const N: usize, const F: usize, const M_
     message_consumer: Option<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
     broadcast_producer: Option<Producer<ConsensusMessage<N, F, M_SIZE>>>,
     validated_block_consumer: Option<Consumer<ValidatedBlock>>,
+    proposal_req_producer: Option<Producer<ProposalRequest>>,
+    proposal_resp_consumer: Option<Consumer<ProposalResponse>>,
+    finalized_producer: Option<Producer<FinalizedNotification>>,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> Default
@@ -975,6 +1068,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
             message_consumer: None,
             broadcast_producer: None,
             validated_block_consumer: None,
+            proposal_req_producer: None,
+            proposal_resp_consumer: None,
+            finalized_producer: None,
         }
     }
 
@@ -1027,6 +1123,30 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
         self
     }
 
+    pub fn with_proposal_req_producer(
+        mut self,
+        proposal_req_producer: Producer<ProposalRequest>,
+    ) -> Self {
+        self.proposal_req_producer = Some(proposal_req_producer);
+        self
+    }
+
+    pub fn with_proposal_resp_consumer(
+        mut self,
+        proposal_resp_consumer: Consumer<ProposalResponse>,
+    ) -> Self {
+        self.proposal_resp_consumer = Some(proposal_resp_consumer);
+        self
+    }
+
+    pub fn with_finalized_producer(
+        mut self,
+        finalized_producer: Producer<FinalizedNotification>,
+    ) -> Self {
+        self.finalized_producer = Some(finalized_producer);
+        self
+    }
+
     pub fn build(self) -> Result<ConsensusStateMachine<N, F, M_SIZE>> {
         ConsensusStateMachine::new(
             self.view_manager
@@ -1039,6 +1159,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
                 .ok_or_else(|| anyhow::anyhow!("Broadcast producer not set"))?,
             self.validated_block_consumer
                 .ok_or_else(|| anyhow::anyhow!("Validated block consumer not set"))?,
+            self.proposal_req_producer
+                .ok_or_else(|| anyhow::anyhow!("Proposal request producer not set"))?,
+            self.proposal_resp_consumer
+                .ok_or_else(|| anyhow::anyhow!("Proposal response consumer not set"))?,
+            self.finalized_producer
+                .ok_or_else(|| anyhow::anyhow!("Finalized producer not set"))?,
             self.tick_interval
                 .ok_or_else(|| anyhow::anyhow!("Tick interval not set"))?,
             self.shutdown_signal
@@ -1112,17 +1238,17 @@ mod tests {
         (PeerSet::new(public_keys), peer_id_to_secret_key)
     }
 
-    fn create_test_transaction(nonce: u64) -> Transaction {
+    fn create_test_transaction(nonce: u64) -> Arc<Transaction> {
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
-        Transaction::new_transfer(
+        Arc::new(Transaction::new_transfer(
             Address::from_public_key(&pk),
             Address::from_bytes([7u8; 32]),
             42,
             nonce,
             1_000,
             &sk,
-        )
+        ))
     }
 
     fn create_test_config(n: usize, f: usize, peer_strs: Vec<String>) -> ConsensusConfig {
@@ -1150,6 +1276,9 @@ mod tests {
         let mut message_producers = Vec::with_capacity(N);
         let mut broadcast_consumers = Vec::with_capacity(N);
         let mut validated_block_producers = Vec::with_capacity(N);
+        let mut proposal_req_consumers = Vec::with_capacity(N);
+        let mut proposal_resp_producers = Vec::with_capacity(N);
+        let mut finalized_consumers = Vec::with_capacity(N);
         let mut shutdown_signals = Vec::with_capacity(N);
         let mut temp_dirs = Vec::with_capacity(N);
 
@@ -1187,6 +1316,18 @@ mod tests {
             // Create logger
             let logger = slog::Logger::root(slog::Discard, slog::o!());
 
+            // Create proposal request channel
+            let (proposal_req_prod, proposal_req_cons) = RingBuffer::new(RING_BUFFER_SIZE);
+            proposal_req_consumers.push(proposal_req_cons);
+
+            // Create proposal response channel
+            let (proposal_resp_prod, proposal_resp_cons) = RingBuffer::new(RING_BUFFER_SIZE);
+            proposal_resp_producers.push(proposal_resp_prod);
+
+            // Create finalized channel
+            let (finalized_prod, finalized_cons) = RingBuffer::new(RING_BUFFER_SIZE);
+            finalized_consumers.push(finalized_cons);
+
             // Create leader manager
             let leader_manager = Box::new(RoundRobinLeaderManager::new(
                 N,
@@ -1221,6 +1362,9 @@ mod tests {
                 msg_cons,
                 bc_prod,
                 validated_block_cons,
+                proposal_req_prod,
+                proposal_resp_cons,
+                finalized_prod,
                 Duration::from_millis(100),
                 shutdown,
                 logger,

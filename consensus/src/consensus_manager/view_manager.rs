@@ -1406,6 +1406,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(())
     }
 
+    /// Returns the transaction hashes for a block in the given view.
+    pub fn get_block_tx_hashes(&self, view: u64) -> Result<Vec<[u8; blake3::OUT_LEN]>> {
+        let ctx = self
+            .view_chain
+            .find_view_context(view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not found", view))?;
+
+        let block = ctx
+            .block
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Block not found for view {}", view))?;
+
+        Ok(block.transactions.iter().map(|tx| tx.tx_hash).collect())
+    }
+
     fn _try_update_view(&mut self, view: u64) -> Result<()> {
         // TODO: Implement view update logic
         tracing::info!("Trying to update view to {}", view);
@@ -1468,17 +1483,17 @@ mod tests {
     }
 
     /// Creates a test transaction
-    fn create_test_transaction() -> Transaction {
+    fn create_test_transaction() -> Arc<Transaction> {
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
-        Transaction::new_transfer(
+        Arc::new(Transaction::new_transfer(
             Address::from_public_key(&pk),
             Address::from_bytes([7u8; 32]),
             42,
             9,
             1_000,
             &sk,
-        )
+        ))
     }
 
     /// Creates a test block

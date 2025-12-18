@@ -539,7 +539,7 @@ mod tests {
         // Try to transfer 200 (more than balance)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 200, 0, 10, &sk);
 
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
         let result = validator.validate_block(&block);
 
         assert!(result.is_err());
@@ -562,7 +562,7 @@ mod tests {
         // Try to use nonce 0 (should be 5)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
 
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
         let result = validator.validate_block(&block);
 
         assert!(result.is_err());
@@ -593,7 +593,7 @@ mod tests {
         let tx1 = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
         let tx2 = Transaction::new_transfer(sender_addr, recipient_addr, 200, 1, 10, &sk);
 
-        let block = create_test_block(vec![tx1, tx2]);
+        let block = create_test_block(vec![Arc::new(tx1), Arc::new(tx2)]);
         let result = validator.validate_block(&block);
 
         assert!(result.is_ok());
@@ -623,7 +623,7 @@ mod tests {
 
         // Same transaction twice
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx.clone(), tx]);
+        let block = create_test_block(vec![Arc::new(tx.clone()), Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -643,7 +643,7 @@ mod tests {
 
         // Sender account doesn't exist
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -662,7 +662,7 @@ mod tests {
 
         // Transfer to self
         let tx = Transaction::new_transfer(sender_addr, sender_addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -685,7 +685,7 @@ mod tests {
 
         // Recipient doesn't exist - should be implicitly created
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -707,7 +707,7 @@ mod tests {
         store.put_account(&account).unwrap();
 
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -736,7 +736,7 @@ mod tests {
             .unwrap();
 
         let tx = Transaction::new_create_account(sender_addr, existing_addr, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -758,7 +758,7 @@ mod tests {
         store.put_account(&account).unwrap();
 
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk); // 10 fee
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -779,7 +779,7 @@ mod tests {
         store.put_account(&Account::new(sender_pk, 0, 0)).unwrap();
 
         let tx = Transaction::new_mint(sender_addr, recipient_addr, 5000, 0, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -799,7 +799,7 @@ mod tests {
         store.put_account(&Account::new(sender_pk, 0, 5)).unwrap(); // nonce 5
 
         let tx = Transaction::new_mint(sender_addr, recipient_addr, 5000, 0, &sk); // nonce 0
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -818,7 +818,7 @@ mod tests {
         store.put_account(&Account::new(pk, 1000, 0)).unwrap();
 
         let tx = Transaction::new_burn(addr, addr, 500, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -837,7 +837,7 @@ mod tests {
         store.put_account(&Account::new(pk, 100, 0)).unwrap();
 
         let tx = Transaction::new_burn(addr, addr, 500, 0, 10, &sk); // 510 total, only 100 available
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -865,7 +865,7 @@ mod tests {
 
         // Now validate a block at view 3 that spends from current state (800 balance, nonce 1)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 1, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok(), "Should see accumulated pending state");
@@ -888,7 +888,7 @@ mod tests {
 
         // Try to transfer with fee that would overflow
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, u64::MAX, 0, 1, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -908,7 +908,7 @@ mod tests {
         // Both accounts don't exist
         let tx1 = Transaction::new_transfer(addr1, recipient, 100, 0, 10, &sk1);
         let tx2 = Transaction::new_transfer(addr2, recipient, 200, 0, 10, &sk2);
-        let block = create_test_block(vec![tx1, tx2]);
+        let block = create_test_block(vec![Arc::new(tx1), Arc::new(tx2)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -916,7 +916,7 @@ mod tests {
         assert_eq!(errors.len(), 2); // Both transactions fail
     }
 
-    fn create_test_block(transactions: Vec<Transaction>) -> Block {
+    fn create_test_block(transactions: Vec<Arc<Transaction>>) -> Block {
         use crate::crypto::aggregated::BlsSecretKey;
         let sk = BlsSecretKey::generate(&mut rand::thread_rng());
         let sig = sk.sign(b"test block");
@@ -937,7 +937,7 @@ mod tests {
 
         // Now validate a block that spends from the pending account
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok(), "Should validate against pending state");
@@ -955,7 +955,7 @@ mod tests {
         store.put_account(&Account::new(pk, 1000, 5)).unwrap(); // nonce 5
 
         let tx = Transaction::new_burn(addr, addr, 100, 0, 10, &sk); // nonce 0
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -976,7 +976,7 @@ mod tests {
 
         // Account doesn't exist
         let tx = Transaction::new_burn(addr, addr, 100, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -996,7 +996,7 @@ mod tests {
 
         // amount + fee would overflow
         let tx = Transaction::new_burn(addr, addr, u64::MAX, 0, 1, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -1018,7 +1018,7 @@ mod tests {
             .unwrap(); // nonce 5
 
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk); // nonce 0
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -1040,7 +1040,7 @@ mod tests {
 
         // Sender doesn't exist
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
@@ -1066,7 +1066,7 @@ mod tests {
             .unwrap();
 
         let tx = Transaction::new_mint(sender_addr, recipient_addr, 1000, 0, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -1085,7 +1085,7 @@ mod tests {
 
         // Sender doesn't exist - mint should still work (permissionless on testnet)
         let tx = Transaction::new_mint(sender_addr, recipient_addr, 5000, 0, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -1114,7 +1114,7 @@ mod tests {
         let tx2 = Transaction::new_mint(addr2, addr3, 200, 0, &sk2);
         let tx3 = Transaction::new_burn(addr1, addr1, 50, 1, 5, &sk1);
 
-        let block = create_test_block(vec![tx1, tx2, tx3]);
+        let block = create_test_block(vec![Arc::new(tx1), Arc::new(tx2), Arc::new(tx3)]);
         let result = validator.validate_block(&block);
 
         assert!(result.is_ok());
@@ -1141,7 +1141,7 @@ mod tests {
         let tx1 = Transaction::new_transfer(sender_addr, new_addr, 100, 0, 10, &sk);
         let tx2 = Transaction::new_create_account(sender_addr, new_addr, 1, 10, &sk);
 
-        let block = create_test_block(vec![tx1, tx2]);
+        let block = create_test_block(vec![Arc::new(tx1), Arc::new(tx2)]);
         let result = validator.validate_block(&block);
 
         // Should fail - account already exists (implicitly created)
@@ -1165,7 +1165,7 @@ mod tests {
         let tx2 = Transaction::new_mint(sender_addr, recipient_addr, 200, 1, &sk);
         let tx3 = Transaction::new_mint(sender_addr, recipient_addr, 300, 2, &sk);
 
-        let block = create_test_block(vec![tx1, tx2, tx3]);
+        let block = create_test_block(vec![Arc::new(tx1), Arc::new(tx2), Arc::new(tx3)]);
         let result = validator.validate_block(&block);
 
         assert!(result.is_ok());
@@ -1187,7 +1187,7 @@ mod tests {
 
         // Zero amount transfer (only fee)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 0, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok());
@@ -1214,7 +1214,7 @@ mod tests {
 
         // Now validate with nonce 1 (pending) and balance 800 (500 + 300)
         let tx = Transaction::new_transfer(sender_addr, recipient_addr, 700, 1, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_ok(), "Should see finalized + pending state");
@@ -1243,7 +1243,7 @@ mod tests {
 
         // Try to CreateAccount for same address - should fail
         let tx = Transaction::new_create_account(sender_addr, new_addr, 0, 10, &sk);
-        let block = create_test_block(vec![tx]);
+        let block = create_test_block(vec![Arc::new(tx)]);
 
         let result = validator.validate_block(&block);
         assert!(result.is_err());
