@@ -839,17 +839,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             tx_hashes: finalized_txs,
         };
 
-        // Best-effort notification (don't fail finalization if channel is full)
-        if let Err(rtrb::PushError::Full(notif)) = self.finalized_producer.push(notification) {
-            slog::warn!(
-                self.logger,
-                "Finalization channel full, dropped notification for view {} with {} txs",
-                notif.view,
-                notif.tx_hashes.len()
-            );
-        }
-
         self.view_manager.finalize_view(view)?;
+
+        // Best-effort notification (don't fail finalization if channel is full)
+        best_effort_notification(&mut self.finalized_producer, notification, &self.logger)?;
 
         Ok(())
     }
@@ -1030,6 +1023,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         );
         Ok(())
     }
+}
+
+/// Best-effort notification to a producer
+fn best_effort_notification<T>(
+    producer: &mut Producer<T>,
+    notification: T,
+    logger: &slog::Logger,
+) -> Result<()> {
+    if let Err(rtrb::PushError::Full(_)) = producer.push(notification) {
+        slog::warn!(logger, "Notification channel full, dropped notification");
+    }
+    Ok(())
 }
 
 /// Builder for creating a [`ConsensusStateMachine`] instance
@@ -1259,6 +1264,7 @@ mod tests {
             leader_manager: LeaderSelectionStrategy::RoundRobin,
             network: Network::Local,
             peers: peer_strs,
+            genesis_accounts: vec![],
         }
     }
 

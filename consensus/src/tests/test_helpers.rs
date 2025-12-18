@@ -4,7 +4,10 @@
 
 use crate::{
     consensus::ConsensusMessage,
-    consensus_manager::{config::ConsensusConfig, leader_manager::LeaderSelectionStrategy},
+    consensus_manager::{
+        config::{ConsensusConfig, GenesisAccount},
+        leader_manager::LeaderSelectionStrategy,
+    },
     crypto::{
         aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
         transaction_crypto::{TxPublicKey, TxSecretKey},
@@ -222,6 +225,7 @@ impl TestFixture {
             leader_manager: LeaderSelectionStrategy::RoundRobin,
             network: crate::consensus_manager::config::Network::Local,
             peers: peer_strs,
+            genesis_accounts: vec![],
         };
 
         Self {
@@ -229,6 +233,13 @@ impl TestFixture {
             peer_set,
             config,
         }
+    }
+
+    /// Creates a test fixture with funded genesis accounts
+    pub fn with_genesis_accounts(genesis_accounts: Vec<GenesisAccount>) -> Self {
+        let mut fixture = Self::default();
+        fixture.config.genesis_accounts = genesis_accounts;
+        fixture
     }
 
     /// Creates a default test fixture with standard parameters (N=6, F=1)
@@ -260,16 +271,25 @@ pub fn create_test_transaction(
     )
 }
 
-/// Creates multiple test transactions with proper signatures
-///
-/// # Arguments
-/// * `count` - Number of transactions to create
-pub fn create_test_transactions(count: usize) -> Vec<Transaction> {
+/// Creates funded test transactions along with their keypairs
+/// Returns (transactions, genesis_accounts) where genesis_accounts can be used
+/// to fund the senders in the genesis block
+pub fn create_funded_test_transactions(count: usize) -> (Vec<Transaction>, Vec<GenesisAccount>) {
     let mut transactions = Vec::new();
-    for i in 0..count {
+    let mut genesis_accounts = Vec::new();
+
+    for _i in 0..count {
         let (sk, pk) = gen_tx_keypair();
-        let payload = format!("transaction-{}", i).into_bytes();
-        transactions.push(create_test_transaction(&sk, &pk, 0, payload));
+
+        // Create genesis account entry for this sender
+        genesis_accounts.push(GenesisAccount {
+            public_key: hex::encode(pk.to_bytes()),
+            balance: 10_000,
+        });
+
+        // Create the transaction
+        transactions.push(create_test_transaction(&sk, &pk, 0, vec![]));
     }
-    transactions
+
+    (transactions, genesis_accounts)
 }

@@ -468,6 +468,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         persistence_writer.put_finalized_block(&genesis_block)?;
         persistence_writer.put_m_notarization(&genesis_m_notarization)?; // TODO: do we need to store a L-notarization for the genesis block as well (n-f votes)?
+        persistence_writer.initialize_genesis_accounts(&config.genesis_accounts)?;
+
+        slog::info!(
+            logger,
+            "Initialized genesis accounts";
+            "count" => config.genesis_accounts.len(),
+        );
 
         let mut genesis_context: ViewContext<N, F, M_SIZE> =
             ViewContext::new(0, genesis_leader, replica_id, [0; blake3::OUT_LEN]);
@@ -1433,7 +1440,7 @@ mod tests {
     use super::*;
     use crate::{
         consensus_manager::{
-            config::{ConsensusConfig, Network},
+            config::{ConsensusConfig, GenesisAccount, Network},
             leader_manager::{LeaderSelectionStrategy, RoundRobinLeaderManager},
             utils::{create_notarization_data, create_nullification_data},
         },
@@ -1578,6 +1585,24 @@ mod tests {
         )
     }
 
+    /// Creates a test config with genesis accounts
+    fn create_test_config_with_genesis(
+        n: usize,
+        f: usize,
+        peer_public_keys: Vec<String>,
+        genesis_accounts: Vec<GenesisAccount>,
+    ) -> ConsensusConfig {
+        ConsensusConfig::new(
+            n,
+            f,
+            Duration::from_secs(5),
+            LeaderSelectionStrategy::RoundRobin,
+            Network::Local,
+            peer_public_keys,
+            genesis_accounts,
+        )
+    }
+
     /// Creates a test nullification from nullify messages
     fn create_test_nullification<const N: usize, const F: usize, const M_SIZE: usize>(
         nullify_messages: &HashSet<Nullify>,
@@ -1597,6 +1622,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_public_keys,
+            vec![],
         )
     }
 
@@ -1876,6 +1902,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
@@ -1945,6 +1972,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
@@ -2007,6 +2035,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
@@ -2070,6 +2099,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
@@ -2534,6 +2564,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
@@ -2656,6 +2687,7 @@ mod tests {
             LeaderSelectionStrategy::RoundRobin,
             Network::Local,
             peer_strs,
+            vec![],
         );
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
@@ -6824,5 +6856,195 @@ mod tests {
         );
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_genesis_accounts_initialized() {
+        // Create test peer setup
+        let setup = create_test_peer_setup(6);
+        let replica_id = setup.peer_set.sorted_peer_ids[0];
+
+        // Create peer strings for config
+        let peer_strs: Vec<String> = setup
+            .peer_set
+            .sorted_peer_ids
+            .iter()
+            .map(|pid| {
+                let pk = setup.peer_set.id_to_public_key.get(pid).unwrap();
+                let mut buf = Vec::new();
+                pk.0.serialize_compressed(&mut buf).unwrap();
+                hex::encode(buf)
+            })
+            .collect();
+
+        // Create test keypairs for genesis accounts
+        let sk1 = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let pk1 = sk1.public_key();
+
+        let sk2 = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let pk2 = sk2.public_key();
+
+        let genesis_accounts = vec![
+            GenesisAccount {
+                public_key: hex::encode(pk1.to_bytes()),
+                balance: 1_000_000,
+            },
+            GenesisAccount {
+                public_key: hex::encode(pk2.to_bytes()),
+                balance: 500_000,
+            },
+        ];
+
+        // Create config with genesis accounts
+        let config = create_test_config_with_genesis(6, 1, peer_strs, genesis_accounts);
+
+        // Create ViewProgressManager (this initializes genesis)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
+        let (persistence_writer, reader) = PendingStateWriter::new(store.clone(), 0);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let leader_manager = Box::new(RoundRobinLeaderManager::new(
+            6,
+            setup.peer_set.sorted_peer_ids.clone(),
+        ));
+
+        let _manager = ViewProgressManager::<6, 1, 3>::new(
+            config,
+            replica_id,
+            leader_manager,
+            persistence_writer,
+            logger,
+        )
+        .unwrap();
+
+        // Verify genesis accounts were created
+        let addr1 = Address::from_public_key(&pk1);
+        let addr2 = Address::from_public_key(&pk2);
+
+        let account1 = reader.get_account(&addr1).unwrap();
+        assert_eq!(account1.balance, 1_000_000);
+        assert_eq!(account1.nonce, 0);
+
+        let account2 = reader.get_account(&addr2).unwrap();
+        assert_eq!(account2.balance, 500_000);
+        assert_eq!(account2.nonce, 0);
+    }
+
+    #[test]
+    fn test_genesis_with_empty_accounts() {
+        // Create test peer setup
+        let setup = create_test_peer_setup(6);
+        let replica_id = setup.peer_set.sorted_peer_ids[0];
+
+        // Create peer strings for config
+        let peer_strs: Vec<String> = setup
+            .peer_set
+            .sorted_peer_ids
+            .iter()
+            .map(|pid| {
+                let pk = setup.peer_set.id_to_public_key.get(pid).unwrap();
+                let mut buf = Vec::new();
+                pk.0.serialize_compressed(&mut buf).unwrap();
+                hex::encode(buf)
+            })
+            .collect();
+
+        // Genesis with no accounts should work (just no funded accounts)
+        let config = create_test_config_with_genesis(6, 1, peer_strs, vec![]);
+
+        // Create ViewProgressManager
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
+        let (persistence_writer, _reader) = PendingStateWriter::new(store.clone(), 0);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let leader_manager = Box::new(RoundRobinLeaderManager::new(
+            6,
+            setup.peer_set.sorted_peer_ids.clone(),
+        ));
+
+        // Should succeed without errors
+        let result = ViewProgressManager::<6, 1, 3>::new(
+            config,
+            replica_id,
+            leader_manager,
+            persistence_writer,
+            logger,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_genesis_accounts_have_zero_nonce() {
+        // Create test peer setup
+        let setup = create_test_peer_setup(6);
+        let replica_id = setup.peer_set.sorted_peer_ids[0];
+
+        // Create peer strings for config
+        let peer_strs: Vec<String> = setup
+            .peer_set
+            .sorted_peer_ids
+            .iter()
+            .map(|pid| {
+                let pk = setup.peer_set.id_to_public_key.get(pid).unwrap();
+                let mut buf = Vec::new();
+                pk.0.serialize_compressed(&mut buf).unwrap();
+                hex::encode(buf)
+            })
+            .collect();
+
+        // Create multiple genesis accounts
+        let mut genesis_accounts = Vec::new();
+        let mut keypairs = Vec::new();
+
+        for _ in 0..5 {
+            let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+            let pk = sk.public_key();
+            genesis_accounts.push(GenesisAccount {
+                public_key: hex::encode(pk.to_bytes()),
+                balance: 1000 + (keypairs.len() as u64 * 100),
+            });
+            keypairs.push((sk, pk));
+        }
+
+        // Create config with genesis accounts
+        let config = create_test_config_with_genesis(6, 1, peer_strs, genesis_accounts);
+
+        // Create ViewProgressManager
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
+        let (persistence_writer, reader) = PendingStateWriter::new(store.clone(), 0);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let leader_manager = Box::new(RoundRobinLeaderManager::new(
+            6,
+            setup.peer_set.sorted_peer_ids.clone(),
+        ));
+
+        let _manager = ViewProgressManager::<6, 1, 3>::new(
+            config,
+            replica_id,
+            leader_manager,
+            persistence_writer,
+            logger,
+        )
+        .unwrap();
+
+        // Verify ALL genesis accounts have nonce 0
+        for (i, (_sk, pk)) in keypairs.iter().enumerate() {
+            let addr = Address::from_public_key(pk);
+            let account = reader
+                .get_account(&addr)
+                .unwrap_or_else(|| panic!("Account {} should exist", i));
+            assert_eq!(account.nonce, 0, "Account {} should have nonce 0", i);
+            assert_eq!(
+                account.balance,
+                1000 + (i as u64 * 100),
+                "Account {} should have correct balance",
+                i
+            );
+        }
     }
 }

@@ -10,6 +10,16 @@ use validator::Validate;
 
 use crate::consensus_manager::leader_manager::LeaderSelectionStrategy;
 
+/// A genesis account with initial balance
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct GenesisAccount {
+    /// The account's public key
+    pub public_key: String,
+    /// The account's balance
+    #[validate(range(min = 0))]
+    pub balance: u64,
+}
+
 /// [`ConsensusConfig`] sets the configuration values for the consensus protocol.
 ///
 /// It contains the number of replicas in the consensus protocol, the number of faulty replicas,
@@ -31,6 +41,9 @@ pub struct ConsensusConfig {
     pub network: Network,
     /// The set of the (initial) peers in the consensus protocol.
     pub peers: Vec<String>,
+    /// Genesis accounts with initial balances
+    #[validate(length(min = 1, max = 100_000))]
+    pub genesis_accounts: Vec<GenesisAccount>,
 }
 
 impl ConsensusConfig {
@@ -41,6 +54,7 @@ impl ConsensusConfig {
         leader_manager: LeaderSelectionStrategy,
         network: Network,
         peers: Vec<String>,
+        genesis_accounts: Vec<GenesisAccount>,
     ) -> Self {
         Self {
             n,
@@ -49,6 +63,7 @@ impl ConsensusConfig {
             leader_manager,
             network,
             peers,
+            genesis_accounts,
         }
     }
 

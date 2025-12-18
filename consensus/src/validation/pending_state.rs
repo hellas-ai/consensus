@@ -9,21 +9,26 @@
 //! - `PendingStateWriter`: Owned by consensus thread, creates and publishes snapshots
 //! - `PendingStateReader`: Cloned to validation thread, reads snapshots lock-free
 
+use std::str::FromStr;
 use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::{ArcSwap, Guard};
 
-use crate::state::{
-    account::Account,
-    address::Address,
-    block::Block,
-    leader::Leader,
-    notarizations::{MNotarization, Vote},
-    nullify::{Nullification, Nullify},
-    transaction::Transaction,
-    view::View,
-};
+use crate::crypto::transaction_crypto::TxPublicKey;
 use crate::storage::store::ConsensusStore;
+use crate::{
+    consensus_manager::config::GenesisAccount,
+    state::{
+        account::Account,
+        address::Address,
+        block::Block,
+        leader::Leader,
+        notarizations::{MNotarization, Vote},
+        nullify::{Nullification, Nullify},
+        transaction::Transaction,
+        view::View,
+    },
+};
 
 use super::types::{AccountUpdate, StateDiff};
 
@@ -307,6 +312,25 @@ impl PendingStateWriter {
         PendingStateReader {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    /// Initializes genesis accounts in the store.
+    /// Should only be balled once during genesis block creation.
+    pub fn initialize_genesis_accounts(
+        &self,
+        genesis_accounts: &[GenesisAccount],
+    ) -> anyhow::Result<()> {
+        // Pre-build all accounts
+        let accounts: Vec<Account> = genesis_accounts
+            .iter()
+            .map(|ga| {
+                let public_key = TxPublicKey::from_str(&ga.public_key).unwrap();
+                Account::new(public_key, ga.balance, 0)
+            })
+            .collect();
+
+        // Insert all at once in a single transaction
+        self.store.batch_put_accounts(&accounts)
     }
 }
 

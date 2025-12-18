@@ -3,6 +3,8 @@
 //! This module provides Ed25519 signatures for user transactions,
 //! separate from the BLS signatures used in consensus.
 
+use std::str::FromStr;
+
 use ed25519_dalek::{
     PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH, Signature, Signer, SigningKey,
     Verifier, VerifyingKey,
@@ -55,6 +57,17 @@ impl TxSecretKey {
     }
 }
 
+impl FromStr for TxPublicKey {
+    type Err = SignatureError;
+    fn from_str(s: &str) -> Result<Self> {
+        let bytes = hex::decode(s)?;
+        let bytes = bytes
+            .try_into()
+            .map_err(|_| SignatureError::InvalidPublicKey)?;
+        Ok(Self(VerifyingKey::from_bytes(&bytes)?))
+    }
+}
+
 impl TxPublicKey {
     /// Create from raw bytes
     pub fn from_bytes(bytes: &[u8; PUBLIC_KEY_LENGTH]) -> Result<Self> {
@@ -88,6 +101,7 @@ impl TxSignature {
 
 #[derive(Debug, Error)]
 pub enum SignatureError {
+    FailedToDecodeHex(#[from] hex::FromHexError),
     InvalidPublicKey,
     InvalidSignature(#[from] ed25519_dalek::SignatureError),
     InvalidSecretKey,
@@ -96,6 +110,7 @@ pub enum SignatureError {
 impl std::fmt::Display for SignatureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FailedToDecodeHex(e) => write!(f, "Failed to decode hex: {}", e),
             Self::InvalidPublicKey => write!(f, "Invalid public key"),
             Self::InvalidSignature(e) => write!(f, "Invalid signature: {}", e),
             Self::InvalidSecretKey => write!(f, "Invalid secret key"),

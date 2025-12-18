@@ -346,6 +346,31 @@ impl ConsensusStore {
         let key = public_key.to_bytes();
         unsafe { self.get_blob_value::<Account, _>(ACCOUNTS, key) }
     }
+
+    /// Puts multiple accounts into the database in a single transaction.
+    /// This is significantly faster than calling put_account repeatedly.
+    pub fn batch_put_accounts(&self, accounts: &[Account]) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("Failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(ACCOUNTS)
+                .context("Failed to open accounts table")?;
+
+            for account in accounts {
+                let key = account.key();
+                let bytes = account.value()?;
+                table
+                    .insert(key.as_slice(), bytes.as_ref())
+                    .context("Failed to insert account")?;
+            }
+        }
+        write_txn
+            .commit()
+            .context("Failed to commit write transaction")
+    }
 }
 
 #[cfg(test)]

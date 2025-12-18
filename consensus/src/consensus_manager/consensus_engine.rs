@@ -445,6 +445,7 @@ mod tests {
             leader_manager: LeaderSelectionStrategy::RoundRobin,
             network: crate::consensus_manager::config::Network::Local,
             peers: peer_strs,
+            genesis_accounts: vec![],
         }
     }
 

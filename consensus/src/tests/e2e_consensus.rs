@@ -5,11 +5,19 @@
 
 use super::{network_simulator::LocalNetwork, test_helpers::*};
 use crate::{
-    consensus_manager::consensus_engine::ConsensusEngine, crypto::transaction_crypto::TxSecretKey,
-    state::address::Address,
+    consensus_manager::{config::GenesisAccount, consensus_engine::ConsensusEngine},
+    crypto::transaction_crypto::{TxPublicKey, TxSecretKey},
+    state::{address::Address, transaction::Transaction},
 };
 use slog::{Drain, Level, Logger, o};
-use std::{env, str::FromStr, sync::Arc, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 /// Creates a logger for integration tests with configurable log levels.
 ///
@@ -64,9 +72,17 @@ fn test_e2e_consensus_happy_path() {
         "byzantine_tolerance" => F,
     );
 
-    // Phase 1: Setup test environment
-    slog::info!(logger, "Phase 1: Creating test fixture");
-    let fixture = TestFixture::default();
+    // Phase 1: Setup test environment with funded accounts
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts"
+    );
+
+    // Create funded transactions FIRST (we need genesis accounts for the fixture)
+    let num_transactions = 30;
+    let (transactions, genesis_accounts) = create_funded_test_transactions(num_transactions);
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
 
     slog::info!(
         logger,
@@ -169,15 +185,12 @@ fn test_e2e_consensus_happy_path() {
     assert!(network.is_running(), "Network should be running");
     slog::info!(logger, "Network routing thread active");
 
-    // Phase 5: Submit transactions
-    let num_transactions = 30;
+    // Phase 5: Submit transactions (already created with funded accounts)
     slog::info!(
         logger,
         "Phase 5: Submitting transactions";
         "count" => num_transactions,
     );
-
-    let transactions = create_test_transactions(num_transactions);
 
     // Keep a copy of transaction hashes for verification
     let expected_tx_hashes: std::collections::HashSet<_> =
@@ -449,9 +462,18 @@ fn test_e2e_consensus_continuous_load() {
         "byzantine_tolerance" => F,
     );
 
-    // Phase 1: Setup test environment
-    slog::info!(logger, "Phase 1: Creating test fixture");
-    let fixture = TestFixture::default();
+    // Phase 1: Setup test environment with funded accounts
+    // Pre-allocate a large pool of funded transactions (enough for the test duration)
+    // Assuming ~5 txs every 100ms for 60 seconds = ~3000 txs, we allocate more to be safe
+    let max_transactions = 5000;
+    let (mut all_transactions, genesis_accounts) =
+        create_funded_test_transactions(max_transactions);
+
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts"
+    );
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
 
     slog::info!(
         logger,
@@ -573,20 +595,21 @@ fn test_e2e_consensus_continuous_load() {
     let mut tx_index = 0usize;
     let mut expected_tx_hashes = std::collections::HashSet::new();
 
-    while start_time.elapsed() < test_duration {
-        // Submit a batch of transactions
-        let batch_size = 5;
-        let transactions = create_test_transactions(batch_size);
+    while start_time.elapsed() < test_duration && !all_transactions.is_empty() {
+        // Submit a batch of transactions from pre-allocated pool
+        let batch_size = std::cmp::min(5, all_transactions.len());
 
-        for tx in transactions {
-            let tx_hash = tx.tx_hash;
-            // Distribute transactions across replicas (round-robin)
-            let replica_idx = tx_index % N;
-            tx_index += 1;
+        for _ in 0..batch_size {
+            if let Some(tx) = all_transactions.pop() {
+                let tx_hash = tx.tx_hash;
+                // Distribute transactions across replicas (round-robin)
+                let replica_idx = tx_index % N;
+                tx_index += 1;
 
-            if transaction_producers[replica_idx].push(tx).is_ok() {
-                tx_count += 1;
-                expected_tx_hashes.insert(tx_hash);
+                if transaction_producers[replica_idx].push(tx).is_ok() {
+                    tx_count += 1;
+                    expected_tx_hashes.insert(tx_hash);
+                }
             }
         }
 
@@ -603,6 +626,7 @@ fn test_e2e_consensus_continuous_load() {
                 "messages_routed" => msgs_routed,
                 "messages_dropped" => msgs_dropped,
                 "transactions_submitted" => tx_count,
+                "remaining_txs" => all_transactions.len(),
             );
 
             last_check = std::time::Instant::now();
@@ -827,9 +851,17 @@ fn test_e2e_consensus_with_crashed_replica() {
         "crashed_replica" => CRASHED_REPLICA_IDX,
     );
 
-    // Phase 1: Setup test environment
-    slog::info!(logger, "Phase 1: Creating test fixture");
-    let fixture = TestFixture::default();
+    // Phase 1: Setup test environment with funded accounts
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts"
+    );
+
+    // Create funded transactions FIRST (we need genesis accounts for the fixture)
+    let num_transactions = 30;
+    let (transactions, genesis_accounts) = create_funded_test_transactions(num_transactions);
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
 
     slog::info!(
         logger,
@@ -954,14 +986,12 @@ fn test_e2e_consensus_with_crashed_replica() {
     );
 
     // Phase 6: Submit transactions (only to healthy replicas)
-    let num_transactions = 30;
     slog::info!(
         logger,
         "Phase 6: Submitting transactions";
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(num_transactions);
     // Keep a copy of transaction hashes for verification
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
@@ -1293,9 +1323,17 @@ fn test_e2e_consensus_with_equivocating_leader() {
         "target_view" => 1,
     );
 
-    // Phase 1: Setup test environment
-    slog::info!(logger, "Phase 1: Creating test fixture");
-    let fixture = TestFixture::default();
+    // Phase 1: Setup test environment with funded accounts
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts"
+    );
+
+    // Create funded transactions FIRST (we need genesis accounts for the fixture)
+    let num_transactions = 30;
+    let (transactions, genesis_accounts) = create_funded_test_transactions(num_transactions);
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
 
     slog::info!(
         logger,
@@ -1606,15 +1644,13 @@ fn test_e2e_consensus_with_equivocating_leader() {
         "partition_b" => "replicas 4, 5 received block2",
     );
 
-    // Phase 6: Submit transactions to honest replicas
-    let num_transactions = 30;
+    // Phase 6: Submit transactions to honest replicas (already created with funded accounts)
     slog::info!(
         logger,
         "Phase 6: Submitting transactions to honest replicas";
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(num_transactions);
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
 
@@ -1989,9 +2025,17 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         "byzantine_views" => "1, 7, 13, 19, ... (view % 6 == 1)",
     );
 
-    // Phase 1: Setup test environment
-    slog::info!(logger, "Phase 1: Creating test fixture");
-    let fixture = TestFixture::default();
+    // Phase 1: Setup test environment with funded accounts
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts"
+    );
+
+    // Create funded transactions FIRST (we need genesis accounts for the fixture)
+    let num_transactions = 50;
+    let (transactions, genesis_accounts) = create_funded_test_transactions(num_transactions);
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
 
     slog::info!(
         logger,
@@ -2318,15 +2362,13 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         }
     });
 
-    // Phase 6: Submit transactions to honest replicas
-    let num_transactions = 50;
+    // Phase 6: Submit transactions to honest replicas (already created with funded accounts)
     slog::info!(
         logger,
         "Phase 6: Submitting transactions to honest replicas";
         "count" => num_transactions,
     );
 
-    let transactions = create_test_transactions(num_transactions);
     let expected_tx_hashes: std::collections::HashSet<_> =
         transactions.iter().map(|tx| tx.tx_hash).collect();
 
@@ -2593,5 +2635,1140 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         "equivocations_attempted" => total_equivocations,
         "byzantine_views_nullified" => byzantine_views_nullified,
         "result" => "Protocol correctly handled persistent Byzantine equivocation",
+    );
+}
+
+#[test]
+#[ignore] // Run with: cargo test --lib test_e2e_consensus_functional_blockchain -- --ignored --nocapture
+fn test_e2e_consensus_functional_blockchain() {
+    let logger = create_test_logger();
+
+    slog::info!(
+        logger,
+        "Starting end-to-end consensus test (functional blockchain)";
+        "replicas" => N,
+        "byzantine_tolerance" => F,
+    );
+
+    // Phase 1: Create initial funded accounts
+    // We'll create 10 "user" accounts with initial balances
+    let num_initial_accounts = 10;
+    let initial_balance = 100_000u64;
+
+    let mut user_keys: Vec<(TxSecretKey, TxPublicKey)> = Vec::new();
+    let mut genesis_accounts = Vec::new();
+
+    for _ in 0..num_initial_accounts {
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.public_key();
+        genesis_accounts.push(GenesisAccount {
+            public_key: hex::encode(pk.to_bytes()),
+            balance: initial_balance,
+        });
+        user_keys.push((sk, pk));
+    }
+
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts";
+        "num_accounts" => num_initial_accounts,
+        "initial_balance_each" => initial_balance,
+    );
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
+
+    slog::info!(
+        logger,
+        "Generated keypairs and peer set";
+        "total_replicas" => N,
+        "peer_ids" => ?fixture.peer_set.sorted_peer_ids,
+    );
+
+    // Phase 2: Initialize network simulator
+    slog::info!(logger, "Phase 2: Setting up network simulator");
+    let mut network = LocalNetwork::<N, F, M_SIZE>::new();
+    let mut replica_setups = Vec::with_capacity(N);
+
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
+    for (i, &peer_id) in fixture.peer_set.sorted_peer_ids.iter().enumerate() {
+        let secret_key = peer_id_to_secret_key
+            .get(&peer_id)
+            .expect("Secret key not found")
+            .clone();
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
+
+        slog::debug!(
+            logger,
+            "Created replica setup";
+            "replica_index" => i,
+            "peer_id" => peer_id,
+        );
+
+        replica_setups.push(setup);
+    }
+
+    // Phase 3: Register replicas and start engines
+    slog::info!(
+        logger,
+        "Phase 3: Registering replicas and starting consensus engines"
+    );
+    let mut engines = Vec::with_capacity(N);
+    let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services = Vec::with_capacity(N);
+    let mut mempool_services = Vec::with_capacity(N);
+    let mut stores = Vec::with_capacity(N);
+    let mut pending_state_readers = Vec::with_capacity(N);
+
+    for (i, setup) in replica_setups.into_iter().enumerate() {
+        let replica_id = setup.replica_id;
+
+        // Keep a clone of the storage for verification
+        stores.push(setup.storage.clone());
+
+        // Keep the pending state reader for balance verification
+        let pending_reader = setup.persistence_writer.reader();
+        pending_state_readers.push(pending_reader);
+
+        // Register with network
+        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+        // Create consensus engine
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            fixture.config.clone(),
+            replica_id,
+            setup.secret_key,
+            setup.message_consumer,
+            setup.broadcast_producer,
+            setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
+            setup.persistence_writer,
+            DEFAULT_TICK_INTERVAL,
+            replica_logger,
+        )
+        .expect("Failed to create consensus engine");
+
+        slog::debug!(
+            logger,
+            "Consensus engine started";
+            "replica" => i,
+            "peer_id" => replica_id,
+        );
+
+        engines.push(engine);
+        transaction_producers.push(setup.transaction_producer);
+        validation_services.push(setup.validation_service);
+        mempool_services.push(setup.mempool_service);
+    }
+
+    slog::info!(
+        logger,
+        "All replicas registered and engines started";
+        "count" => engines.len(),
+    );
+
+    // Phase 4: Start network routing
+    slog::info!(logger, "Phase 4: Starting network routing");
+    network.start();
+    assert!(network.is_running(), "Network should be running");
+    slog::info!(logger, "Network routing thread active");
+
+    // Phase 5: Generate valid transactions with proper state tracking
+    slog::info!(
+        logger,
+        "Phase 5: Generating and submitting valid transactions"
+    );
+
+    // Track local state for generating valid transactions
+    let mut local_balances: HashMap<Address, u64> = HashMap::new();
+    let mut local_nonces: HashMap<Address, u64> = HashMap::new();
+
+    // Initialize with genesis state
+    for (_, pk) in &user_keys {
+        let addr = Address::from_public_key(pk);
+        local_balances.insert(addr, initial_balance);
+        local_nonces.insert(addr, 0);
+    }
+
+    let mut all_transactions = Vec::new();
+    let mut new_account_keys: Vec<(TxSecretKey, TxPublicKey)> = Vec::new();
+
+    // Generate valid transactions:
+    // - 30 transfers between existing accounts
+    // - 20 transfers that create new accounts (implicit account creation)
+
+    // Part A: Transfers between existing accounts
+    for i in 0..30 {
+        let sender_idx = i % num_initial_accounts;
+        let receiver_idx = (i + 1) % num_initial_accounts;
+
+        let (sender_sk, sender_pk) = &user_keys[sender_idx];
+        let (_, receiver_pk) = &user_keys[receiver_idx];
+
+        let sender_addr = Address::from_public_key(sender_pk);
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let nonce = *local_nonces.get(&sender_addr).unwrap();
+        let balance = *local_balances.get(&sender_addr).unwrap();
+
+        let transfer_amount = 100u64;
+        let fee = 10u64;
+
+        // Ensure sender has enough balance
+        if balance >= transfer_amount + fee {
+            let tx = Transaction::new_transfer(
+                sender_addr,
+                receiver_addr,
+                transfer_amount,
+                nonce,
+                fee,
+                sender_sk,
+            );
+
+            // Update local state
+            *local_balances.get_mut(&sender_addr).unwrap() -= transfer_amount + fee;
+            *local_balances.get_mut(&receiver_addr).unwrap() += transfer_amount;
+            *local_nonces.get_mut(&sender_addr).unwrap() += 1;
+
+            all_transactions.push(tx);
+        }
+    }
+
+    // Part B: Transfers that create new accounts
+    for i in 0..20 {
+        let sender_idx = i % num_initial_accounts;
+        let (sender_sk, sender_pk) = &user_keys[sender_idx];
+        let sender_addr = Address::from_public_key(sender_pk);
+
+        // Create a new account
+        let new_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let new_pk = new_sk.public_key();
+        let new_addr = Address::from_public_key(&new_pk);
+
+        let nonce = *local_nonces.get(&sender_addr).unwrap();
+        let balance = *local_balances.get(&sender_addr).unwrap();
+
+        let transfer_amount = 500u64; // Give new account some funds
+        let fee = 10u64;
+
+        if balance >= transfer_amount + fee {
+            let tx = Transaction::new_transfer(
+                sender_addr,
+                new_addr,
+                transfer_amount,
+                nonce,
+                fee,
+                sender_sk,
+            );
+
+            // Update local state
+            *local_balances.get_mut(&sender_addr).unwrap() -= transfer_amount + fee;
+            local_balances.insert(new_addr, transfer_amount);
+            local_nonces.insert(new_addr, 0);
+            *local_nonces.get_mut(&sender_addr).unwrap() += 1;
+
+            new_account_keys.push((new_sk, new_pk));
+            all_transactions.push(tx);
+        }
+    }
+
+    // Part C: Some transactions FROM newly created accounts (chain of transfers)
+    for (new_sk, new_pk) in &new_account_keys[..5.min(new_account_keys.len())] {
+        let sender_addr = Address::from_public_key(new_pk);
+        let balance = *local_balances.get(&sender_addr).unwrap_or(&0);
+        let nonce = *local_nonces.get(&sender_addr).unwrap_or(&0);
+
+        // Send back to first user
+        let (_, receiver_pk) = &user_keys[0];
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let transfer_amount = 50u64;
+        let fee = 10u64;
+
+        if balance >= transfer_amount + fee {
+            let tx = Transaction::new_transfer(
+                sender_addr,
+                receiver_addr,
+                transfer_amount,
+                nonce,
+                fee,
+                new_sk,
+            );
+
+            *local_balances.get_mut(&sender_addr).unwrap() -= transfer_amount + fee;
+            *local_balances.get_mut(&receiver_addr).unwrap() += transfer_amount;
+            *local_nonces.get_mut(&sender_addr).unwrap() += 1;
+
+            all_transactions.push(tx);
+        }
+    }
+
+    let expected_tx_hashes: HashSet<_> = all_transactions.iter().map(|tx| tx.tx_hash).collect();
+    let total_valid_txs = all_transactions.len();
+
+    slog::info!(
+        logger,
+        "Generated valid transactions";
+        "total" => total_valid_txs,
+        "between_existing" => 30,
+        "creating_new_accounts" => new_account_keys.len(),
+        "from_new_accounts" => new_account_keys.len().min(5),
+    );
+
+    // Submit transactions to ALL replicas (simulates P2P gossip)
+    // Each transaction must reach all replicas so that any leader can include it
+    for tx in all_transactions.into_iter() {
+        for producer in &mut transaction_producers {
+            // Clone the transaction and send to each replica
+            // Use .ok() since the mempool will deduplicate anyway
+            let _ = producer.push(tx.clone());
+        }
+    }
+
+    slog::info!(
+        logger,
+        "All transactions submitted to all replicas";
+        "total" => total_valid_txs,
+        "replicas" => N,
+    );
+
+    // Phase 6: Wait for consensus to progress
+    slog::info!(
+        logger,
+        "Phase 6: Waiting for consensus to progress";
+        "duration_secs" => 30,
+    );
+
+    let test_duration = Duration::from_secs(30);
+    let check_interval = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < test_duration {
+        thread::sleep(check_interval);
+
+        let elapsed = start_time.elapsed().as_secs();
+        let msgs_routed = network.stats.messages_routed();
+        let msgs_dropped = network.stats.messages_dropped();
+
+        slog::info!(
+            logger,
+            "Consensus progress check";
+            "elapsed_secs" => elapsed,
+            "messages_routed" => msgs_routed,
+            "messages_dropped" => msgs_dropped,
+        );
+    }
+
+    // Phase 7: Verify system health
+    slog::info!(logger, "Phase 7: Verifying system health");
+
+    for (i, engine) in engines.iter().enumerate() {
+        let is_running = engine.is_running();
+
+        slog::info!(
+            logger,
+            "Engine health check";
+            "replica" => i,
+            "is_running" => is_running,
+        );
+
+        assert!(is_running, "Engine {} should still be running", i);
+    }
+
+    // Phase 8: Graceful shutdown
+    slog::info!(logger, "Phase 8: Shutting down consensus engines");
+
+    for engine in &engines {
+        engine.shutdown();
+    }
+
+    network.shutdown();
+
+    for mut service in validation_services {
+        service.shutdown();
+    }
+
+    for mut service in mempool_services {
+        service.shutdown();
+    }
+
+    for (i, engine) in engines.into_iter().enumerate() {
+        slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
+
+        engine
+            .shutdown_and_wait(Duration::from_secs(5))
+            .unwrap_or_else(|e| {
+                slog::error!(
+                    logger,
+                    "Engine shutdown failed";
+                    "replica" => i,
+                    "error" => ?e,
+                );
+                panic!("Engine {} failed to shutdown: {}", i, e)
+            });
+    }
+
+    slog::info!(logger, "All engines shut down successfully");
+
+    // Phase 9: Verify state consistency
+    slog::info!(logger, "Phase 9: Verifying state consistency");
+
+    let mut first_replica_blocks: Option<Vec<crate::state::block::Block>> = None;
+
+    for (i, store) in stores.iter().enumerate() {
+        let blocks = store
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+
+        slog::info!(
+            logger,
+            "Replica state check";
+            "replica" => i,
+            "finalized_blocks" => blocks.len(),
+            "highest_view" => blocks.last().map(|b| b.view()).unwrap_or(0),
+        );
+
+        assert!(
+            !blocks.is_empty(),
+            "Replica {} should have finalized blocks",
+            i
+        );
+
+        // Check chain integrity
+        for (idx, window) in blocks.windows(2).enumerate() {
+            let prev = &window[0];
+            let curr = &window[1];
+            assert_eq!(
+                curr.parent_block_hash(),
+                prev.get_hash(),
+                "Chain broken at index {} for replica {} (view {} -> {})",
+                idx,
+                i,
+                prev.view(),
+                curr.view()
+            );
+        }
+
+        // Check consistency across replicas
+        if let Some(ref first_blocks) = first_replica_blocks {
+            let min_len = std::cmp::min(blocks.len(), first_blocks.len());
+            for j in 0..min_len {
+                assert_eq!(
+                    blocks[j].get_hash(),
+                    first_blocks[j].get_hash(),
+                    "Block mismatch at index {} between replica {} and 0 (view {})",
+                    j,
+                    i,
+                    blocks[j].view()
+                );
+            }
+        } else {
+            first_replica_blocks = Some(blocks);
+        }
+    }
+
+    slog::info!(logger, "State consistency verification passed! ✓");
+
+    // Phase 10: Verify all transactions were included
+    slog::info!(
+        logger,
+        "Phase 10: Verifying transaction inclusion and state consistency"
+    );
+
+    let mut included_tx_hashes = HashSet::new();
+    if let Some(ref blocks) = first_replica_blocks {
+        for block in blocks {
+            for tx in &block.transactions {
+                included_tx_hashes.insert(tx.tx_hash);
+            }
+        }
+    }
+
+    // Verify ALL valid transactions were included
+    let missing_txs: Vec<_> = expected_tx_hashes.difference(&included_tx_hashes).collect();
+
+    assert!(
+        missing_txs.is_empty(),
+        "Missing {} transactions out of {}",
+        missing_txs.len(),
+        total_valid_txs
+    );
+
+    slog::info!(
+        logger,
+        "Transaction inclusion verified! ✓";
+        "total_valid_txs" => total_valid_txs,
+        "all_included" => true,
+        "new_accounts_created" => new_account_keys.len(),
+    );
+
+    // Phase 11: Verify final account balances using PendingStateReader
+    slog::info!(logger, "Phase 11: Verifying final account balances");
+
+    // Use the first replica's pending state reader
+    let pending_reader = &pending_state_readers[0];
+
+    // Verify balances for genesis accounts
+    for (_, pk) in &user_keys {
+        let addr = Address::from_public_key(pk);
+        let expected_balance = *local_balances.get(&addr).unwrap();
+
+        if let Some(account_state) = pending_reader.get_account(&addr) {
+            slog::debug!(
+                logger,
+                "Account balance check";
+                "address" => hex::encode(&addr.as_bytes()[..8]),
+                "expected_balance" => expected_balance,
+                "actual_balance" => account_state.balance,
+            );
+
+            assert_eq!(
+                account_state.balance,
+                expected_balance,
+                "Balance mismatch for account {:?}: expected {}, got {}",
+                hex::encode(&addr.as_bytes()[..8]),
+                expected_balance,
+                account_state.balance
+            );
+        } else {
+            panic!(
+                "Account {:?} not found in pending state",
+                hex::encode(&addr.as_bytes()[..8])
+            );
+        }
+    }
+
+    // Verify balances for newly created accounts
+    for (_, new_pk) in &new_account_keys {
+        let addr = Address::from_public_key(new_pk);
+        let expected_balance = *local_balances.get(&addr).unwrap_or(&0);
+
+        if let Some(account_state) = pending_reader.get_account(&addr) {
+            slog::debug!(
+                logger,
+                "New account balance check";
+                "address" => hex::encode(&addr.as_bytes()[..8]),
+                "expected_balance" => expected_balance,
+                "actual_balance" => account_state.balance,
+            );
+
+            assert_eq!(
+                account_state.balance,
+                expected_balance,
+                "Balance mismatch for new account {:?}: expected {}, got {}",
+                hex::encode(&addr.as_bytes()[..8]),
+                expected_balance,
+                account_state.balance
+            );
+        } else if expected_balance > 0 {
+            panic!(
+                "New account {:?} with expected balance {} not found",
+                hex::encode(&addr.as_bytes()[..8]),
+                expected_balance
+            );
+        }
+    }
+
+    slog::info!(
+        logger,
+        "Account balance verification passed! ✓";
+        "genesis_accounts_verified" => user_keys.len(),
+        "new_accounts_verified" => new_account_keys.len(),
+    );
+
+    // Final success message
+    slog::info!(
+        logger,
+        "Test completed successfully! ✓";
+        "scenario" => "functional blockchain with account creation and balance verification",
+        "total_transactions" => total_valid_txs,
+        "new_accounts_created" => new_account_keys.len(),
+    );
+}
+
+#[test]
+#[ignore] // Run with: cargo test --lib test_e2e_consensus_invalid_tx_rejection -- --ignored --nocapture
+fn test_e2e_consensus_invalid_tx_rejection() {
+    let logger = create_test_logger();
+
+    slog::info!(
+        logger,
+        "Starting end-to-end consensus test (invalid tx rejection)";
+        "replicas" => N,
+        "byzantine_tolerance" => F,
+    );
+
+    // Phase 1: Create funded accounts
+    let num_accounts = 5;
+    let initial_balance = 10_000u64;
+
+    let mut user_keys: Vec<(TxSecretKey, TxPublicKey)> = Vec::new();
+    let mut genesis_accounts = Vec::new();
+
+    for _ in 0..num_accounts {
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.public_key();
+        genesis_accounts.push(GenesisAccount {
+            public_key: hex::encode(pk.to_bytes()),
+            balance: initial_balance,
+        });
+        user_keys.push((sk, pk));
+    }
+
+    slog::info!(
+        logger,
+        "Phase 1: Creating test fixture with funded genesis accounts";
+        "num_accounts" => num_accounts,
+        "initial_balance_each" => initial_balance,
+    );
+
+    let fixture = TestFixture::with_genesis_accounts(genesis_accounts);
+
+    slog::info!(
+        logger,
+        "Generated keypairs and peer set";
+        "total_replicas" => N,
+        "peer_ids" => ?fixture.peer_set.sorted_peer_ids,
+    );
+
+    // Phase 2: Initialize network simulator
+    slog::info!(logger, "Phase 2: Setting up network simulator");
+    let mut network = LocalNetwork::<N, F, M_SIZE>::new();
+    let mut replica_setups = Vec::with_capacity(N);
+
+    let mut peer_id_to_secret_key = std::collections::HashMap::new();
+    for kp in &fixture.keypairs {
+        peer_id_to_secret_key.insert(kp.public_key.to_peer_id(), kp.secret_key.clone());
+    }
+
+    for (i, &peer_id) in fixture.peer_set.sorted_peer_ids.iter().enumerate() {
+        let secret_key = peer_id_to_secret_key
+            .get(&peer_id)
+            .expect("Secret key not found")
+            .clone();
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => peer_id));
+        let setup = ReplicaSetup::new(peer_id, secret_key, replica_logger);
+
+        slog::debug!(
+            logger,
+            "Created replica setup";
+            "replica_index" => i,
+            "peer_id" => peer_id,
+        );
+
+        replica_setups.push(setup);
+    }
+
+    // Phase 3: Register replicas and start engines
+    slog::info!(
+        logger,
+        "Phase 3: Registering replicas and starting consensus engines"
+    );
+    let mut engines = Vec::with_capacity(N);
+    let mut transaction_producers = Vec::with_capacity(N);
+    let mut validation_services = Vec::with_capacity(N);
+    let mut mempool_services = Vec::with_capacity(N);
+    let mut stores = Vec::with_capacity(N);
+    let mut pending_state_readers = Vec::with_capacity(N);
+
+    for (i, setup) in replica_setups.into_iter().enumerate() {
+        let replica_id = setup.replica_id;
+
+        // Keep a clone of the storage for verification
+        stores.push(setup.storage.clone());
+
+        // Keep the pending state reader for balance verification
+        let pending_reader = setup.persistence_writer.reader();
+        pending_state_readers.push(pending_reader);
+
+        // Register with network
+        network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
+
+        // Create consensus engine
+        let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
+
+        let engine = ConsensusEngine::<N, F, M_SIZE>::new(
+            fixture.config.clone(),
+            replica_id,
+            setup.secret_key,
+            setup.message_consumer,
+            setup.broadcast_producer,
+            setup.validated_block_consumer,
+            setup.proposal_req_producer,
+            setup.proposal_resp_consumer,
+            setup.finalized_producer,
+            setup.persistence_writer,
+            DEFAULT_TICK_INTERVAL,
+            replica_logger,
+        )
+        .expect("Failed to create consensus engine");
+
+        slog::debug!(
+            logger,
+            "Consensus engine started";
+            "replica" => i,
+            "peer_id" => replica_id,
+        );
+
+        engines.push(engine);
+        transaction_producers.push(setup.transaction_producer);
+        validation_services.push(setup.validation_service);
+        mempool_services.push(setup.mempool_service);
+    }
+
+    slog::info!(
+        logger,
+        "All replicas registered and engines started";
+        "count" => engines.len(),
+    );
+
+    // Phase 4: Start network routing
+    slog::info!(logger, "Phase 4: Starting network routing");
+    network.start();
+    assert!(network.is_running(), "Network should be running");
+    slog::info!(logger, "Network routing thread active");
+
+    // Phase 5: Generate mix of valid and invalid transactions
+    slog::info!(logger, "Phase 5: Generating valid and invalid transactions");
+
+    // Track state for valid tx generation
+    let mut local_nonces: HashMap<Address, u64> = HashMap::new();
+    let mut local_balances: HashMap<Address, u64> = HashMap::new();
+
+    for (_, pk) in &user_keys {
+        let addr = Address::from_public_key(pk);
+        local_nonces.insert(addr, 0);
+        local_balances.insert(addr, initial_balance);
+    }
+
+    let mut valid_transactions = Vec::new();
+    let mut invalid_transactions = Vec::new();
+    let mut valid_tx_hashes = HashSet::new();
+    let mut invalid_tx_hashes = HashSet::new();
+
+    // Generate 20 VALID transactions
+    for i in 0..20 {
+        let sender_idx = i % num_accounts;
+        let receiver_idx = (i + 1) % num_accounts;
+
+        let (sender_sk, sender_pk) = &user_keys[sender_idx];
+        let (_, receiver_pk) = &user_keys[receiver_idx];
+
+        let sender_addr = Address::from_public_key(sender_pk);
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let nonce = *local_nonces.get(&sender_addr).unwrap();
+        let balance = *local_balances.get(&sender_addr).unwrap();
+
+        let amount = 100u64;
+        let fee = 10u64;
+
+        if balance >= amount + fee {
+            let tx = Transaction::new_transfer(
+                sender_addr,
+                receiver_addr,
+                amount,
+                nonce,
+                fee,
+                sender_sk,
+            );
+
+            valid_tx_hashes.insert(tx.tx_hash);
+            valid_transactions.push(tx);
+
+            // Update state
+            *local_balances.get_mut(&sender_addr).unwrap() -= amount + fee;
+            *local_balances.get_mut(&receiver_addr).unwrap() += amount;
+            *local_nonces.get_mut(&sender_addr).unwrap() += 1;
+        }
+    }
+
+    // Generate INVALID transactions of various types:
+
+    // Type 1: Bad nonce (too high - future nonce)
+    {
+        let (sender_sk, sender_pk) = &user_keys[0];
+        let (_, receiver_pk) = &user_keys[1];
+        let sender_addr = Address::from_public_key(sender_pk);
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let current_nonce = *local_nonces.get(&sender_addr).unwrap();
+        let bad_nonce = current_nonce + 100; // Way too high
+
+        let tx = Transaction::new_transfer(
+            sender_addr,
+            receiver_addr,
+            50,
+            bad_nonce, // Invalid: nonce gap
+            10,
+            sender_sk,
+        );
+
+        slog::debug!(logger, "Created invalid tx: future nonce"; 
+            "expected_nonce" => current_nonce, 
+            "used_nonce" => bad_nonce);
+
+        invalid_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx);
+    }
+
+    // Type 2: Bad nonce (stale - already used)
+    {
+        let (sender_sk, sender_pk) = &user_keys[1];
+        let (_, receiver_pk) = &user_keys[2];
+        let sender_addr = Address::from_public_key(sender_pk);
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let tx = Transaction::new_transfer(
+            sender_addr,
+            receiver_addr,
+            50,
+            0, // Invalid: nonce 0 already used
+            10,
+            sender_sk,
+        );
+
+        slog::debug!(logger, "Created invalid tx: stale nonce");
+
+        invalid_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx);
+    }
+
+    // Type 3: Insufficient balance
+    {
+        let (sender_sk, sender_pk) = &user_keys[2];
+        let (_, receiver_pk) = &user_keys[3];
+        let sender_addr = Address::from_public_key(sender_pk);
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let current_nonce = *local_nonces.get(&sender_addr).unwrap();
+        let current_balance = *local_balances.get(&sender_addr).unwrap();
+
+        let tx = Transaction::new_transfer(
+            sender_addr,
+            receiver_addr,
+            current_balance + 1_000_000, // Way more than available
+            current_nonce,
+            10,
+            sender_sk,
+        );
+
+        slog::debug!(logger, "Created invalid tx: insufficient balance";
+            "balance" => current_balance,
+            "trying_to_send" => current_balance + 1_000_000);
+
+        invalid_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx);
+    }
+
+    // Type 4: Transaction from non-existent account (no balance)
+    {
+        let ghost_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let ghost_pk = ghost_sk.public_key();
+        let ghost_addr = Address::from_public_key(&ghost_pk);
+
+        let (_, receiver_pk) = &user_keys[0];
+        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        let tx = Transaction::new_transfer(ghost_addr, receiver_addr, 100, 0, 10, &ghost_sk);
+
+        slog::debug!(logger, "Created invalid tx: non-existent sender");
+
+        invalid_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx);
+    }
+
+    slog::info!(
+        logger,
+        "Generated transactions";
+        "valid_count" => valid_transactions.len(),
+        "invalid_count" => invalid_transactions.len(),
+    );
+
+    // Combine and shuffle transactions
+    let mut all_transactions = Vec::new();
+    all_transactions.extend(valid_transactions);
+    all_transactions.extend(invalid_transactions);
+
+    // Shuffle to interleave valid and invalid
+    use rand::seq::SliceRandom;
+    all_transactions.shuffle(&mut rand::thread_rng());
+
+    // Submit all transactions to ALL replicas (simulates P2P gossip)
+    // Each transaction must reach all replicas so that any leader can include it
+    for tx in all_transactions.into_iter() {
+        for producer in &mut transaction_producers {
+            // Clone the transaction and send to each replica
+            // Use .ok() since the mempool will deduplicate anyway
+            let _ = producer.push(tx.clone());
+        }
+    }
+
+    slog::info!(
+        logger,
+        "All transactions submitted to all replicas";
+        "valid" => valid_tx_hashes.len(),
+        "invalid" => invalid_tx_hashes.len(),
+        "replicas" => N,
+    );
+
+    // Phase 6: Wait for consensus to progress
+    slog::info!(
+        logger,
+        "Phase 6: Waiting for consensus to progress";
+        "duration_secs" => 30,
+    );
+
+    let test_duration = Duration::from_secs(30);
+    let check_interval = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < test_duration {
+        thread::sleep(check_interval);
+
+        let elapsed = start_time.elapsed().as_secs();
+        let msgs_routed = network.stats.messages_routed();
+        let msgs_dropped = network.stats.messages_dropped();
+
+        slog::info!(
+            logger,
+            "Consensus progress check";
+            "elapsed_secs" => elapsed,
+            "messages_routed" => msgs_routed,
+            "messages_dropped" => msgs_dropped,
+        );
+    }
+
+    // Phase 7: Verify system health
+    slog::info!(logger, "Phase 7: Verifying system health");
+
+    for (i, engine) in engines.iter().enumerate() {
+        let is_running = engine.is_running();
+
+        slog::info!(
+            logger,
+            "Engine health check";
+            "replica" => i,
+            "is_running" => is_running,
+        );
+
+        assert!(is_running, "Engine {} should still be running", i);
+    }
+
+    // Phase 8: Graceful shutdown
+    slog::info!(logger, "Phase 8: Shutting down consensus engines");
+
+    for engine in &engines {
+        engine.shutdown();
+    }
+
+    network.shutdown();
+
+    for mut service in validation_services {
+        service.shutdown();
+    }
+
+    for mut service in mempool_services {
+        service.shutdown();
+    }
+
+    for (i, engine) in engines.into_iter().enumerate() {
+        slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
+
+        engine
+            .shutdown_and_wait(Duration::from_secs(5))
+            .unwrap_or_else(|e| {
+                slog::error!(
+                    logger,
+                    "Engine shutdown failed";
+                    "replica" => i,
+                    "error" => ?e,
+                );
+                panic!("Engine {} failed to shutdown: {}", i, e)
+            });
+    }
+
+    slog::info!(logger, "All engines shut down successfully");
+
+    // Phase 9: Verify state consistency
+    slog::info!(logger, "Phase 9: Verifying state consistency");
+
+    let mut first_replica_blocks: Option<Vec<crate::state::block::Block>> = None;
+
+    for (i, store) in stores.iter().enumerate() {
+        let blocks = store
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+
+        slog::info!(
+            logger,
+            "Replica state check";
+            "replica" => i,
+            "finalized_blocks" => blocks.len(),
+            "highest_view" => blocks.last().map(|b| b.view()).unwrap_or(0),
+        );
+
+        assert!(
+            !blocks.is_empty(),
+            "Replica {} should have finalized blocks",
+            i
+        );
+
+        // Check chain integrity
+        for (idx, window) in blocks.windows(2).enumerate() {
+            let prev = &window[0];
+            let curr = &window[1];
+            assert_eq!(
+                curr.parent_block_hash(),
+                prev.get_hash(),
+                "Chain broken at index {} for replica {} (view {} -> {})",
+                idx,
+                i,
+                prev.view(),
+                curr.view()
+            );
+        }
+
+        // Check consistency across replicas
+        if let Some(ref first_blocks) = first_replica_blocks {
+            let min_len = std::cmp::min(blocks.len(), first_blocks.len());
+            for j in 0..min_len {
+                assert_eq!(
+                    blocks[j].get_hash(),
+                    first_blocks[j].get_hash(),
+                    "Block mismatch at index {} between replica {} and 0 (view {})",
+                    j,
+                    i,
+                    blocks[j].view()
+                );
+            }
+        } else {
+            first_replica_blocks = Some(blocks);
+        }
+    }
+
+    slog::info!(logger, "State consistency verification passed! ✓");
+
+    // Phase 10: Verify ONLY valid transactions were included
+    slog::info!(
+        logger,
+        "Phase 10: Verifying transaction inclusion correctness"
+    );
+
+    let mut included_tx_hashes = HashSet::new();
+    if let Some(ref blocks) = first_replica_blocks {
+        for block in blocks {
+            for tx in &block.transactions {
+                included_tx_hashes.insert(tx.tx_hash);
+            }
+        }
+    }
+
+    // Check 1: All valid transactions should be included
+    let missing_valid: Vec<_> = valid_tx_hashes.difference(&included_tx_hashes).collect();
+
+    if !missing_valid.is_empty() {
+        slog::warn!(
+            logger,
+            "Some valid transactions missing";
+            "missing_count" => missing_valid.len(),
+        );
+    }
+
+    // Allow some valid txs to be missing if they arrived late
+    let valid_inclusion_rate =
+        (valid_tx_hashes.len() - missing_valid.len()) as f64 / valid_tx_hashes.len() as f64;
+
+    assert!(
+        valid_inclusion_rate > 0.9,
+        "Valid transaction inclusion rate too low: {:.2}%",
+        valid_inclusion_rate * 100.0
+    );
+
+    // Check 2: NO invalid transactions should be included
+    let included_invalid: Vec<_> = invalid_tx_hashes
+        .intersection(&included_tx_hashes)
+        .collect();
+
+    assert!(
+        included_invalid.is_empty(),
+        "Invalid transactions were incorrectly included! Found {} invalid txs in finalized blocks",
+        included_invalid.len()
+    );
+
+    slog::info!(
+        logger,
+        "Transaction validation verified! ✓";
+        "valid_submitted" => valid_tx_hashes.len(),
+        "valid_included" => valid_tx_hashes.len() - missing_valid.len(),
+        "valid_inclusion_rate" => format!("{:.2}%", valid_inclusion_rate * 100.0),
+        "invalid_submitted" => invalid_tx_hashes.len(),
+        "invalid_included" => 0,
+        "invalid_correctly_rejected" => true,
+    );
+
+    // Verify protocol made progress despite invalid transactions
+    assert!(
+        !first_replica_blocks.as_ref().unwrap().is_empty(),
+        "Protocol should have finalized blocks despite invalid transactions"
+    );
+
+    // Phase 11: Verify account balances are consistent (invalid txs didn't affect state)
+    slog::info!(logger, "Phase 11: Verifying account balances are correct");
+
+    let pending_reader = &pending_state_readers[0];
+
+    for (_, pk) in &user_keys {
+        let addr = Address::from_public_key(pk);
+        let expected_balance = *local_balances.get(&addr).unwrap();
+
+        if let Some(account_state) = pending_reader.get_account(&addr) {
+            slog::debug!(
+                logger,
+                "Account balance check";
+                "address" => hex::encode(&addr.as_bytes()[..8]),
+                "expected_balance" => expected_balance,
+                "actual_balance" => account_state.balance,
+            );
+
+            assert_eq!(
+                account_state.balance,
+                expected_balance,
+                "Balance mismatch for account {:?}: expected {}, got {}. Invalid txs may have affected state!",
+                hex::encode(&addr.as_bytes()[..8]),
+                expected_balance,
+                account_state.balance
+            );
+        } else {
+            panic!(
+                "Account {:?} not found in pending state",
+                hex::encode(&addr.as_bytes()[..8])
+            );
+        }
+    }
+
+    slog::info!(
+        logger,
+        "Account balance verification passed! ✓";
+        "accounts_verified" => user_keys.len(),
+        "invalid_txs_had_no_effect" => true,
+    );
+
+    // Final success message
+    slog::info!(
+        logger,
+        "Test completed successfully! ✓";
+        "scenario" => "invalid transaction rejection with balance verification",
+        "protocol_made_progress" => true,
+        "all_invalid_rejected" => true,
+        "valid_inclusion_rate" => format!("{:.2}%", valid_inclusion_rate * 100.0),
     );
 }
