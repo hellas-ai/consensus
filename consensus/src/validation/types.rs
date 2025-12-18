@@ -211,6 +211,12 @@ pub enum ValidationError {
     /// Ed25519 signature verification failed
     InvalidSignature { tx_index: usize, tx_hash: [u8; 32] },
 
+    /// Block signature verification failed
+    BlockSignatureVerificationFailed {
+        block_hash: [u8; blake3::OUT_LEN],
+        num_txs: usize,
+    },
+
     /// The sender account does not exist in the database
     AccountNotFound { tx_index: usize, address: Address },
 
@@ -249,6 +255,17 @@ impl std::fmt::Display for ValidationError {
                     "Invalid signature for tx {} (hash: {})",
                     tx_index,
                     hex::encode(&tx_hash[..8])
+                )
+            }
+            Self::BlockSignatureVerificationFailed {
+                block_hash,
+                num_txs,
+            } => {
+                write!(
+                    f,
+                    "Block signature verification failed for block (hash: {}) with {} transactions",
+                    hex::encode(&block_hash[..8]),
+                    num_txs
                 )
             }
             Self::AccountNotFound { tx_index, address } => {

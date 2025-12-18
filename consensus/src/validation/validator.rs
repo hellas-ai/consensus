@@ -24,6 +24,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+// use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
 use crate::state::{
     address::Address,
     block::Block,
@@ -60,6 +62,35 @@ impl BlockValidator {
     /// * `Ok(StateDiff)` - All transactions valid, state changes pre-computed
     /// * `Err(Vec<ValidationError>)` - One or more transactions invalid
     pub fn validate_block(&self, block: &Block) -> ValidationResult<StateDiff> {
+        // // Phase 1: Parallel signature verification (which is the most expensive operation)
+        // let sig_errors: Vec<ValidationError> = block
+        //     .transactions
+        //     .par_iter()
+        //     .enumerate()
+        //     .filter_map(|(tx_index, tx)| {
+        //         if !tx.verify() {
+        //             Some(ValidationError::InvalidSignature {
+        //                 tx_index,
+        //                 tx_hash: tx.tx_hash,
+        //             })
+        //         } else {
+        //             None
+        //         }
+        //     })
+        //     .collect();
+
+        // if !sig_errors.is_empty() {
+        //     return Err(sig_errors);
+        // }
+
+        if !block.verify_block_txs_signatures() {
+            return Err(vec![ValidationError::InvalidSignature {
+                tx_index: 0,
+                tx_hash: block.transactions[0].tx_hash,
+            }]);
+        }
+
+        // Phase 2: Sequential validation of block transactions
         let mut errors = Vec::new();
         let mut state_diff = StateDiff::new();
 
@@ -74,15 +105,6 @@ impl BlockValidator {
             // 1. Check for duplicate transactions hashes in same block
             if !seen_tx_hashes.insert(tx.tx_hash) {
                 errors.push(ValidationError::DuplicateTransaction {
-                    tx_index,
-                    tx_hash: tx.tx_hash,
-                });
-                continue;
-            }
-
-            // 2. Verify Ed25519 signature
-            if !tx.verify() {
-                errors.push(ValidationError::InvalidSignature {
                     tx_index,
                     tx_hash: tx.tx_hash,
                 });
