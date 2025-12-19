@@ -190,7 +190,7 @@ use crate::{
     crypto::aggregated::{BlsPublicKey, BlsSecretKey, PeerId},
     mempool::{FinalizedNotification, ProposalRequest, ProposalResponse},
     state::peer::PeerSet,
-    validation::{PendingStateWriter, ValidatedBlock},
+    validation::PendingStateWriter,
 };
 
 /// [`ConsensusEngine`] is the high-level interface for running the Minimmit consensus protocol.
@@ -236,7 +236,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         secret_key: BlsSecretKey,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-        validated_block_consumer: Consumer<ValidatedBlock>,
         proposal_req_producer: Producer<ProposalRequest>,
         proposal_resp_consumer: Consumer<ProposalResponse>,
         finalized_producer: Producer<FinalizedNotification>,
@@ -287,7 +286,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
             .with_secret_key(secret_key)
             .with_message_consumer(message_consumer)
             .with_broadcast_producer(broadcast_producer)
-            .with_validated_block_consumer(validated_block_consumer)
             .with_proposal_req_producer(proposal_req_producer)
             .with_proposal_resp_consumer(proposal_resp_consumer)
             .with_finalized_producer(finalized_producer)
@@ -489,8 +487,6 @@ mod tests {
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create validated block consumer
-        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
         // Create proposal request producer
         let (proposal_req_producer, _proposal_req_consumer) = RingBuffer::new(1000);
         // Create proposal response consumer
@@ -508,7 +504,6 @@ mod tests {
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,
@@ -562,8 +557,6 @@ mod tests {
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
         let (broadcast_producer, _broadcast_consumer) = RingBuffer::new(1000);
-        // Create validated block consumer
-        let (_validated_block_producer, validated_block_consumer) = RingBuffer::new(1000);
         // Create proposal request producer
         let (proposal_req_producer, _proposal_req_consumer) = RingBuffer::new(1000);
         // Create proposal response consumer
@@ -580,7 +573,6 @@ mod tests {
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,

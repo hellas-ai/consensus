@@ -13,9 +13,9 @@ use crate::{
         transaction_crypto::{TxPublicKey, TxSecretKey},
     },
     mempool::{FinalizedNotification, MempoolService, ProposalRequest, ProposalResponse},
-    state::{address::Address, block::Block, peer::PeerSet, transaction::Transaction},
+    state::{address::Address, peer::PeerSet, transaction::Transaction},
     storage::store::ConsensusStore,
-    validation::{PendingStateWriter, ValidatedBlock, service::BlockValidationService},
+    validation::PendingStateWriter,
 };
 
 use std::sync::{Arc, atomic::AtomicBool};
@@ -61,7 +61,7 @@ fn gen_tx_keypair() -> (TxSecretKey, TxPublicKey) {
     (sk, pk)
 }
 
-/// Complete setup for a single replica including BlockValidationService
+/// Complete setup for a single replica with synchronous block validation
 pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The replica's peer ID
     pub replica_id: PeerId,
@@ -80,12 +80,6 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// Producer for outgoing consensus messages (consensus engine writes here)
     pub broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-
-    /// Producer for blocks to validate (P2P/leader sends blocks here)
-    pub block_producer: Producer<Block>,
-
-    /// Consumer for validated blocks (consensus engine reads from here)
-    pub validated_block_consumer: Consumer<ValidatedBlock>,
 
     /// Mempool service handle
     pub mempool_service: MempoolService,
@@ -108,10 +102,7 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Persistent storage for this replica
     pub storage: Arc<ConsensusStore>,
 
-    /// Block validation service handle
-    pub validation_service: BlockValidationService,
-
-    /// Shutdown flag (shared with validation service)
+    /// Shutdown flag (shared with mempool service)
     #[allow(unused)]
     pub shutdown: Arc<AtomicBool>,
 
@@ -120,7 +111,10 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_SIZE> {
-    /// Creates a new replica setup with BlockValidationService and MempoolService
+    /// Creates a new replica setup with MempoolService
+    ///
+    /// Block validation is now done synchronously in ViewProgressManager,
+    /// so no separate BlockValidationService is needed.
     pub fn new(replica_id: PeerId, secret_key: BlsSecretKey, logger: slog::Logger) -> Self {
         // Create ring buffers for consensus messages
         let (message_producer, message_consumer) = RingBuffer::new(BUFFER_SIZE);
@@ -134,17 +128,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
         // Create shutdown flag (shared across all services)
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Spawn BlockValidationService - creates block channels and pending state
-        let (validation_service, block_producer, validated_block_consumer, persistence_writer) =
-            BlockValidationService::spawn(
-                Arc::clone(&storage),
-                0, // last_finalized_view
-                Arc::clone(&shutdown),
-                logger.clone(),
-            );
-
-        // Create a PendingStateReader for the mempool from the writer
-        let pending_state_reader = persistence_writer.reader();
+        // Create PendingStateWriter directly (no separate validation service needed)
+        let (persistence_writer, pending_state_reader) =
+            PendingStateWriter::new(Arc::clone(&storage), 0);
 
         // Spawn MempoolService - creates transaction and proposal channels
         let (mempool_service, mempool_channels) =
@@ -158,15 +144,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             message_producer,
             broadcast_consumer,
             broadcast_producer,
-            block_producer,
-            validated_block_consumer,
             mempool_service,
             proposal_req_producer: mempool_channels.proposal_req_producer,
             proposal_resp_consumer: mempool_channels.proposal_resp_consumer,
             finalized_producer: mempool_channels.finalized_producer,
             transaction_producer: mempool_channels.tx_producer,
             persistence_writer,
-            validation_service,
             shutdown,
             _temp_dir: temp_dir,
         }

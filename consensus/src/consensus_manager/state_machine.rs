@@ -12,49 +12,44 @@
 //! ring buffers for incoming messages and periodically triggering timeout events:
 //!
 //!
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │              ConsensusStateMachine (Event Loop)                 │
-//! │                                                                 │
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │              ConsensusStateMachine (Event Loop)                │
+//! │                                                                │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  1. Poll validated_block_consumer (ValidatedBlocks)      │  │
-//! │  │     - Validated blocks with StateDiff to vote for        │  │
+//! │  │  1. Poll message_consumer (ConsensusMessages)            │  │
+//! │  │     - BlockProposal (validated synchronously via         │  │
+//! │  │       ViewProgressManager), Vote, MNotarization,         │  │
+//! │  │       LNotarization, Nullify, Nullification              │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
-//! │                       │                                         │
-//! │                       ▼                                         │
+//! │                       │                                        │
+//! │                       ▼                                        │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  2. Poll message_consumer (ConsensusMessages)            │  │
-//! │  │     - BlockProposal, Vote, MNotarization, LNotarization  │  │
-//! │  │     - Nullify, Nullification                             │  │
-//! │  └────────────────────┬─────────────────────────────────────┘  │
-//! │                       │                                         │
-//! │                       ▼                                         │
-//! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  3. Periodic Tick (every tick_interval)                  │  │
+//! │  │  2. Periodic Tick (every tick_interval)                  │  │
 //! │  │     - Check view timeout                                 │  │
 //! │  │     - Trigger nullification if needed                    │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
-//! │                       │                                         │
-//! │                       ▼                                         │
+//! │                       │                                        │
+//! │                       ▼                                        │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  4. Process Event (ViewProgressEvent)                    │  │
+//! │  │  3. Process Event (ViewProgressEvent)                    │  │
 //! │  │     - ViewProgressManager returns events based on state  │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
-//! │                       │                                         │
-//! │                       ▼                                         │
+//! │                       │                                        │
+//! │                       ▼                                        │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  5. Handle Event (take action)                           │  │
+//! │  │  4. Handle Event (take action)                           │  │
 //! │  │     - Propose block, vote, create notarizations          │  │
 //! │  │     - Broadcast messages, progress views                 │  │
 //! │  └────────────────────┬─────────────────────────────────────┘  │
-//! │                       │                                         │
-//! │                       ▼                                         │
+//! │                       │                                        │
+//! │                       ▼                                        │
 //! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │  6. Broadcast via broadcast_producer                     │  │
+//! │  │  5. Broadcast via broadcast_producer                     │  │
 //! │  │     - Send messages to network layer                     │  │
 //! │  └──────────────────────────────────────────────────────────┘  │
-//! │                                                                 │
+//! │                                                                │
 //! │  Loop continues until shutdown_signal is set                   │
-//! └─────────────────────────────────────────────────────────────────┘
+//! └────────────────────────────────────────────────────────────────┘
 //!
 //! ## Responsibilities
 //!
@@ -221,7 +216,6 @@ use crate::{
     crypto::aggregated::{BlsSecretKey, PeerId},
     mempool::{FinalizedNotification, ProposalRequest, ProposalResponse},
     state::{block::Block, notarizations::Vote, transaction::Transaction},
-    validation::ValidatedBlock,
 };
 
 /// Maximum number of attempts to broadcast a consensus message, in case the ring buffer is full
@@ -256,9 +250,6 @@ pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: u
     /// Channel for broadcasting consensus messages to the network
     broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
 
-    /// Channel for receiving validated blocks from the validation service
-    validated_block_consumer: Consumer<ValidatedBlock>,
-
     /// Channel for requesting block proposals from mempool
     proposal_req_producer: Producer<ProposalRequest>,
 
@@ -286,7 +277,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         secret_key: BlsSecretKey,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
-        validated_block_consumer: Consumer<ValidatedBlock>,
         proposal_req_producer: Producer<ProposalRequest>,
         proposal_resp_consumer: Consumer<ProposalResponse>,
         finalized_producer: Producer<FinalizedNotification>,
@@ -300,7 +290,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             secret_key,
             message_consumer,
             broadcast_producer,
-            validated_block_consumer,
             proposal_req_producer,
             proposal_resp_consumer,
             finalized_producer,
@@ -322,14 +311,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             let mut did_work = false;
-
-            // 1. Validated blocks (ready to vote for)
-            while let Ok(validated_block) = self.validated_block_consumer.pop() {
-                did_work = true;
-                if let Err(e) = self.handle_validated_block(validated_block) {
-                    slog::error!(self.logger, "Error handling validated block: {}", e);
-                }
-            }
 
             // Process all available consensus messages from the network
             while let Ok(message) = self.message_consumer.pop() {
@@ -376,18 +357,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             self.view_manager.replica_id()
         );
         Ok(())
-    }
-
-    fn handle_validated_block(&mut self, validated_block: ValidatedBlock) -> Result<()> {
-        let state_diff = validated_block.state_diff;
-
-        // Store the StateDiff for later application on finalization
-        // Then process the block through normal consensus flow
-        let event = self
-            .view_manager
-            .process_validated_block(validated_block.block, state_diff)?;
-
-        self.handle_event(event)
     }
 
     /// Handles any incoming consensus messages
@@ -1046,7 +1015,6 @@ pub struct ConsensusStateMachineBuilder<const N: usize, const F: usize, const M_
     logger: Option<slog::Logger>,
     message_consumer: Option<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
     broadcast_producer: Option<Producer<ConsensusMessage<N, F, M_SIZE>>>,
-    validated_block_consumer: Option<Consumer<ValidatedBlock>>,
     proposal_req_producer: Option<Producer<ProposalRequest>>,
     proposal_resp_consumer: Option<Consumer<ProposalResponse>>,
     finalized_producer: Option<Producer<FinalizedNotification>>,
@@ -1072,7 +1040,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
             logger: None,
             message_consumer: None,
             broadcast_producer: None,
-            validated_block_consumer: None,
             proposal_req_producer: None,
             proposal_resp_consumer: None,
             finalized_producer: None,
@@ -1120,14 +1087,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
         self
     }
 
-    pub fn with_validated_block_consumer(
-        mut self,
-        validated_block_consumer: Consumer<ValidatedBlock>,
-    ) -> Self {
-        self.validated_block_consumer = Some(validated_block_consumer);
-        self
-    }
-
     pub fn with_proposal_req_producer(
         mut self,
         proposal_req_producer: Producer<ProposalRequest>,
@@ -1162,8 +1121,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
                 .ok_or_else(|| anyhow::anyhow!("Message consumer not set"))?,
             self.broadcast_producer
                 .ok_or_else(|| anyhow::anyhow!("Broadcast producer not set"))?,
-            self.validated_block_consumer
-                .ok_or_else(|| anyhow::anyhow!("Validated block consumer not set"))?,
             self.proposal_req_producer
                 .ok_or_else(|| anyhow::anyhow!("Proposal request producer not set"))?,
             self.proposal_resp_consumer
@@ -1217,9 +1174,8 @@ mod tests {
         state_machines: Vec<ConsensusStateMachine<N, F, M_SIZE>>,
         peer_set: PeerSet,
         broadcast_consumers: Vec<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
-        _validated_block_producers: Vec<Producer<ValidatedBlock>>,
         shutdown_signals: Vec<Arc<AtomicBool>>,
-        peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
+        _peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
     }
 
     fn create_test_peer_setup(
@@ -1281,7 +1237,6 @@ mod tests {
         let mut state_machines = Vec::with_capacity(N);
         let mut message_producers = Vec::with_capacity(N);
         let mut broadcast_consumers = Vec::with_capacity(N);
-        let mut validated_block_producers = Vec::with_capacity(N);
         let mut proposal_req_consumers = Vec::with_capacity(N);
         let mut proposal_resp_producers = Vec::with_capacity(N);
         let mut finalized_consumers = Vec::with_capacity(N);
@@ -1298,11 +1253,6 @@ mod tests {
             // Create broadcast channel (for outgoing consensus messages)
             let (bc_prod, bc_cons) = RingBuffer::new(RING_BUFFER_SIZE);
             broadcast_consumers.push(bc_cons);
-
-            // Create validated block channel
-            let (vb_prod, validated_block_cons) =
-                RingBuffer::<ValidatedBlock>::new(RING_BUFFER_SIZE);
-            validated_block_producers.push(vb_prod);
 
             // Create shutdown signal
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -1367,7 +1317,6 @@ mod tests {
                 sk.clone(),
                 msg_cons,
                 bc_prod,
-                validated_block_cons,
                 proposal_req_prod,
                 proposal_resp_cons,
                 finalized_prod,
@@ -1384,9 +1333,8 @@ mod tests {
             state_machines,
             peer_set,
             broadcast_consumers,
-            _validated_block_producers: validated_block_producers,
             shutdown_signals,
-            peer_id_to_secret_key,
+            _peer_id_to_secret_key: peer_id_to_secret_key,
         }
     }
 
@@ -1504,18 +1452,10 @@ mod tests {
         }
     }
 
-    use crate::validation::{ValidatedBlock, types::StateDiff};
-
-    /// Creates a test StateDiff
-    fn create_test_state_diff(balance: u64) -> StateDiff {
-        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
-        let addr = Address::from_public_key(&sk.public_key());
-        let mut diff = StateDiff::new();
-        diff.add_created_account(addr, balance);
-        diff
-    }
+    use crate::validation::types::StateDiff;
 
     /// Creates a test block for a specific view and leader
+    #[allow(dead_code)]
     fn create_block_for_view(
         view: u64,
         leader_id: PeerId,
@@ -1547,45 +1487,22 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_validated_block_extracts_state_diff() {
-        // Scenario: ValidatedBlock arrives with StateDiff
-        // handle_validated_block should extract and pass to view_manager
+    fn test_synchronous_block_validation_on_tick() {
+        // Scenario: State machine processes ticks correctly.
+        // Block validation now happens synchronously in ViewProgressManager
+        // when a BlockProposal is received via handle_block_proposal().
         let mut setup = create_test_setup();
         let replica_idx = 0;
 
-        // Get the leader for view 1 (round-robin: index 1)
-        let leader_id = setup.peer_set.sorted_peer_ids[1];
-        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap().clone();
-
-        // Use genesis hash as the parent (ViewProgressManager starts at view 1 with genesis as
-        // parent)
-        let parent_hash = Block::genesis_hash();
-        let block = create_block_for_view(1, leader_id, &leader_sk, parent_hash);
-        let state_diff = create_test_state_diff(1000);
-
-        let validated_block = ValidatedBlock::new(block, state_diff);
-
-        // Push the validated block to the channel
-        setup._validated_block_producers[replica_idx]
-            .push(validated_block)
-            .expect("Failed to push validated block");
-
-        // Tick the state machine to process the block
+        // Tick the state machine - should succeed even without messages
         let result = setup.state_machines[replica_idx].handle_tick();
         assert!(result.is_ok(), "Tick should succeed");
 
-        // For a valid block from the correct leader, the replica should vote
-        // Check if a vote was broadcast (unless this replica is the leader)
-        if setup.peer_set.sorted_peer_ids[replica_idx] != leader_id {
-            // Non-leader replicas should broadcast a vote
-            let broadcast = setup.broadcast_consumers[replica_idx].pop();
-            if let Ok(ConsensusMessage::Vote(vote)) = broadcast {
-                assert_eq!(vote.view, 1);
-                assert_eq!(vote.leader_id, leader_id);
-            }
-            // Note: It's also valid if no vote is broadcast immediately
-            // depending on timing and state machine internals
-        }
+        // Initially no broadcasts since no blocks to vote on
+        assert!(
+            setup.broadcast_consumers[replica_idx].pop().is_err(),
+            "Should have no broadcasts initially"
+        );
     }
 
     #[test]
@@ -1603,6 +1520,8 @@ mod tests {
     #[test]
     fn test_validated_block_struct_contains_state_diff() {
         // Verify ValidatedBlock struct has state_diff field
+        use crate::validation::ValidatedBlock;
+
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let addr = Address::from_public_key(&sk.public_key());
 

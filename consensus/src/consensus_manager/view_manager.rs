@@ -366,7 +366,7 @@
 //! - Validated block processing and StateDiff storage
 //! - Pending state timing (StateDiff not in pending until M-notarization)
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use tracing::instrument;
@@ -390,7 +390,7 @@ use crate::{
         nullify::{Nullification, Nullify},
         peer::PeerSet,
     },
-    validation::{PendingStateWriter, StateDiff},
+    validation::{BlockValidator, PendingStateWriter, StateDiff},
 };
 
 // TODO: Add view progression logic
@@ -419,6 +419,9 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
 
     /// The leader manager algorithm to use for leader selection.
     leader_manager: Box<dyn LeaderManager>,
+
+    /// Block validator for synchronous validation of proposed blocks (for each view).
+    block_validator: BlockValidator,
 
     /// The chain of non-finalized views.
     view_chain: ViewChain<N, F, M_SIZE>,
@@ -495,11 +498,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             genesis_block_hash, // Parent is Genesis
         );
 
+        let block_validator = BlockValidator::new(persistence_writer.reader());
         let view_chain = ViewChain::new(view1_context, persistence_writer);
 
         Ok(Self {
             config,
             leader_manager,
+            block_validator,
             view_chain,
             replica_id,
             peers,
@@ -512,6 +517,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     pub fn from_genesis(
         config: ConsensusConfig,
         replica_id: PeerId,
+        block_validator: BlockValidator,
         persistence_writer: PendingStateWriter,
         logger: slog::Logger,
     ) -> Result<Self> {
@@ -550,6 +556,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(Self {
             config,
             leader_manager,
+            block_validator,
             view_chain,
             replica_id,
             peers,
@@ -964,6 +971,24 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             });
         }
 
+        // Synchronous validation of the block for each view.
+        let state_diff = match self.block_validator.validate_block(&block) {
+            Ok(state_diff) => state_diff,
+            Err(errors) => {
+                slog::warn!(
+                    self.logger,
+                    "Block validation failed";
+                    "view" => block_view_number,
+                    "block_hash" => ?block.get_hash(),
+                    "error_count" => errors.len(),
+                    "first_error" => ?errors.first()
+                );
+                return Ok(ViewProgressEvent::ShouldNullify {
+                    view: block_view_number,
+                });
+            }
+        };
+
         let LeaderProposalResult {
             block_hash,
             is_enough_to_m_notarize,
@@ -971,9 +996,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             should_await,
             should_vote,
             should_nullify,
-        } = self
-            .view_chain
-            .add_block_proposal(block_view_number, block, &self.peers)?;
+        } = self.view_chain.add_block_proposal(
+            block_view_number,
+            block,
+            Arc::new(state_diff),
+            &self.peers,
+        )?;
 
         if should_await {
             return Ok(ViewProgressEvent::Await);
@@ -1490,6 +1518,7 @@ mod tests {
     }
 
     /// Creates a test transaction
+    #[allow(dead_code)]
     fn create_test_transaction() -> Arc<Transaction> {
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
@@ -1511,7 +1540,9 @@ mod tests {
         leader_sk: BlsSecretKey,
         height: u64,
     ) -> Block {
-        let transactions = vec![create_test_transaction()];
+        // Use empty transactions for test blocks to pass synchronous validation
+        // (transactions require funded accounts which unit tests don't set up)
+        let transactions = vec![];
 
         // First, create a temporary block to compute its hash
         let temp_block = Block::new(
@@ -1743,11 +1774,17 @@ mod tests {
 
         let path = temp_db_path("view_manager_genesis");
         let persistence_storage = Arc::new(ConsensusStore::open(&path).unwrap());
-        let (persistence_writer, _persistence_reader) =
+        let (persistence_writer, persistence_reader) =
             PendingStateWriter::new(persistence_storage.clone(), 0);
-        let manager: ViewProgressManager<6, 1, 3> =
-            ViewProgressManager::from_genesis(config, replica_id, persistence_writer, logger)
-                .unwrap();
+        let block_validator = BlockValidator::new(persistence_reader);
+        let manager: ViewProgressManager<6, 1, 3> = ViewProgressManager::from_genesis(
+            config,
+            replica_id,
+            block_validator,
+            persistence_writer,
+            logger,
+        )
+        .unwrap();
 
         assert_eq!(manager.current_view_number(), 0);
         assert_eq!(manager.non_finalized_count(), 1);
@@ -5982,9 +6019,12 @@ mod tests {
         manager.view_chain.non_finalized_views.insert(2, view_ctx_2);
 
         // Add the block directly to view 2 using view_chain
-        let result = manager
-            .view_chain
-            .add_block_proposal(2, block_2, &manager.peers);
+        let result = manager.view_chain.add_block_proposal(
+            2,
+            block_2,
+            Arc::new(StateDiff::new()),
+            &manager.peers,
+        );
         assert!(result.is_ok());
         assert!(result.unwrap().should_await); // Should await parent M-notarization
 
@@ -6056,7 +6096,7 @@ mod tests {
         // Add the block as pending using view_chain directly
         manager
             .view_chain
-            .add_block_proposal(2, block_2, &manager.peers)
+            .add_block_proposal(2, block_2, Arc::new(StateDiff::new()), &manager.peers)
             .unwrap();
 
         // Verify block is pending
@@ -6135,7 +6175,7 @@ mod tests {
         // Add block 2 as pending
         manager
             .view_chain
-            .add_block_proposal(2, block_2, &manager.peers)
+            .add_block_proposal(2, block_2, Arc::new(StateDiff::new()), &manager.peers)
             .unwrap();
 
         // Verify block 2 is pending
@@ -6172,7 +6212,7 @@ mod tests {
         // Add block 3 as pending (parent view 2 has block but no M-notarization)
         manager
             .view_chain
-            .add_block_proposal(3, block_3, &manager.peers)
+            .add_block_proposal(3, block_3, Arc::new(StateDiff::new()), &manager.peers)
             .unwrap();
 
         // View 3 should be pending (waiting for view 2 M-notarization)
@@ -6254,7 +6294,7 @@ mod tests {
         // Add block 2 as pending
         manager
             .view_chain
-            .add_block_proposal(2, block_2, &manager.peers)
+            .add_block_proposal(2, block_2, Arc::new(StateDiff::new()), &manager.peers)
             .unwrap();
 
         // Verify block is pending
@@ -6690,7 +6730,7 @@ mod tests {
 
         let path = temp_db_path("view_manager_with_reader");
         let persistence_storage = Arc::new(ConsensusStore::open(&path).unwrap());
-        let (persistence_writer, persistence_reader) =
+        let (persistence_writer, _persistence_reader) =
             PendingStateWriter::new(persistence_storage.clone(), 0);
         (
             ViewProgressManager::new(
@@ -6701,7 +6741,7 @@ mod tests {
                 logger,
             )
             .unwrap(),
-            persistence_reader,
+            _persistence_reader.clone(),
             path,
         )
     }
@@ -6901,7 +6941,7 @@ mod tests {
         // Create ViewProgressManager (this initializes genesis)
         let temp_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
-        let (persistence_writer, reader) = PendingStateWriter::new(store.clone(), 0);
+        let (persistence_writer, persistence_reader) = PendingStateWriter::new(store.clone(), 0);
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
@@ -6922,11 +6962,11 @@ mod tests {
         let addr1 = Address::from_public_key(&pk1);
         let addr2 = Address::from_public_key(&pk2);
 
-        let account1 = reader.get_account(&addr1).unwrap();
+        let account1 = persistence_reader.get_account(&addr1).unwrap();
         assert_eq!(account1.balance, 1_000_000);
         assert_eq!(account1.nonce, 0);
 
-        let account2 = reader.get_account(&addr2).unwrap();
+        let account2 = persistence_reader.get_account(&addr2).unwrap();
         assert_eq!(account2.balance, 500_000);
         assert_eq!(account2.nonce, 0);
     }
@@ -6956,7 +6996,7 @@ mod tests {
         // Create ViewProgressManager
         let temp_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
-        let (persistence_writer, _reader) = PendingStateWriter::new(store.clone(), 0);
+        let (persistence_writer, _persistence_reader) = PendingStateWriter::new(store.clone(), 0);
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
@@ -7015,7 +7055,7 @@ mod tests {
         // Create ViewProgressManager
         let temp_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(ConsensusStore::open(temp_dir.path().join("db")).unwrap());
-        let (persistence_writer, reader) = PendingStateWriter::new(store.clone(), 0);
+        let (persistence_writer, persistence_reader) = PendingStateWriter::new(store.clone(), 0);
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
         let leader_manager = Box::new(RoundRobinLeaderManager::new(
@@ -7035,7 +7075,7 @@ mod tests {
         // Verify ALL genesis accounts have nonce 0
         for (i, (_sk, pk)) in keypairs.iter().enumerate() {
             let addr = Address::from_public_key(pk);
-            let account = reader
+            let account = persistence_reader
                 .get_account(&addr)
                 .unwrap_or_else(|| panic!("Account {} should exist", i));
             assert_eq!(account.nonce, 0, "Account {} should have nonce 0", i);
