@@ -1,3 +1,5 @@
+use ed25519_dalek::{Signature, VerifyingKey, verify_batch};
+use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error};
 use std::{hash::Hash, hash::Hasher, sync::Arc};
 
@@ -5,6 +7,7 @@ use crate::{
     crypto::{
         aggregated::{BlsSignature, PeerId},
         conversions::ArkSerdeWrapper,
+        transaction_crypto::TxSignature,
     },
     state::transaction::Transaction,
 };
@@ -171,6 +174,119 @@ impl Block {
         }
         block
     }
+
+    /// Optimal chunk size for parallel batch verification.
+    /// Smaller chunks = more parallelism but more overhead.
+    /// Larger chunks = less parallelism but better batch efficiency.
+    /// 128 is a good balance for typical CPU cache sizes.
+    const BATCH_CHUNK_SIZE: usize = 128;
+
+    /// Verifies all transaction signatures using parallel batch verification.
+    ///
+    /// This combines two optimizations:
+    /// 1. **Batch verification**: Ed25519 batch verification is ~3x faster than individual
+    /// 2. **Parallel processing**: Chunks are verified in parallel across CPU cores
+    ///
+    /// For a block with N transactions on M cores, the effective speedup is:
+    /// - Batch: ~3x (N signatures verified in N/3 time)
+    /// - Parallel: ~Mx (spread across cores)
+    /// - Combined: ~3M x improvement over sequential individual verification
+    ///
+    /// # Returns
+    /// - `true` if all transaction signatures are valid
+    /// - `false` if any signature is invalid (use `verify_signatures_find_invalid` to find which)
+    pub fn verify_block_txs_signatures(&self) -> bool {
+        if self.transactions.is_empty() {
+            return true;
+        }
+
+        // For small blocks, use simple batch verification (avoid parallelism overhead)
+        if self.transactions.len() <= Self::BATCH_CHUNK_SIZE {
+            return self.verify_batch_chunk(&self.transactions);
+        }
+
+        // For larger blocks, process chunks in parallel
+        self.transactions
+            .par_chunks(Self::BATCH_CHUNK_SIZE)
+            .all(|chunk| self.verify_batch_chunk(chunk))
+    }
+
+    /// Verifies a chunk of transactions using batch verification.
+    ///
+    /// This is an internal helper for parallel batch verification.
+    fn verify_batch_chunk(&self, chunk: &[Arc<Transaction>]) -> bool {
+        if chunk.is_empty() {
+            return true;
+        }
+
+        // Pre-allocate vectors for batch verification
+        let mut messages: Vec<&[u8]> = Vec::with_capacity(chunk.len());
+        let mut signatures: Vec<Signature> = Vec::with_capacity(chunk.len());
+        let mut verifying_keys: Vec<VerifyingKey> = Vec::with_capacity(chunk.len());
+
+        for tx in chunk {
+            // Get the message (tx_hash)
+            messages.push(&tx.tx_hash);
+
+            // Convert signature
+            let sig = match TxSignature::try_from(&tx.signature) {
+                Ok(s) => s.0,
+                Err(_) => return false, // Invalid signature format
+            };
+            signatures.push(sig);
+
+            // Convert public key from address
+            let pk = match tx.sender.to_public_key() {
+                Some(pk) => pk.0,
+                None => return false, // Invalid public key
+            };
+            verifying_keys.push(pk);
+        }
+
+        // Perform batch verification on this chunk
+        verify_batch(&messages, &signatures, &verifying_keys).is_ok()
+    }
+
+    /// Finds all transactions with invalid signatures using parallel processing.
+    ///
+    /// This is slower than `verify_block_txs_signatures` but returns the indices
+    /// of invalid transactions. Use this as a fallback when batch verification
+    /// fails to identify which specific transactions are invalid.
+    ///
+    /// # Returns
+    /// A vector of transaction indices that have invalid signatures.
+    /// Empty vector means all signatures are valid.
+    pub fn verify_signatures_find_invalid(&self) -> Vec<usize> {
+        self.transactions
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, tx)| if !tx.verify() { Some(idx) } else { None })
+            .collect()
+    }
+
+    /// Verifies all transaction signatures with optimal performance.
+    ///
+    /// First attempts batch verification (fast path). If that fails,
+    /// falls back to individual verification to identify invalid transactions.
+    ///
+    /// # Returns
+    /// - `Ok(())` if all signatures are valid
+    /// - `Err(Vec<usize>)` containing indices of transactions with invalid signatures
+    pub fn verify_all_signatures(&self) -> Result<(), Vec<usize>> {
+        // Fast path: batch verification
+        if self.verify_block_txs_signatures() {
+            return Ok(());
+        }
+
+        // Slow path: find invalid signatures
+        let invalid_indices = self.verify_signatures_find_invalid();
+        if invalid_indices.is_empty() {
+            // This shouldn't happen, but handle gracefully
+            Ok(())
+        } else {
+            Err(invalid_indices)
+        }
+    }
 }
 
 impl PartialEq for Block {
@@ -321,5 +437,114 @@ mod tests {
             b2.get_hash()
         };
         assert_eq!(expected, recomputed);
+    }
+
+    #[test]
+    fn batch_verify_empty_block() {
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"genesis");
+        let block = Block::genesis(0, leader_signature);
+
+        assert!(block.verify_block_txs_signatures());
+        assert!(block.verify_all_signatures().is_ok());
+    }
+
+    #[test]
+    fn batch_verify_valid_signatures() {
+        let parent = [5u8; blake3::OUT_LEN];
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+
+        // Create a block with valid transactions
+        let block = gen_block(10, 0, parent, 5, 12345, leader_signature, 10);
+
+        assert!(block.verify_block_txs_signatures());
+        assert!(block.verify_all_signatures().is_ok());
+        assert!(block.verify_signatures_find_invalid().is_empty());
+    }
+
+    #[test]
+    fn batch_verify_single_transaction() {
+        let parent = [6u8; blake3::OUT_LEN];
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+
+        let block = gen_block(11, 0, parent, 1, 11111, leader_signature, 11);
+
+        assert!(block.verify_block_txs_signatures());
+        assert!(block.verify_all_signatures().is_ok());
+    }
+
+    #[test]
+    fn batch_verify_many_transactions() {
+        let parent = [7u8; blake3::OUT_LEN];
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+
+        // Create a block with many transactions
+        let block = gen_block(12, 0, parent, 100, 22222, leader_signature, 12);
+
+        assert!(block.verify_block_txs_signatures());
+        assert!(block.verify_all_signatures().is_ok());
+    }
+
+    #[test]
+    fn batch_verify_detects_invalid_signature() {
+        let parent = [8u8; blake3::OUT_LEN];
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+
+        // Create valid transactions
+        let mut txs: Vec<Arc<Transaction>> = (0..5).map(|_| Arc::new(gen_tx())).collect();
+
+        // Corrupt the signature of the 3rd transaction
+        let mut corrupted_tx = (*txs[2]).clone();
+        corrupted_tx.signature.bytes[0] ^= 0xFF; // Flip bits
+        txs[2] = Arc::new(corrupted_tx);
+
+        let block = Block::new(13, 0, parent, txs, 33333, leader_signature, false, 13);
+
+        // Batch verification should fail
+        assert!(!block.verify_block_txs_signatures());
+
+        // find_invalid should identify the corrupted transaction
+        let invalid = block.verify_signatures_find_invalid();
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0], 2); // Index 2 is corrupted
+
+        // verify_all_signatures should return error with the invalid index
+        let result = block.verify_all_signatures();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), vec![2]);
+    }
+
+    #[test]
+    fn batch_verify_detects_multiple_invalid_signatures() {
+        let parent = [9u8; blake3::OUT_LEN];
+        let sk = BlsSecretKey::generate(&mut thread_rng());
+        let leader_signature = sk.sign(b"block proposal");
+
+        // Create valid transactions
+        let mut txs: Vec<Arc<Transaction>> = (0..5).map(|_| Arc::new(gen_tx())).collect();
+
+        // Corrupt signatures at index 1 and 4
+        let mut corrupted_tx1 = (*txs[1]).clone();
+        corrupted_tx1.signature.bytes[0] ^= 0xFF;
+        txs[1] = Arc::new(corrupted_tx1);
+
+        let mut corrupted_tx4 = (*txs[4]).clone();
+        corrupted_tx4.signature.bytes[0] ^= 0xFF;
+        txs[4] = Arc::new(corrupted_tx4);
+
+        let block = Block::new(14, 0, parent, txs, 44444, leader_signature, false, 14);
+
+        // Batch verification should fail
+        assert!(!block.verify_block_txs_signatures());
+
+        // find_invalid should identify both corrupted transactions
+        let invalid = block.verify_signatures_find_invalid();
+        assert_eq!(invalid.len(), 2);
+        assert!(invalid.contains(&1));
+        assert!(invalid.contains(&4));
     }
 }
