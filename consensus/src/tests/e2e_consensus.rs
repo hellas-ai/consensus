@@ -4420,7 +4420,8 @@ fn test_e2e_consensus_with_true_equivocation() {
             );
         } else if view_1_finalized {
             // This could happen if one partition got quorum before detecting equivocation
-            // In a 6-replica system with f=1, partition A (3 replicas) cannot get L-notarization alone
+            // In a 6-replica system with f=1, partition A (3 replicas) cannot get L-notarization
+            // alone
             slog::warn!(
                 logger,
                 "View 1 was finalized (one partition may have achieved quorum)";
