@@ -7087,4 +7087,647 @@ mod tests {
             );
         }
     }
+
+    // ==================================================================================
+    // Synchronous Block Validation Tests
+    // These tests verify that handle_block_proposal correctly validates blocks
+    // and returns ShouldNullify when validation fails.
+    // ==================================================================================
+
+    /// Helper struct to hold test setup with genesis accounts for validation tests
+    struct TestSetupWithGenesis {
+        peer_set: PeerSet,
+        peer_id_to_secret_key: HashMap<PeerId, BlsSecretKey>,
+        genesis_sk: TxSecretKey,
+        genesis_addr: Address,
+    }
+
+    /// Creates a test setup with a funded genesis account for validation tests
+    fn create_test_setup_with_genesis(size: usize) -> TestSetupWithGenesis {
+        let mut rng = thread_rng();
+        let mut public_keys = vec![];
+        let mut peer_id_to_secret_key = HashMap::new();
+
+        for _ in 0..size {
+            let sk = BlsSecretKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let peer_id = pk.to_peer_id();
+            peer_id_to_secret_key.insert(peer_id, sk);
+            public_keys.push(pk);
+        }
+
+        // Create genesis account keypair
+        let genesis_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let genesis_addr = Address::from_public_key(&genesis_sk.public_key());
+
+        TestSetupWithGenesis {
+            peer_set: PeerSet::new(public_keys),
+            peer_id_to_secret_key,
+            genesis_sk,
+            genesis_addr,
+        }
+    }
+
+    /// Creates a test manager with funded genesis accounts for validation tests
+    fn create_test_manager_with_genesis<const N: usize, const F: usize, const M_SIZE: usize>(
+        setup: &TestSetupWithGenesis,
+        replica_index: usize,
+        genesis_balance: u64,
+    ) -> (ViewProgressManager<N, F, M_SIZE>, String) {
+        let replica_id = setup.peer_set.sorted_peer_ids[replica_index];
+
+        let peer_strs: Vec<String> = setup
+            .peer_set
+            .sorted_peer_ids
+            .iter()
+            .map(|pid| {
+                let pk = setup.peer_set.id_to_public_key.get(pid).unwrap();
+                let mut buf = Vec::new();
+                pk.0.serialize_compressed(&mut buf).unwrap();
+                hex::encode(buf)
+            })
+            .collect();
+
+        let genesis_accounts = vec![GenesisAccount {
+            public_key: hex::encode(setup.genesis_sk.public_key().to_bytes()),
+            balance: genesis_balance,
+        }];
+
+        let config = create_test_config_with_genesis(N, F, peer_strs, genesis_accounts);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let leader_manager = Box::new(RoundRobinLeaderManager::new(
+            N,
+            setup.peer_set.sorted_peer_ids.clone(),
+        ));
+
+        let path = temp_db_path("view_manager_validation");
+        let persistence_storage = Arc::new(ConsensusStore::open(&path).unwrap());
+        let (persistence_writer, _persistence_reader) =
+            PendingStateWriter::new(persistence_storage.clone(), 0);
+
+        (
+            ViewProgressManager::new(
+                config,
+                replica_id,
+                leader_manager,
+                persistence_writer,
+                logger,
+            )
+            .unwrap(),
+            path,
+        )
+    }
+
+    /// Creates a block with custom transactions for testing validation
+    fn create_test_block_with_txs(
+        view: u64,
+        leader: PeerId,
+        parent_hash: [u8; blake3::OUT_LEN],
+        leader_sk: BlsSecretKey,
+        height: u64,
+        transactions: Vec<Arc<Transaction>>,
+    ) -> Block {
+        let temp_block = Block::new(
+            view,
+            leader,
+            parent_hash,
+            transactions.clone(),
+            1234567890,
+            leader_sk.sign(b"temp"),
+            false,
+            height,
+        );
+
+        let block_hash = temp_block.get_hash();
+
+        Block::new(
+            view,
+            leader,
+            parent_hash,
+            transactions,
+            1234567890,
+            leader_sk.sign(&block_hash),
+            false,
+            height,
+        )
+    }
+
+    #[test]
+    fn test_handle_block_proposal_invalid_signature_returns_should_nullify() {
+        // Scenario: Block contains a transaction with corrupted signature
+        // Expected: handle_block_proposal returns ShouldNullify
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        // Create a valid transaction but then corrupt its signature
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+        let mut tx = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            0,
+            1_000,
+            &setup.genesis_sk,
+        );
+        // Corrupt the signature
+        tx.signature.bytes[0] ^= 0xFF;
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(view, 1, "Should nullify view 1 due to invalid signature");
+            }
+            other => panic!(
+                "Expected ShouldNullify for block with invalid signature, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_unfunded_sender_returns_should_nullify() {
+        // Scenario: Block contains a transaction from an account that doesn't exist
+        // Expected: handle_block_proposal returns ShouldNullify due to AccountNotFound
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        // Create a transaction from an unfunded account
+        let unfunded_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let unfunded_addr = Address::from_public_key(&unfunded_sk.public_key());
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        let tx =
+            Transaction::new_transfer(unfunded_addr, recipient_addr, 1000, 0, 100, &unfunded_sk);
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(view, 1, "Should nullify view 1 due to unfunded sender");
+            }
+            other => panic!(
+                "Expected ShouldNullify for block with unfunded sender, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_invalid_nonce_returns_should_nullify() {
+        // Scenario: Block contains a transaction with wrong nonce (5 instead of 0)
+        // Expected: handle_block_proposal returns ShouldNullify due to InvalidNonce
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        // Create transaction with nonce 5 (should be 0)
+        let tx = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            5, // Wrong nonce - should be 0
+            1_000,
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(view, 1, "Should nullify view 1 due to invalid nonce");
+            }
+            other => panic!(
+                "Expected ShouldNullify for block with invalid nonce, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_insufficient_balance_returns_should_nullify() {
+        // Scenario: Block contains a transfer exceeding sender's balance
+        // Expected: handle_block_proposal returns ShouldNullify due to InsufficientBalance
+        let setup = create_test_setup_with_genesis(4);
+        // Fund genesis account with only 1000
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        // Try to transfer 10000 when only 1000 available (minus gas)
+        let tx = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            10_000, // Way more than available
+            0,
+            100, // Gas
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(view, 1, "Should nullify view 1 due to insufficient balance");
+            }
+            other => panic!(
+                "Expected ShouldNullify for block with insufficient balance, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_valid_tx_stores_state_diff() {
+        // Scenario: Valid block with valid transaction is proposed
+        // Expected: Block is accepted (ShouldVote) and StateDiff is stored in ViewContext
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        // Create a valid transfer transaction
+        let tx = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            1000,
+            0, // Correct nonce
+            100,
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldVote { view, block_hash } => {
+                assert_eq!(view, 1, "Should vote for view 1");
+                assert_ne!(
+                    block_hash,
+                    [0u8; blake3::OUT_LEN],
+                    "Block hash should be set"
+                );
+
+                // Verify StateDiff was stored in ViewContext
+                let ctx = manager.view_chain.find_view_context(1).unwrap();
+                assert!(
+                    ctx.state_diff.is_some(),
+                    "StateDiff should be stored in ViewContext"
+                );
+
+                let state_diff = ctx.state_diff.as_ref().unwrap();
+                // Should have updates for sender (nonce, balance changes)
+                // and possibly created_accounts for implicit recipient creation
+                assert!(
+                    !state_diff.updates.is_empty() || !state_diff.created_accounts.is_empty(),
+                    "StateDiff should contain state changes"
+                );
+            }
+            other => panic!("Expected ShouldVote for valid block, got {:?}", other),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_state_diff_reflects_transfer_changes() {
+        // Scenario: Valid transfer block - verify StateDiff accurately reflects balance changes
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        let transfer_amount = 5000u64;
+        let gas = 100u64;
+
+        let tx = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            transfer_amount,
+            0,
+            gas,
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        if let ViewProgressEvent::ShouldVote {
+            view: _,
+            block_hash: _,
+        } = result.unwrap()
+        {
+            let ctx = manager.view_chain.find_view_context(1).unwrap();
+            let state_diff = ctx.state_diff.as_ref().unwrap();
+
+            // Check sender update: balance decreased, nonce increased
+            if let Some(sender_update) = state_diff.updates.get(&setup.genesis_addr) {
+                assert_eq!(sender_update.new_nonce, 1, "Sender nonce should be 1");
+                // balance_delta should be negative (amount + gas deducted)
+                let expected_delta = -((transfer_amount + gas) as i128);
+                assert_eq!(
+                    sender_update.balance_delta, expected_delta,
+                    "Sender balance_delta should reflect transfer and gas"
+                );
+            }
+
+            // Check recipient was created with correct balance
+            let recipient_account = state_diff
+                .created_accounts
+                .iter()
+                .find(|acc| acc.address == recipient_addr);
+            if let Some(acc) = recipient_account {
+                assert_eq!(
+                    acc.initial_balance, transfer_amount,
+                    "Recipient should receive transfer amount"
+                );
+            }
+        } else {
+            panic!("Expected ShouldVote event");
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_multiple_invalid_txs_returns_should_nullify() {
+        // Scenario: Block with multiple invalid transactions
+        // Expected: handle_block_proposal returns ShouldNullify
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        // Create two transactions from unfunded accounts
+        let unfunded1_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let unfunded1_addr = Address::from_public_key(&unfunded1_sk.public_key());
+        let unfunded2_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let unfunded2_addr = Address::from_public_key(&unfunded2_sk.public_key());
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        let tx1 =
+            Transaction::new_transfer(unfunded1_addr, recipient_addr, 100, 0, 10, &unfunded1_sk);
+        let tx2 =
+            Transaction::new_transfer(unfunded2_addr, recipient_addr, 200, 0, 10, &unfunded2_sk);
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx1), Arc::new(tx2)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(view, 1, "Should nullify view 1 due to invalid transactions");
+            }
+            other => panic!(
+                "Expected ShouldNullify for block with invalid transactions, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_first_valid_second_invalid_returns_should_nullify() {
+        // Scenario: Block with first tx valid, second tx invalid (bad nonce)
+        // Expected: handle_block_proposal returns ShouldNullify
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        // First tx: valid (nonce 0)
+        let tx1 = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            0,
+            100,
+            &setup.genesis_sk,
+        );
+
+        // Second tx: invalid nonce (should be 1, using 5)
+        let tx2 = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            5, // Wrong nonce
+            100,
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx1), Arc::new(tx2)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldNullify { view } => {
+                assert_eq!(
+                    view, 1,
+                    "Should nullify due to second tx having invalid nonce"
+                );
+            }
+            other => panic!(
+                "Expected ShouldNullify when second tx has invalid nonce, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_handle_block_proposal_sequential_valid_txs_succeeds() {
+        // Scenario: Block with multiple valid transactions from same sender (sequential nonces)
+        // Expected: handle_block_proposal returns ShouldVote
+        let setup = create_test_setup_with_genesis(4);
+        let (mut manager, path): (ViewProgressManager<4, 1, 3>, String) =
+            create_test_manager_with_genesis(&setup, 2, 1_000_000);
+
+        let leader_id = setup.peer_set.sorted_peer_ids[1];
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+
+        let recipient_sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_addr = Address::from_public_key(&recipient_sk.public_key());
+
+        // Three transactions with sequential nonces (0, 1, 2)
+        let tx1 = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            0,
+            100,
+            &setup.genesis_sk,
+        );
+        let tx2 = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            1,
+            100,
+            &setup.genesis_sk,
+        );
+        let tx3 = Transaction::new_transfer(
+            setup.genesis_addr,
+            recipient_addr,
+            100,
+            2,
+            100,
+            &setup.genesis_sk,
+        );
+
+        let block = create_test_block_with_txs(
+            1,
+            leader_id,
+            Block::genesis_hash(),
+            leader_sk.clone(),
+            1,
+            vec![Arc::new(tx1), Arc::new(tx2), Arc::new(tx3)],
+        );
+
+        let result = manager.handle_block_proposal(block);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ViewProgressEvent::ShouldVote { view, .. } => {
+                assert_eq!(view, 1, "Should vote for valid block with sequential txs");
+
+                // Verify StateDiff reflects all three transactions
+                let ctx = manager.view_chain.find_view_context(1).unwrap();
+                let state_diff = ctx.state_diff.as_ref().unwrap();
+
+                if let Some(sender_update) = state_diff.updates.get(&setup.genesis_addr) {
+                    assert_eq!(sender_update.new_nonce, 3, "Nonce should be 3 after 3 txs");
+                }
+            }
+            other => panic!(
+                "Expected ShouldVote for valid block with sequential txs, got {:?}",
+                other
+            ),
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

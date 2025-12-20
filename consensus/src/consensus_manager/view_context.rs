@@ -4798,4 +4798,218 @@ mod tests {
             "state_diff should persist after adding votes"
         );
     }
+
+    // ==================================================================================
+    // State Diff Accessor Method Tests
+    // These tests verify the set_state_diff, get_state_diff, and take_state_diff methods
+    // ==================================================================================
+
+    #[test]
+    fn test_set_state_diff_stores_diff_correctly() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // Initially None
+        assert!(
+            ctx.state_diff.is_none(),
+            "state_diff should be None initially"
+        );
+
+        // Create and set a diff
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let mut diff = crate::validation::types::StateDiff::new();
+        diff.add_created_account(addr, 5000);
+        let diff_arc = Arc::new(diff);
+
+        ctx.set_state_diff(Arc::clone(&diff_arc));
+
+        // Verify it's set
+        assert!(
+            ctx.state_diff.is_some(),
+            "state_diff should be set after set_state_diff"
+        );
+
+        // Verify Arc reference counting
+        assert_eq!(
+            Arc::strong_count(&diff_arc),
+            2,
+            "Arc should have 2 strong references"
+        );
+    }
+
+    #[test]
+    fn test_get_state_diff_returns_reference() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // get_state_diff on empty returns None
+        assert!(
+            ctx.get_state_diff().is_none(),
+            "get_state_diff should return None when not set"
+        );
+
+        // Set a diff
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let mut diff = crate::validation::types::StateDiff::new();
+        diff.add_created_account(addr, 7500);
+
+        ctx.set_state_diff(Arc::new(diff));
+
+        // get_state_diff returns a reference
+        let retrieved = ctx.get_state_diff();
+        assert!(
+            retrieved.is_some(),
+            "get_state_diff should return Some after set"
+        );
+
+        let retrieved_diff = retrieved.unwrap();
+        let found_account = retrieved_diff
+            .created_accounts
+            .iter()
+            .find(|acc| acc.address == addr);
+        assert!(
+            found_account.is_some(),
+            "Retrieved diff should contain the created account"
+        );
+        assert_eq!(
+            found_account.unwrap().initial_balance,
+            7500,
+            "Retrieved diff should have correct balance"
+        );
+
+        // state_diff should still be set after get (not consumed)
+        assert!(
+            ctx.state_diff.is_some(),
+            "state_diff should still be set after get"
+        );
+    }
+
+    #[test]
+    fn test_take_state_diff_removes_and_returns() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // take_state_diff on empty returns None
+        assert!(
+            ctx.take_state_diff().is_none(),
+            "take_state_diff should return None when not set"
+        );
+
+        // Set a diff
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+        let mut diff = crate::validation::types::StateDiff::new();
+        diff.add_created_account(addr, 9999);
+
+        ctx.set_state_diff(Arc::new(diff));
+        assert!(ctx.state_diff.is_some(), "Precondition: diff should be set");
+
+        // take_state_diff removes and returns
+        let taken = ctx.take_state_diff();
+        assert!(taken.is_some(), "take_state_diff should return Some");
+
+        let taken_diff = taken.unwrap();
+        let found_account = taken_diff
+            .created_accounts
+            .iter()
+            .find(|acc| acc.address == addr);
+        assert!(
+            found_account.is_some(),
+            "Taken diff should contain the created account"
+        );
+        assert_eq!(
+            found_account.unwrap().initial_balance,
+            9999,
+            "Taken diff should have correct balance"
+        );
+
+        // state_diff should now be None
+        assert!(
+            ctx.state_diff.is_none(),
+            "state_diff should be None after take"
+        );
+        assert!(
+            ctx.get_state_diff().is_none(),
+            "get_state_diff should return None after take"
+        );
+    }
+
+    #[test]
+    fn test_take_state_diff_called_twice_returns_none_second_time() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // Set a diff
+        let diff = crate::validation::types::StateDiff::new();
+        ctx.set_state_diff(Arc::new(diff));
+
+        // First take succeeds
+        let first_take = ctx.take_state_diff();
+        assert!(first_take.is_some(), "First take should succeed");
+
+        // Second take returns None
+        let second_take = ctx.take_state_diff();
+        assert!(second_take.is_none(), "Second take should return None");
+    }
+
+    #[test]
+    fn test_set_state_diff_overwrites_existing() {
+        let leader_id = 12345u64;
+        let replica_id = 67890u64;
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let mut ctx: ViewContext<5, 1, 3> = ViewContext::new(1, leader_id, replica_id, parent_hash);
+
+        // Set first diff
+        let sk1 = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr1 = Address::from_public_key(&sk1.public_key());
+        let mut diff1 = crate::validation::types::StateDiff::new();
+        diff1.add_created_account(addr1, 1000);
+        ctx.set_state_diff(Arc::new(diff1));
+
+        // Set second diff (should overwrite)
+        let sk2 = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr2 = Address::from_public_key(&sk2.public_key());
+        let mut diff2 = crate::validation::types::StateDiff::new();
+        diff2.add_created_account(addr2, 2000);
+        ctx.set_state_diff(Arc::new(diff2));
+
+        // Retrieved diff should be the second one
+        let retrieved = ctx.get_state_diff().unwrap();
+        let found_addr1 = retrieved
+            .created_accounts
+            .iter()
+            .find(|acc| acc.address == addr1);
+        let found_addr2 = retrieved
+            .created_accounts
+            .iter()
+            .find(|acc| acc.address == addr2);
+        assert!(
+            found_addr1.is_none(),
+            "First diff's address should not be present"
+        );
+        assert!(
+            found_addr2.is_some(),
+            "Second diff's address should be present"
+        );
+        assert_eq!(
+            found_addr2.unwrap().initial_balance,
+            2000,
+            "Second diff's balance should be correct"
+        );
+    }
 }

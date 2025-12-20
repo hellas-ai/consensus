@@ -5814,4 +5814,97 @@ mod tests {
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
+
+    // ==================================================================================
+    // Block Proposal State Diff Tests
+    // These tests verify that StateDiff is correctly stored when blocks are added.
+    // ==================================================================================
+
+    #[test]
+    fn test_add_block_proposal_with_immediate_parent_notarization_stores_state_diff() {
+        // Scenario: Block is added when parent already has M-notarization
+        // Expected: Block is processed immediately (not pending) and state_diff is stored
+        let setup = TestSetupWithReader::new(N);
+        let leader_id = setup.leader_id(0);
+        let replica_id = setup.replica_id(1);
+        let parent_hash = [0u8; blake3::OUT_LEN];
+
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let addr = Address::from_public_key(&sk.public_key());
+
+        // Create view 1 with block AND M-notarization
+        let mut ctx_v1 = create_view_context_with_votes(
+            1,
+            leader_id,
+            replica_id,
+            parent_hash,
+            M_SIZE,
+            &setup.peer_set,
+            &setup.peer_id_to_secret_key,
+        );
+        let block_v1 = ctx_v1.block.as_ref().unwrap().clone();
+        let block_hash_v1 = block_v1.get_hash();
+
+        let votes_v1: HashSet<Vote> = (0..M_SIZE)
+            .map(|i| {
+                create_vote(
+                    i,
+                    1,
+                    block_hash_v1,
+                    leader_id,
+                    &setup.peer_set,
+                    &setup.peer_id_to_secret_key,
+                )
+            })
+            .collect();
+        let m_not_v1 = create_m_notarization(&votes_v1, 1, block_hash_v1, leader_id);
+        ctx_v1
+            .add_m_notarization(m_not_v1, &setup.peer_set)
+            .unwrap();
+
+        let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
+
+        // Progress to view 2
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
+        view_chain.progress_with_m_notarization(ctx_v2).unwrap();
+
+        // Add block for view 2 - parent V1 already has M-notarization, so NOT pending
+        let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
+        let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
+        let state_diff_v2 = Arc::new(create_state_diff_for_address(addr, 3000));
+
+        let result =
+            view_chain.add_block_proposal(2, block_v2, state_diff_v2.clone(), &setup.peer_set);
+        assert!(result.is_ok());
+
+        let proposal_result = result.unwrap();
+        assert!(
+            !proposal_result.should_await,
+            "Block should NOT await - parent already M-notarized"
+        );
+
+        // Verify state_diff is stored in view 2's context
+        let ctx = view_chain.find_view_context(2).unwrap();
+        assert!(
+            ctx.state_diff.is_some(),
+            "state_diff should be stored even for immediately processed blocks"
+        );
+
+        let stored_diff = ctx.state_diff.as_ref().unwrap();
+        let found_account = stored_diff
+            .created_accounts
+            .iter()
+            .find(|acc| acc.address == addr);
+        assert!(
+            found_account.is_some(),
+            "state_diff should contain the created account"
+        );
+        assert_eq!(
+            found_account.unwrap().initial_balance,
+            3000,
+            "state_diff should have correct balance"
+        );
+
+        std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
+    }
 }
