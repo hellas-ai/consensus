@@ -4,3 +4,30 @@ name    = "p2p"
 version = "0.1.0"
 
 [dependencies]
+anyhow                  = { workspace = true }
+ark-bls12-381           = { workspace = true, features = [ "curve" ] }
+ark-ec                  = { workspace = true }
+ark-serialize           = { workspace = true }
+blake3                  = { workspace = true }
+bytes                   = { workspace = true }
+commonware-codec        = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-p2p          = { workspace = true }
+commonware-runtime      = { workspace = true }
+commonware-utils        = { workspace = true }
+consensus               = { workspace = true }
+figment                 = { workspace = true, features = [ "toml" ] }
+futures                 = { workspace = true }
+governor                = { workspace = true }
+hex                     = { workspace = true }
+rand                    = { workspace = true }
+rkyv                    = { workspace = true }
+rtrb                    = { workspace = true }
+serde                   = { workspace = true, features = [ "derive" ] }
+slog                    = { workspace = true }
+thiserror               = { workspace = true }
+tokio                   = { workspace = true }
+
+[dev-dependencies]
+rand     = { workspace = true }
+tempfile = { workspace = true }
