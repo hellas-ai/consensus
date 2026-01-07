@@ -266,6 +266,9 @@ pub struct ConsensusStateMachine<const N: usize, const F: usize, const M_SIZE: u
     /// This is used to signal to the state machine that it should shutdown gracefully.
     shutdown_signal: Arc<AtomicBool>,
 
+    /// Notify to wake up the P2P service when broadcast queue has data.
+    broadcast_notify: Arc<tokio::sync::Notify>,
+
     /// Logger for logging events
     logger: slog::Logger,
 }
@@ -282,6 +285,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         finalized_producer: Producer<FinalizedNotification>,
         tick_interval: Duration,
         shutdown_signal: Arc<AtomicBool>,
+        broadcast_notify: Arc<tokio::sync::Notify>,
         logger: slog::Logger,
     ) -> Result<Self> {
         Ok(Self {
@@ -295,6 +299,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             finalized_producer,
             tick_interval,
             shutdown_signal,
+            broadcast_notify,
             logger,
         })
     }
@@ -929,6 +934,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         for attempt in 0..MAX_BROADCAST_ATTEMPTS {
             match self.broadcast_producer.push(message.clone()) {
                 Ok(_) => {
+                    self.broadcast_notify.notify_one();
                     return Ok(());
                 }
                 Err(rtrb::PushError::Full(_)) => {
@@ -1015,6 +1021,7 @@ pub struct ConsensusStateMachineBuilder<const N: usize, const F: usize, const M_
     logger: Option<slog::Logger>,
     message_consumer: Option<Consumer<ConsensusMessage<N, F, M_SIZE>>>,
     broadcast_producer: Option<Producer<ConsensusMessage<N, F, M_SIZE>>>,
+    broadcast_notify: Option<Arc<tokio::sync::Notify>>,
     proposal_req_producer: Option<Producer<ProposalRequest>>,
     proposal_resp_consumer: Option<Consumer<ProposalResponse>>,
     finalized_producer: Option<Producer<FinalizedNotification>>,
@@ -1040,6 +1047,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
             logger: None,
             message_consumer: None,
             broadcast_producer: None,
+            broadcast_notify: None,
             proposal_req_producer: None,
             proposal_resp_consumer: None,
             finalized_producer: None,
@@ -1087,6 +1095,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
         self
     }
 
+    pub fn with_broadcast_notify(mut self, broadcast_notify: Arc<tokio::sync::Notify>) -> Self {
+        self.broadcast_notify = Some(broadcast_notify);
+        self
+    }
+
     pub fn with_proposal_req_producer(
         mut self,
         proposal_req_producer: Producer<ProposalRequest>,
@@ -1131,6 +1144,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize>
                 .ok_or_else(|| anyhow::anyhow!("Tick interval not set"))?,
             self.shutdown_signal
                 .ok_or_else(|| anyhow::anyhow!("Shutdown signal not set"))?,
+            self.broadcast_notify
+                .ok_or_else(|| anyhow::anyhow!("Broadcast notify not set"))?,
             self.logger
                 .ok_or_else(|| anyhow::anyhow!("Logger not set"))?,
         )
@@ -1322,6 +1337,7 @@ mod tests {
                 finalized_prod,
                 Duration::from_millis(100),
                 shutdown,
+                Arc::new(tokio::sync::Notify::new()),
                 logger,
             )
             .unwrap();

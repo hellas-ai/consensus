@@ -26,15 +26,19 @@ pub struct P2PHandle {
     pub thread_handle: JoinHandle<()>,
     /// Shutdown signal.
     pub shutdown: Arc<AtomicBool>,
+    /// Notify to wake up the service when shutdown is requested.
+    /// This ensures the service exits immediately rather than waiting for a recv timeout.
+    pub shutdown_notify: Arc<Notify>,
     /// Notify to wake up the service when broadcast queue has data.
     /// Producer should call `broadcast_notify.notify_one()` after pushing.
     pub broadcast_notify: Arc<Notify>,
 }
 
 impl P2PHandle {
-    /// Signal the P2P thread to shutdown.
+    /// Signal the P2P thread to shutdown and wake it immediately.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown_notify.notify_one();
     }
 
     /// Wait for the P2P thread to finish.
@@ -60,6 +64,8 @@ where
 {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_clone = Arc::clone(&shutdown_notify);
     let broadcast_notify = Arc::new(Notify::new());
     let broadcast_notify_clone = Arc::clone(&broadcast_notify);
 
@@ -76,6 +82,7 @@ where
                     tx_producer,
                     broadcast_consumer,
                     shutdown_clone,
+                    shutdown_notify_clone,
                     broadcast_notify_clone,
                     logger,
                 )
@@ -87,11 +94,13 @@ where
     P2PHandle {
         thread_handle,
         shutdown,
+        shutdown_notify,
         broadcast_notify,
     }
 }
 
 /// Run the P2P service main loop.
+#[allow(clippy::too_many_arguments)]
 async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>(
     context: C,
     config: P2PConfig,
@@ -100,6 +109,7 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     mut tx_producer: Producer<Transaction>,
     mut broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
     broadcast_notify: Arc<Notify>,
     logger: Logger,
 ) where
@@ -116,7 +126,13 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
         tokio::select! {
             biased;
 
-            // 1. Incoming Consensus Messages (highest priority)
+            // 0. Shutdown notification (highest priority)
+            _ = shutdown_notify.notified() => {
+                slog::info!(logger, "Received shutdown signal");
+                break;
+            }
+
+            // 1. Incoming Consensus Messages
             res = receivers.consensus.recv() => {
                 match res {
                     Ok((sender, msg)) => {
@@ -178,7 +194,9 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
         }
     }
 
-    slog::info!(logger, "P2P service shutting down");
+    // Graceful shutdown: stop network
+    network.shutdown();
+    slog::info!(logger, "P2P service shut down");
 }
 
 /// Route an incoming network message to the appropriate channel.

@@ -87,12 +87,13 @@ impl P2PConfig {
     /// ```ignore
     /// let config = P2PConfig::from_file("config/p2p.toml")?;
     /// ```
-    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, figment::Error> {
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Box<figment::Error>> {
         use figment::providers::{Env, Format, Toml};
         Figment::new()
             .merge(Toml::file(path))
             .merge(Env::prefixed("HELLAS_VALIDATOR_P2P_"))
             .extract()
+            .map_err(Box::new)
     }
 
     /// Load configuration with defaults, then merge from file, then env.
@@ -100,13 +101,14 @@ impl P2PConfig {
     /// Priority (highest to lowest): Env > TOML file > Defaults
     pub fn from_file_with_defaults<P: AsRef<std::path::Path>>(
         path: P,
-    ) -> Result<Self, figment::Error> {
+    ) -> Result<Self, Box<figment::Error>> {
         use figment::providers::{Env, Format, Serialized, Toml};
         Figment::new()
             .merge(Serialized::defaults(Self::default()))
             .merge(Toml::file(path))
             .merge(Env::prefixed("P2P_"))
             .extract()
+            .map_err(Box::new)
     }
 }
 

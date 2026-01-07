@@ -206,4 +206,197 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
     pub fn public_key(&self) -> ed25519::PublicKey {
         self.public_key.clone()
     }
+
+    /// Gracefully shutdown the network service.
+    ///
+    /// This aborts the background network task and releases resources.
+    pub fn shutdown(&mut self) {
+        if let Some(handle) = self.network_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that build_recipients returns All when no recipients specified
+    #[test]
+    fn test_build_recipients_empty_returns_all() {
+        let recipients: Vec<ed25519::PublicKey> = vec![];
+        let result = NetworkService::<commonware_runtime::deterministic::Context>::build_recipients(
+            recipients,
+        );
+        assert!(matches!(result, Recipients::All));
+    }
+
+    /// Test that build_recipients returns Some when recipients are specified
+    #[test]
+    fn test_build_recipients_with_keys_returns_some() {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let pk = signer.public_key();
+        let recipients = vec![pk.clone()];
+
+        let result = NetworkService::<commonware_runtime::deterministic::Context>::build_recipients(
+            recipients,
+        );
+
+        match result {
+            Recipients::Some(keys) => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], pk);
+            }
+            Recipients::All | Recipients::One(_) => panic!("Expected Recipients::Some"),
+        }
+    }
+
+    /// Test that build_recipients preserves multiple recipients
+    #[test]
+    fn test_build_recipients_multiple_keys() {
+        let signer1 = ed25519::PrivateKey::from_seed(1);
+        let signer2 = ed25519::PrivateKey::from_seed(2);
+        let signer3 = ed25519::PrivateKey::from_seed(3);
+
+        let recipients = vec![
+            signer1.public_key(),
+            signer2.public_key(),
+            signer3.public_key(),
+        ];
+
+        let result = NetworkService::<commonware_runtime::deterministic::Context>::build_recipients(
+            recipients.clone(),
+        );
+
+        match result {
+            Recipients::Some(keys) => {
+                assert_eq!(keys.len(), 3);
+                assert_eq!(keys, recipients);
+            }
+            Recipients::All | Recipients::One(_) => panic!("Expected Recipients::Some"),
+        }
+    }
+
+    /// Test constants are sensible values
+    #[test]
+    fn test_default_quotas_are_positive() {
+        assert!(DEFAULT_CONSENSUS_QUOTA_PER_SECOND > 0);
+        assert!(DEFAULT_TX_QUOTA_PER_SECOND > 0);
+        assert!(DEFAULT_SYNC_QUOTA_PER_SECOND > 0);
+    }
+
+    /// Test consensus has higher quota than sync (priority ordering)
+    #[test]
+    fn test_quota_priority_ordering() {
+        // Transactions should have highest throughput
+        assert!(DEFAULT_TX_QUOTA_PER_SECOND > DEFAULT_CONSENSUS_QUOTA_PER_SECOND);
+        // Consensus should have higher priority than sync
+        assert!(DEFAULT_CONSENSUS_QUOTA_PER_SECOND > DEFAULT_SYNC_QUOTA_PER_SECOND);
+    }
+
+    /// Test backlog sizes are properly sized
+    #[test]
+    fn test_backlog_sizes() {
+        // Transaction backlog should be largest (highest volume)
+        assert!(DEFAULT_TX_BACKLOG > DEFAULT_CONSENSUS_BACKLOG);
+        // Consensus backlog larger than sync
+        assert!(DEFAULT_CONSENSUS_BACKLOG > DEFAULT_SYNC_BACKLOG);
+    }
+
+    /// Test P2PConfig validator parsing
+    #[test]
+    fn test_validator_public_key_parsing() {
+        use crate::config::ValidatorPeerInfo;
+        use consensus::crypto::aggregated::PeerId;
+
+        // Valid hex public key (32 bytes = 64 hex chars)
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let pk = signer.public_key();
+        let pk_hex = hex::encode(pk.as_ref());
+
+        let validator = ValidatorPeerInfo {
+            ed25519_public_key: pk_hex.clone(),
+            address: Some("127.0.0.1:8080".parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        };
+
+        let bytes = validator.parse_public_key_bytes();
+        assert!(bytes.is_some());
+        assert_eq!(bytes.unwrap().len(), 32);
+    }
+
+    /// Test invalid hex parsing returns None
+    #[test]
+    fn test_invalid_public_key_parsing() {
+        use crate::config::ValidatorPeerInfo;
+        use consensus::crypto::aggregated::PeerId;
+
+        let validator = ValidatorPeerInfo {
+            ed25519_public_key: "not_valid_hex".to_string(),
+            address: None,
+            bls_peer_id: PeerId::default(),
+        };
+
+        let bytes = validator.parse_public_key_bytes();
+        assert!(bytes.is_none());
+    }
+
+    /// Test validator without address is filtered out during bootstrapper creation
+    #[test]
+    fn test_bootstrapper_requires_address() {
+        use crate::config::ValidatorPeerInfo;
+        use consensus::crypto::aggregated::PeerId;
+
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let pk = signer.public_key();
+        let pk_hex = hex::encode(pk.as_ref());
+
+        // Validator without address
+        let validator = ValidatorPeerInfo {
+            ed25519_public_key: pk_hex,
+            address: None, // No address!
+            bls_peer_id: PeerId::default(),
+        };
+
+        // Simulating the filter_map logic from NetworkService::new
+        let result: Option<(ed25519::PublicKey, Ingress)> = (|| {
+            let pk_bytes = validator.parse_public_key_bytes()?;
+            let public_key = ed25519::PublicKey::read(&mut pk_bytes.as_slice()).ok()?;
+            let addr = validator.address?; // This will be None
+            Some((public_key, Ingress::Socket(addr)))
+        })();
+
+        assert!(result.is_none());
+    }
+
+    /// Test valid validator creates bootstrapper entry
+    #[test]
+    fn test_valid_validator_creates_bootstrapper() {
+        use crate::config::ValidatorPeerInfo;
+        use consensus::crypto::aggregated::PeerId;
+
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let pk = signer.public_key();
+        let pk_hex = hex::encode(pk.as_ref());
+        let addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let validator = ValidatorPeerInfo {
+            ed25519_public_key: pk_hex,
+            address: Some(addr),
+            bls_peer_id: PeerId::default(),
+        };
+
+        // Simulating the filter_map logic from NetworkService::new
+        let result: Option<(ed25519::PublicKey, Ingress)> = (|| {
+            let pk_bytes = validator.parse_public_key_bytes()?;
+            let public_key = ed25519::PublicKey::read(&mut pk_bytes.as_slice()).ok()?;
+            let addr = validator.address?;
+            Some((public_key, Ingress::Socket(addr)))
+        })();
+
+        assert!(result.is_some());
+        let (parsed_pk, ingress) = result.unwrap();
+        assert_eq!(parsed_pk, pk);
+        assert!(matches!(ingress, Ingress::Socket(a) if a == addr));
+    }
 }

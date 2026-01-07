@@ -9,7 +9,6 @@ pub mod message;
 pub mod network;
 pub mod peer;
 pub mod protocols;
-pub mod runtime;
 pub mod service;
 
 pub use config::P2PConfig;
