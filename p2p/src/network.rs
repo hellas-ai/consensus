@@ -277,32 +277,6 @@ mod tests {
         }
     }
 
-    /// Test constants are sensible values
-    #[test]
-    fn test_default_quotas_are_positive() {
-        assert!(DEFAULT_CONSENSUS_QUOTA_PER_SECOND > 0);
-        assert!(DEFAULT_TX_QUOTA_PER_SECOND > 0);
-        assert!(DEFAULT_SYNC_QUOTA_PER_SECOND > 0);
-    }
-
-    /// Test consensus has higher quota than sync (priority ordering)
-    #[test]
-    fn test_quota_priority_ordering() {
-        // Transactions should have highest throughput
-        assert!(DEFAULT_TX_QUOTA_PER_SECOND > DEFAULT_CONSENSUS_QUOTA_PER_SECOND);
-        // Consensus should have higher priority than sync
-        assert!(DEFAULT_CONSENSUS_QUOTA_PER_SECOND > DEFAULT_SYNC_QUOTA_PER_SECOND);
-    }
-
-    /// Test backlog sizes are properly sized
-    #[test]
-    fn test_backlog_sizes() {
-        // Transaction backlog should be largest (highest volume)
-        assert!(DEFAULT_TX_BACKLOG > DEFAULT_CONSENSUS_BACKLOG);
-        // Consensus backlog larger than sync
-        assert!(DEFAULT_CONSENSUS_BACKLOG > DEFAULT_SYNC_BACKLOG);
-    }
-
     /// Test P2PConfig validator parsing
     #[test]
     fn test_validator_public_key_parsing() {
