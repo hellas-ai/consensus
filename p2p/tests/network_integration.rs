@@ -33,10 +33,6 @@ fn create_test_logger() -> slog::Logger {
     slog::Logger::root(slog::Discard, slog::o!())
 }
 
-// =============================================================================
-// Service Creation Tests
-// =============================================================================
-
 /// Test NetworkService creation and verify all components initialized.
 #[test]
 fn test_network_service_creation_with_receivers() {
@@ -127,10 +123,6 @@ fn test_different_seeds_produce_different_keys() {
     });
 }
 
-// =============================================================================
-// Shutdown Tests
-// =============================================================================
-
 /// Test shutdown is idempotent - can be called multiple times.
 #[test]
 fn test_shutdown_idempotent() {
@@ -151,10 +143,6 @@ fn test_shutdown_idempotent() {
         network.shutdown();
     });
 }
-
-// =============================================================================
-// Validator/Bootstrapper Parsing Tests
-// =============================================================================
 
 /// Test that bootstrapper peer info is correctly parsed from config.
 #[test]
@@ -231,10 +219,6 @@ fn test_short_public_key_rejected() {
     assert!(validator.parse_public_key_bytes().is_none());
 }
 
-// =============================================================================
-// Message Serialization Tests
-// =============================================================================
-
 // Message serialization tests removed - Transaction requires complex construction.
 // Serialization is tested in p2p/src/message.rs unit tests.
 
@@ -246,10 +230,6 @@ fn test_channel_ids_are_distinct() {
     assert_ne!(channels::CONSENSUS, channels::BLOCK_SYNC);
     assert_ne!(channels::TRANSACTIONS, channels::BLOCK_SYNC);
 }
-
-// =============================================================================
-// Two-Node Communication Tests
-// =============================================================================
 
 /// Test two network nodes can be created on same runtime with different ports.
 /// This test verifies that:
@@ -425,10 +405,6 @@ fn test_mutual_bootstrappers() {
         network2.shutdown();
     });
 }
-
-// =============================================================================
-// Real Network I/O Tests (using tokio runtime)
-// =============================================================================
 
 /// Test actual message delivery between two nodes using real network I/O.
 /// This test uses the tokio-backed runtime which performs real TCP connections.
