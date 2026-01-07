@@ -19,6 +19,7 @@ use crate::{
 };
 
 use std::sync::{Arc, atomic::AtomicBool};
+use tokio::sync::Notify;
 
 use ark_serialize::CanonicalSerialize;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -81,6 +82,9 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Producer for outgoing consensus messages (consensus engine writes here)
     pub broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
 
+    /// Notify for signaling when new messages are available to broadcast
+    pub broadcast_notify: Arc<Notify>,
+
     /// Mempool service handle
     pub mempool_service: MempoolService,
 
@@ -120,6 +124,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
         let (message_producer, message_consumer) = RingBuffer::new(BUFFER_SIZE);
         let (broadcast_producer, broadcast_consumer) = RingBuffer::new(BUFFER_SIZE);
 
+        // Create broadcast notify for signaling new messages to broadcast
+        let broadcast_notify = Arc::new(Notify::new());
+
         // Create temporary directory and storage
         let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("consensus.redb");
@@ -144,6 +151,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             message_producer,
             broadcast_consumer,
             broadcast_producer,
+            broadcast_notify,
             mempool_service,
             proposal_req_producer: mempool_channels.proposal_req_producer,
             proposal_resp_consumer: mempool_channels.proposal_resp_consumer,

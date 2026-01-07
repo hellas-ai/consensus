@@ -36,7 +36,7 @@ const DEFAULT_SYNC_BACKLOG: usize = 1_28;
 /// Core network service managing the commonware discovery network.
 pub struct NetworkService<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> {
     /// Our ED25519 private key for identity.
-    signer: ed25519::PrivateKey,
+    _signer: ed25519::PrivateKey,
 
     /// Handle to the commonware network (for shutdown/metrics).
     /// Wrapped in Option because start() consumes the network builder.
@@ -135,7 +135,7 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
         slog::info!(logger, "P2P Network started"; "public_key" => ?public_key);
 
         let service = Self {
-            signer,
+            _signer: signer,
             network_handle: Some(network_handle),
             oracle,
             public_key,

@@ -235,6 +235,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         replica_id: PeerId,
         secret_key: BlsSecretKey,
         message_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
+        broadcast_notify: Arc<tokio::sync::Notify>,
         broadcast_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
         proposal_req_producer: Producer<ProposalRequest>,
         proposal_resp_consumer: Consumer<ProposalResponse>,
@@ -291,6 +292,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
             .with_finalized_producer(finalized_producer)
             .with_tick_interval(tick_interval)
             .with_shutdown_signal(shutdown_signal.clone())
+            .with_broadcast_notify(broadcast_notify)
             .with_logger(logger.clone())
             .build()
             .context("Failed to build ConsensusStateMachine")?;
@@ -483,6 +485,9 @@ mod tests {
         // Create logger
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
+        // Create broadcast notify for signaling new messages to broadcast
+        let broadcast_notify = Arc::new(tokio::sync::Notify::new());
+
         // Create message consumer
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
@@ -503,6 +508,7 @@ mod tests {
             replica_id,
             secret_key,
             message_consumer,
+            broadcast_notify,
             broadcast_producer,
             proposal_req_producer,
             proposal_resp_consumer,
@@ -553,6 +559,9 @@ mod tests {
             PendingStateWriter::new(Arc::new(storage), 0);
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
+        // Create broadcast notify for signaling new messages to broadcast
+        let broadcast_notify = Arc::new(tokio::sync::Notify::new());
+
         // Create message consumer
         let (_message_producer, message_consumer) = RingBuffer::new(1000);
         // Create broadcast producer
@@ -572,6 +581,7 @@ mod tests {
             replica_id,
             secret_key,
             message_consumer,
+            broadcast_notify,
             broadcast_producer,
             proposal_req_producer,
             proposal_resp_consumer,

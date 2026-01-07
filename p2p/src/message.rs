@@ -19,7 +19,7 @@ pub mod channels {
     pub const BLOCK_SYNC: Channel = 2;
 }
 
-// TODO: Do we want to add identity request/response ? For metadata sharing across nodes ? 
+// TODO: Do we want to add identity request/response ? For metadata sharing across nodes ?
 // This might be useful if we allow dynamic membership.
 
 /// Wire protocol message envelope.

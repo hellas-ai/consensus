@@ -479,7 +479,7 @@ mod tests {
         }
 
         // Drain all
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(std::time::Duration::from_millis(4));
 
         let mut received = 0;
         while consumer.pop().is_ok() {
