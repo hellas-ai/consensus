@@ -425,3 +425,410 @@ fn test_mutual_bootstrappers() {
         network2.shutdown();
     });
 }
+
+// =============================================================================
+// Real Network I/O Tests (using tokio runtime)
+// =============================================================================
+
+/// Test actual message delivery between two nodes using real network I/O.
+/// This test uses the tokio-backed runtime which performs real TCP connections.
+///
+/// NOTE: This test requires available ports and may be flaky if ports are in use.
+#[test]
+fn test_real_message_delivery_between_nodes() {
+    use commonware_p2p::Receiver;
+
+    // Use tokio runtime for real network I/O
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(2001);
+        let signer2 = ed25519::PrivateKey::from_seed(2002);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+
+        // Use high port numbers to avoid conflicts
+        let port1: u16 = 19100;
+        let port2: u16 = 19101;
+
+        // Set up mutual bootstrappers so nodes know about each other
+        let mut config1 = create_test_config(port1);
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config2 = create_test_config(port2);
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        // Create two network services
+        let (mut network1, _receivers1) =
+            NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
+
+        let (mut network2, mut receivers2) =
+            NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
+
+        // Give peers time to discover each other and establish connections
+        ctx.sleep(Duration::from_millis(1000)).await;
+
+        // Send message from node1 to node2
+        let test_msg = b"Hello from node 1 to node 2 - real network!".to_vec();
+        network1
+            .broadcast_consensus(test_msg.clone(), vec![pk2.clone()])
+            .await;
+
+        // Try to receive with timeout
+        let receive_result = tokio::select! {
+            biased;
+
+            result = receivers2.consensus.recv() => Some(result),
+
+            _ = ctx.sleep(Duration::from_secs(5)) => None,
+        };
+
+        // Verify message was received
+        match receive_result {
+            Some(Ok((sender_pk, msg_bytes))) => {
+                assert_eq!(sender_pk, pk1, "Sender should be node1");
+                assert_eq!(
+                    msg_bytes.as_ref(),
+                    test_msg.as_slice(),
+                    "Message content should match"
+                );
+                println!("✓ Real message successfully delivered from node1 to node2");
+            }
+            Some(Err(e)) => {
+                panic!("Receiver error: {:?}", e);
+            }
+            None => {
+                panic!("Timeout waiting for message - peers may not have connected");
+            }
+        }
+
+        // Cleanup
+        network1.shutdown();
+        network2.shutdown();
+    });
+}
+
+/// Test bidirectional message delivery - both nodes send and receive.
+#[test]
+fn test_bidirectional_message_delivery() {
+    use commonware_p2p::Receiver;
+
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(3001);
+        let signer2 = ed25519::PrivateKey::from_seed(3002);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+
+        let port1: u16 = 19200;
+        let port2: u16 = 19201;
+
+        let mut config1 = create_test_config(port1);
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config2 = create_test_config(port2);
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        let (mut network1, mut receivers1) =
+            NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
+        let (mut network2, mut receivers2) =
+            NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
+
+        ctx.sleep(Duration::from_millis(1000)).await;
+
+        // Send messages in both directions
+        let msg1_to_2 = b"Message from node1 to node2".to_vec();
+        let msg2_to_1 = b"Message from node2 to node1".to_vec();
+
+        network1
+            .broadcast_consensus(msg1_to_2.clone(), vec![pk2.clone()])
+            .await;
+        network2
+            .broadcast_consensus(msg2_to_1.clone(), vec![pk1.clone()])
+            .await;
+
+        // Receive both messages
+        let (result1, result2) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), receivers2.consensus.recv()),
+            tokio::time::timeout(Duration::from_secs(5), receivers1.consensus.recv()),
+        );
+
+        // Verify node2 received message from node1
+        match result1 {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk1);
+                assert_eq!(msg.as_ref(), msg1_to_2.as_slice());
+            }
+            _ => panic!("Node2 failed to receive message from node1"),
+        }
+
+        // Verify node1 received message from node2
+        match result2 {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk2);
+                assert_eq!(msg.as_ref(), msg2_to_1.as_slice());
+            }
+            _ => panic!("Node1 failed to receive message from node2"),
+        }
+
+        network1.shutdown();
+        network2.shutdown();
+    });
+}
+
+/// Test transaction channel message delivery.
+#[test]
+fn test_transaction_channel_delivery() {
+    use commonware_p2p::Receiver;
+
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(4001);
+        let signer2 = ed25519::PrivateKey::from_seed(4002);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+
+        let port1: u16 = 19300;
+        let port2: u16 = 19301;
+
+        let mut config1 = create_test_config(port1);
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config2 = create_test_config(port2);
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        let (mut network1, _receivers1) =
+            NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
+        let (mut network2, mut receivers2) =
+            NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
+
+        ctx.sleep(Duration::from_millis(1000)).await;
+
+        let tx_msg = b"Transaction data for gossip".to_vec();
+        network1
+            .broadcast_transaction(tx_msg.clone(), vec![pk2.clone()])
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), receivers2.tx.recv()).await;
+
+        match result {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk1);
+                assert_eq!(msg.as_ref(), tx_msg.as_slice());
+            }
+            _ => panic!("Failed to receive transaction message"),
+        }
+
+        network1.shutdown();
+        network2.shutdown();
+    });
+}
+
+/// Test sync channel message delivery.
+#[test]
+fn test_sync_channel_delivery() {
+    use commonware_p2p::Receiver;
+
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(5001);
+        let signer2 = ed25519::PrivateKey::from_seed(5002);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+
+        let port1: u16 = 19400;
+        let port2: u16 = 19401;
+
+        let mut config1 = create_test_config(port1);
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config2 = create_test_config(port2);
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        let (mut network1, _receivers1) =
+            NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
+        let (mut network2, mut receivers2) =
+            NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
+
+        ctx.sleep(Duration::from_millis(1000)).await;
+
+        let sync_msg = b"Block sync request/response data".to_vec();
+        network1
+            .send_sync(sync_msg.clone(), vec![pk2.clone()])
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), receivers2.sync.recv()).await;
+
+        match result {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk1);
+                assert_eq!(msg.as_ref(), sync_msg.as_slice());
+            }
+            _ => panic!("Failed to receive sync message"),
+        }
+
+        network1.shutdown();
+        network2.shutdown();
+    });
+}
+
+/// Test broadcast to all nodes (empty recipients list).
+#[test]
+fn test_broadcast_to_all_nodes() {
+    use commonware_p2p::Receiver;
+
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(6001);
+        let signer2 = ed25519::PrivateKey::from_seed(6002);
+        let signer3 = ed25519::PrivateKey::from_seed(6003);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk3 = signer3.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+        let pk3_hex = hex::encode(pk3.as_ref());
+
+        let port1: u16 = 19500;
+        let port2: u16 = 19501;
+        let port3: u16 = 19502;
+
+        // All nodes know about each other
+        let mut config1 = create_test_config(port1);
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk3_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config2 = create_test_config(port2);
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk3_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let mut config3 = create_test_config(port3);
+        config3.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config3.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        let (mut network1, _receivers1) =
+            NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
+        let (mut network2, mut receivers2) =
+            NetworkService::new(ctx.clone(), signer2.clone(), config2, logger.clone()).await;
+        let (mut network3, mut receivers3) =
+            NetworkService::new(ctx.clone(), signer3.clone(), config3, logger).await;
+
+        // Give all peers time to discover each other
+        ctx.sleep(Duration::from_millis(2000)).await;
+
+        // Broadcast from node1 to all (empty recipients = broadcast to all)
+        let broadcast_msg = b"Broadcast message to all nodes".to_vec();
+        network1
+            .broadcast_consensus(broadcast_msg.clone(), vec![])
+            .await;
+
+        // Both node2 and node3 should receive the message
+        let (result2, result3) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), receivers2.consensus.recv()),
+            tokio::time::timeout(Duration::from_secs(5), receivers3.consensus.recv()),
+        );
+
+        match result2 {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk1);
+                assert_eq!(msg.as_ref(), broadcast_msg.as_slice());
+            }
+            _ => panic!("Node2 failed to receive broadcast"),
+        }
+
+        match result3 {
+            Ok(Ok((sender, msg))) => {
+                assert_eq!(sender, pk1);
+                assert_eq!(msg.as_ref(), broadcast_msg.as_slice());
+            }
+            _ => panic!("Node3 failed to receive broadcast"),
+        }
+
+        network1.shutdown();
+        network2.shutdown();
+        network3.shutdown();
+    });
+}
