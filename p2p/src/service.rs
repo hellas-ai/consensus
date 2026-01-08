@@ -394,27 +394,25 @@ where
             }
 
             res = receivers.sync.recv() => {
-                if let Ok((sender, msg)) = res {
-                    if let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
-                        match p2p_msg {
-                            P2PMessage::Ping(ts) => {
-                                // Respond with Pong
-                                if let Ok(pong_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Pong(ts)) {
-                                    network.send_sync(pong_bytes, vec![sender.clone()]).await;
-                                }
-                                // Also mark peer as ready (they can reach us)
-                                if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
-                                    slog::info!(logger, "Peer ready (received ping)"; "peer" => ?sender, "total" => ready_peers.len());
-                                }
+                if let Ok((sender, msg)) = res && let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
+                    match p2p_msg {
+                        P2PMessage::Ping(ts) => {
+                            // Respond with Pong
+                            if let Ok(pong_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Pong(ts)) {
+                                network.send_sync(pong_bytes, vec![sender.clone()]).await;
                             }
-                            P2PMessage::Pong(_ts) => {
-                                // Peer responded to our ping
-                                if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
-                                    slog::info!(logger, "Peer ready (received pong)"; "peer" => ?sender, "total" => ready_peers.len());
-                                }
+                            // Also mark peer as ready (they can reach us)
+                            if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                                slog::info!(logger, "Peer ready (received ping)"; "peer" => ?sender, "total" => ready_peers.len());
                             }
-                            _ => {}
                         }
+                        P2PMessage::Pong(_ts) => {
+                            // Peer responded to our ping
+                            if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                                slog::info!(logger, "Peer ready (received pong)"; "peer" => ?sender, "total" => ready_peers.len());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -716,6 +714,69 @@ mod tests {
 
         // Simulate becoming ready
         is_ready.store(true, Ordering::Release);
+        assert!(handle.is_ready());
+
+        // Cleanup
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn test_p2p_handle_wait_ready_already_ready() {
+        let is_ready = Arc::new(AtomicBool::new(true));
+        let ready_notify = Arc::new(Notify::new());
+
+        let handle = P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            broadcast_notify: Arc::new(Notify::new()),
+            ready_notify: ready_notify.clone(),
+            is_ready: is_ready.clone(),
+        };
+
+        // Should return immediately if already ready
+        let start = std::time::Instant::now();
+        handle.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // Should return almost immediately (< 10ms)
+        assert!(elapsed < Duration::from_millis(10));
+
+        // Cleanup
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn test_p2p_handle_wait_ready_becomes_ready() {
+        let is_ready = Arc::new(AtomicBool::new(false));
+        let ready_notify = Arc::new(Notify::new());
+
+        let handle = P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            broadcast_notify: Arc::new(Notify::new()),
+            ready_notify: ready_notify.clone(),
+            is_ready: is_ready.clone(),
+        };
+
+        // Spawn a task that will signal ready after a delay
+        let ready_notify_clone = ready_notify.clone();
+        let is_ready_clone = is_ready.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            is_ready_clone.store(true, Ordering::Release);
+            ready_notify_clone.notify_waiters();
+        });
+
+        // wait_ready should block until ready
+        let start = std::time::Instant::now();
+        handle.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // Should have waited at least 50ms
+        assert!(elapsed >= Duration::from_millis(45));
+        assert!(elapsed < Duration::from_millis(200)); // But not too long
         assert!(handle.is_ready());
 
         // Cleanup

@@ -43,15 +43,15 @@ fn create_test_config(port: u16) -> P2PConfig {
         listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         external_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         validators: vec![],
-        total_number_peers: 6,           // 5f + 1 for Minimmit (f=1)
-        maximum_number_faulty_peers: 1,  // f = 1
+        total_number_peers: 6,          // 5f + 1 for Minimmit (f=1)
+        maximum_number_faulty_peers: 1, // f = 1
         cluster_id: "test-cluster".to_string(),
         max_message_size: 1024 * 1024,
         message_backlog: 1024,
         consensus_rate_per_second: 10000,
         tx_rate_per_second: 50000,
-        bootstrap_timeout_ms: 5000,      // 5s timeout for integration tests
-        ping_interval_ms: 200,           // Ping every 200ms during bootstrap
+        bootstrap_timeout_ms: 5000, // 5s timeout for integration tests
+        ping_interval_ms: 200,      // Ping every 200ms during bootstrap
     }
 }
 
@@ -500,6 +500,401 @@ fn test_p2p_service_handles_shutdown_signal() {
         std::mem::forget(handle);
 
         // Give runtime time to clean up before executor's async block completes
+        ctx.sleep(Duration::from_millis(100)).await;
+    });
+}
+
+/// Test that bootstrap completes successfully when enough peers respond.
+///
+/// This test verifies:
+/// 1. Two nodes can discover each other via ping/pong
+/// 2. Bootstrap completes when minimum peers are reached
+/// 3. Ready signal is properly set
+#[test]
+fn test_bootstrap_completes_with_sufficient_peers() {
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(8001);
+        let signer2 = ed25519::PrivateKey::from_seed(8002);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+
+        let port1: u16 = 19901;
+        let port2: u16 = 19902;
+
+        // Configure node1 with node2 as validator
+        let mut config1 = create_test_config(port1);
+        config1.total_number_peers = 6; // n = 6
+        config1.maximum_number_faulty_peers = 1; // f = 1
+        // For n=6, f=1: need n-f-1 = 4 other peers, but we only have 1
+        // So min_peers will be capped at 1
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        // Configure node2 with node1 as validator
+        let mut config2 = create_test_config(port2);
+        config2.total_number_peers = 6;
+        config2.maximum_number_faulty_peers = 1;
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        // Create P2P service for node1
+        let (consensus_prod1, _consensus_cons1) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod1, _tx_cons1) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod1, broadcast_cons1) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle1 = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config1,
+            signer1,
+            consensus_prod1,
+            tx_prod1,
+            broadcast_cons1,
+            logger.clone(),
+        );
+
+        // Create P2P service for node2
+        let (consensus_prod2, _consensus_cons2) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod2, _tx_cons2) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod2, broadcast_cons2) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle2 = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config2,
+            signer2,
+            consensus_prod2,
+            tx_prod2,
+            broadcast_cons2,
+            logger,
+        );
+
+        // Wait for both services to complete bootstrap
+        let start = std::time::Instant::now();
+        handle1.wait_ready().await;
+        handle2.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // Both should become ready
+        assert!(handle1.is_ready(), "Node1 should be ready");
+        assert!(handle2.is_ready(), "Node2 should be ready");
+
+        // Bootstrap should complete reasonably quickly (< 5 seconds)
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Bootstrap took too long: {:?}",
+            elapsed
+        );
+
+        // Cleanup
+        handle1.shutdown();
+        handle2.shutdown();
+        std::mem::forget(handle1);
+        std::mem::forget(handle2);
+
+        ctx.sleep(Duration::from_millis(100)).await;
+    });
+}
+
+/// Test that bootstrap times out when not enough peers respond.
+///
+/// This test verifies:
+/// 1. Bootstrap waits for the configured timeout
+/// 2. Service becomes ready even if timeout occurs (for single-node testing)
+/// 3. Ready signal is still set after timeout
+#[test]
+fn test_bootstrap_timeout_when_insufficient_peers() {
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer = ed25519::PrivateKey::from_seed(8003);
+        let non_existent_signer = ed25519::PrivateKey::from_seed(9999);
+        let non_existent_pk = non_existent_signer.public_key();
+        let non_existent_pk_hex = hex::encode(non_existent_pk.as_ref());
+
+        let port: u16 = 19903;
+
+        // Configure with a validator that won't respond (wrong port)
+        // This ensures min_peers > 0, so bootstrap will actually wait
+        let mut config = create_test_config(port);
+        config.total_number_peers = 6;
+        config.maximum_number_faulty_peers = 1;
+        config.bootstrap_timeout_ms = 500; // Short timeout for test
+        // Add a validator that won't respond (port that's not listening)
+        config.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: non_existent_pk_hex,
+            address: Some(format!("127.0.0.1:{}", 19999).parse().unwrap()), // Port not listening
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        let (consensus_prod, _consensus_cons) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod, _tx_cons) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod, broadcast_cons) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config,
+            signer,
+            consensus_prod,
+            tx_prod,
+            broadcast_cons,
+            logger,
+        );
+
+        // Wait for bootstrap to complete (should timeout)
+        let start = std::time::Instant::now();
+        handle.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // Should become ready after timeout (even without peer responses)
+        assert!(handle.is_ready(), "Service should be ready after timeout");
+
+        // Should have waited at least the timeout duration
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "Should wait at least timeout duration: {:?}",
+            elapsed
+        );
+        // But not too much longer
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Should not wait too long after timeout: {:?}",
+            elapsed
+        );
+
+        // Cleanup
+        handle.shutdown();
+        std::mem::forget(handle);
+
+        ctx.sleep(Duration::from_millis(100)).await;
+    });
+}
+
+/// Test that bootstrap skips when min_peers is 0.
+///
+/// This test verifies that when no peers are required, bootstrap completes immediately.
+#[test]
+fn test_bootstrap_skips_when_no_peers_required() {
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer = ed25519::PrivateKey::from_seed(8004);
+
+        let port: u16 = 19904;
+
+        // Configure with total_number_peers = 1 (only ourselves)
+        let mut config = create_test_config(port);
+        config.total_number_peers = 1; // Only ourselves
+        config.maximum_number_faulty_peers = 0; // f = 0
+        // min_other_peers = 1 - 0 - 1 = 0, so bootstrap should skip
+        config.validators = vec![];
+
+        let logger = create_test_logger();
+
+        let (consensus_prod, _consensus_cons) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod, _tx_cons) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod, broadcast_cons) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config,
+            signer,
+            consensus_prod,
+            tx_prod,
+            broadcast_cons,
+            logger,
+        );
+
+        // Wait for bootstrap - should complete almost immediately
+        let start = std::time::Instant::now();
+        handle.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // Should become ready very quickly (bootstrap skipped)
+        assert!(handle.is_ready(), "Service should be ready immediately");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Bootstrap should skip quickly"
+        );
+
+        // Cleanup
+        handle.shutdown();
+        std::mem::forget(handle);
+
+        ctx.sleep(Duration::from_millis(100)).await;
+    });
+}
+
+/// Test bootstrap with three nodes (more realistic scenario).
+///
+/// This test verifies:
+/// 1. Multiple nodes can bootstrap together
+/// 2. All nodes become ready when minimum threshold is reached
+/// 3. Ping/pong works across multiple nodes
+#[test]
+fn test_bootstrap_with_three_nodes() {
+    let executor = commonware_runtime::tokio::Runner::default();
+
+    executor.start(|ctx| async move {
+        let signer1 = ed25519::PrivateKey::from_seed(8005);
+        let signer2 = ed25519::PrivateKey::from_seed(8006);
+        let signer3 = ed25519::PrivateKey::from_seed(8007);
+
+        let pk1 = signer1.public_key();
+        let pk2 = signer2.public_key();
+        let pk3 = signer3.public_key();
+        let pk1_hex = hex::encode(pk1.as_ref());
+        let pk2_hex = hex::encode(pk2.as_ref());
+        let pk3_hex = hex::encode(pk3.as_ref());
+
+        let port1: u16 = 19905;
+        let port2: u16 = 19906;
+        let port3: u16 = 19907;
+
+        // Configure node1 with nodes 2 and 3 as validators
+        let mut config1 = create_test_config(port1);
+        config1.total_number_peers = 6;
+        config1.maximum_number_faulty_peers = 1;
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config1.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk3_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        // Configure node2 with nodes 1 and 3 as validators
+        let mut config2 = create_test_config(port2);
+        config2.total_number_peers = 6;
+        config2.maximum_number_faulty_peers = 1;
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config2.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk3_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        // Configure node3 with nodes 1 and 2 as validators
+        let mut config3 = create_test_config(port3);
+        config3.total_number_peers = 6;
+        config3.maximum_number_faulty_peers = 1;
+        config3.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk1_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+        config3.validators.push(ValidatorPeerInfo {
+            ed25519_public_key: pk2_hex.clone(),
+            address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
+            bls_peer_id: PeerId::default(),
+        });
+
+        let logger = create_test_logger();
+
+        // Create all three P2P services
+        let (consensus_prod1, _consensus_cons1) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod1, _tx_cons1) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod1, broadcast_cons1) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle1 = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config1,
+            signer1,
+            consensus_prod1,
+            tx_prod1,
+            broadcast_cons1,
+            logger.clone(),
+        );
+
+        let (consensus_prod2, _consensus_cons2) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod2, _tx_cons2) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod2, broadcast_cons2) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle2 = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config2,
+            signer2,
+            consensus_prod2,
+            tx_prod2,
+            broadcast_cons2,
+            logger.clone(),
+        );
+
+        let (consensus_prod3, _consensus_cons3) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+        let (tx_prod3, _tx_cons3) = RingBuffer::<Transaction>::new(100);
+        let (_broadcast_prod3, broadcast_cons3) =
+            RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
+
+        let handle3 = spawn(
+            commonware_runtime::tokio::Runner::default(),
+            config3,
+            signer3,
+            consensus_prod3,
+            tx_prod3,
+            broadcast_cons3,
+            logger,
+        );
+
+        // Wait for all services to complete bootstrap
+        let start = std::time::Instant::now();
+        handle1.wait_ready().await;
+        handle2.wait_ready().await;
+        handle3.wait_ready().await;
+        let elapsed = start.elapsed();
+
+        // All should become ready
+        assert!(handle1.is_ready(), "Node1 should be ready");
+        assert!(handle2.is_ready(), "Node2 should be ready");
+        assert!(handle3.is_ready(), "Node3 should be ready");
+
+        // Bootstrap should complete reasonably quickly
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "Bootstrap took too long: {:?}",
+            elapsed
+        );
+
+        // Cleanup
+        handle1.shutdown();
+        handle2.shutdown();
+        handle3.shutdown();
+        std::mem::forget(handle1);
+        std::mem::forget(handle2);
+        std::mem::forget(handle3);
+
         ctx.sleep(Duration::from_millis(100)).await;
     });
 }
