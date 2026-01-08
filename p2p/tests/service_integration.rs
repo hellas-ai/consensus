@@ -19,13 +19,13 @@
 
 use std::time::Duration;
 
-use commonware_cryptography::{Signer, ed25519};
 use commonware_runtime::{Clock, Runner};
 use consensus::consensus::ConsensusMessage;
-use consensus::crypto::aggregated::{BlsSecretKey, PeerId};
+use consensus::crypto::aggregated::BlsSecretKey;
 use consensus::state::block::Block;
 use consensus::state::transaction::Transaction;
 use p2p::config::{P2PConfig, ValidatorPeerInfo};
+use p2p::identity::ValidatorIdentity;
 use p2p::service::spawn;
 use rtrb::RingBuffer;
 use slog::Logger;
@@ -57,7 +57,9 @@ fn test_p2p_service_spawn_and_shutdown() {
     let executor = commonware_runtime::tokio::Runner::default();
 
     executor.start(|ctx| async move {
-        let signer = ed25519::PrivateKey::from_seed(7001);
+        // Create identity from BLS key (ed25519 is derived)
+        let bls_key = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity = ValidatorIdentity::from_bls_key(bls_key);
         let config = create_test_config(19600);
         let logger = create_test_logger();
 
@@ -70,7 +72,7 @@ fn test_p2p_service_spawn_and_shutdown() {
         let handle = spawn(
             commonware_runtime::tokio::Runner::default(),
             config,
-            signer,
+            identity,
             consensus_prod,
             tx_prod,
             broadcast_cons,
@@ -98,11 +100,14 @@ fn test_p2p_service_broadcast_notification() {
     let executor = commonware_runtime::tokio::Runner::default();
 
     executor.start(|ctx| async move {
-        let signer1 = ed25519::PrivateKey::from_seed(7002);
-        let signer2 = ed25519::PrivateKey::from_seed(7003);
+        // Create identities from BLS keys (ed25519 is derived deterministically)
+        let bls_key1 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let bls_key2 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity1 = ValidatorIdentity::from_bls_key(bls_key1);
+        let identity2 = ValidatorIdentity::from_bls_key(bls_key2);
 
-        let pk1 = signer1.public_key();
-        let pk2 = signer2.public_key();
+        let pk1 = identity1.ed25519_public_key();
+        let pk2 = identity2.ed25519_public_key();
         let pk1_hex = hex::encode(pk1.as_ref());
         let pk2_hex = hex::encode(pk2.as_ref());
 
@@ -114,14 +119,14 @@ fn test_p2p_service_broadcast_notification() {
         config1.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity2.peer_id(),
         });
 
         let mut config2 = create_test_config(port2);
         config2.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity1.peer_id(),
         });
 
         let logger = create_test_logger();
@@ -133,17 +138,20 @@ fn test_p2p_service_broadcast_notification() {
         let (mut broadcast_prod, broadcast_cons) =
             RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
 
+        // Get the ed25519 key for node2 before consuming identity2
+        let signer2 = identity2.clone_ed25519_private_key();
+
         let handle1 = spawn(
             commonware_runtime::tokio::Runner::default(),
             config1,
-            signer1,
+            identity1,
             consensus_prod,
             tx_prod,
             broadcast_cons,
             logger.clone(),
         );
 
-        // Create network service for node2 (the receiver)
+        // Create network service for node2 (the receiver) - uses raw ed25519
         let (mut network2, mut receivers2) =
             p2p::network::NetworkService::new(ctx.clone(), signer2, config2, logger).await;
 
@@ -228,11 +236,14 @@ fn test_p2p_service_routes_consensus_messages() {
     let executor = commonware_runtime::tokio::Runner::default();
 
     executor.start(|ctx| async move {
-        let signer1 = ed25519::PrivateKey::from_seed(7003);
-        let signer2 = ed25519::PrivateKey::from_seed(7004);
+        // Create identities from BLS keys
+        let bls_key1 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let bls_key2 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity1 = ValidatorIdentity::from_bls_key(bls_key1);
+        let identity2 = ValidatorIdentity::from_bls_key(bls_key2);
 
-        let pk1 = signer1.public_key();
-        let pk2 = signer2.public_key();
+        let pk1 = identity1.ed25519_public_key();
+        let pk2 = identity2.ed25519_public_key();
         let pk1_hex = hex::encode(pk1.as_ref());
         let pk2_hex = hex::encode(pk2.as_ref());
 
@@ -246,8 +257,11 @@ fn test_p2p_service_routes_consensus_messages() {
         config2.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity1.peer_id(),
         });
+
+        // Get the ed25519 key for node1 before consuming identity1
+        let signer1 = identity1.clone_ed25519_private_key();
 
         // Create P2P service for node2 (receiver) - runs in separate thread+runtime
         let (consensus_prod, mut consensus_cons) =
@@ -259,7 +273,7 @@ fn test_p2p_service_routes_consensus_messages() {
         let handle2 = spawn(
             commonware_runtime::tokio::Runner::default(),
             config2,
-            signer2,
+            identity2,
             consensus_prod,
             tx_prod,
             broadcast_cons,
@@ -279,7 +293,7 @@ fn test_p2p_service_routes_consensus_messages() {
         config1.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity1.peer_id(),
         });
 
         // Create network service for node1 (sender) in the test's runtime
@@ -355,11 +369,14 @@ fn test_p2p_service_routes_transaction_messages() {
     let executor = commonware_runtime::tokio::Runner::default();
 
     executor.start(|ctx| async move {
-        let signer1 = ed25519::PrivateKey::from_seed(7005);
-        let signer2 = ed25519::PrivateKey::from_seed(7006);
+        // Create identities from BLS keys
+        let bls_key1 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let bls_key2 = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity1 = ValidatorIdentity::from_bls_key(bls_key1);
+        let identity2 = ValidatorIdentity::from_bls_key(bls_key2);
 
-        let pk1 = signer1.public_key();
-        let pk2 = signer2.public_key();
+        let pk1 = identity1.ed25519_public_key();
+        let pk2 = identity2.ed25519_public_key();
         let pk1_hex = hex::encode(pk1.as_ref());
         let pk2_hex = hex::encode(pk2.as_ref());
 
@@ -370,8 +387,11 @@ fn test_p2p_service_routes_transaction_messages() {
         config2.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity1.peer_id(),
         });
+
+        // Get the ed25519 key for node1 before consuming identity1
+        let signer1 = identity1.clone_ed25519_private_key();
 
         let (consensus_prod, _consensus_cons) =
             RingBuffer::<ConsensusMessage<N, F, M_SIZE>>::new(100);
@@ -382,7 +402,7 @@ fn test_p2p_service_routes_transaction_messages() {
         let handle2 = spawn(
             commonware_runtime::tokio::Runner::default(),
             config2,
-            signer2,
+            identity2,
             consensus_prod,
             tx_prod,
             broadcast_cons,
@@ -393,7 +413,7 @@ fn test_p2p_service_routes_transaction_messages() {
         config1.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
-            bls_peer_id: PeerId::default(),
+            bls_peer_id: identity1.peer_id(),
         });
 
         let (mut network1, _receivers1) =
@@ -456,7 +476,9 @@ fn test_p2p_service_handles_shutdown_signal() {
     let executor = commonware_runtime::tokio::Runner::default();
 
     executor.start(|ctx| async move {
-        let signer = ed25519::PrivateKey::from_seed(7007);
+        // Create identity from BLS key
+        let bls_key = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity = ValidatorIdentity::from_bls_key(bls_key);
         let config = create_test_config(19606);
         let logger = create_test_logger();
 
@@ -469,7 +491,7 @@ fn test_p2p_service_handles_shutdown_signal() {
         let handle = spawn(
             commonware_runtime::tokio::Runner::default(),
             config,
-            signer,
+            identity,
             consensus_prod,
             tx_prod,
             broadcast_cons,

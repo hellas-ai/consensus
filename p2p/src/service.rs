@@ -9,12 +9,14 @@ use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Receiver;
 use commonware_runtime::{Clock, Metrics, Network, Resolver, Runner, Spawner};
 use consensus::consensus::ConsensusMessage;
+use consensus::crypto::aggregated::PeerId;
 use consensus::state::transaction::Transaction;
 use rand::{CryptoRng, RngCore};
 use rtrb::{Consumer, Producer};
 use slog::Logger;
 use tokio::sync::Notify;
 
+use crate::ValidatorIdentity;
 use crate::config::P2PConfig;
 use crate::error::P2PError;
 use crate::message::{P2PMessage, deserialize_message};
@@ -51,7 +53,7 @@ impl P2PHandle {
 pub fn spawn<E, const N: usize, const F: usize, const M_SIZE: usize>(
     runner: E,
     config: P2PConfig,
-    signer: ed25519::PrivateKey,
+    identity: ValidatorIdentity,
     consensus_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
     tx_producer: Producer<Transaction>,
     broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
@@ -69,6 +71,10 @@ where
     let broadcast_notify = Arc::new(Notify::new());
     let broadcast_notify_clone = Arc::clone(&broadcast_notify);
 
+    // Extract the ed25519 key for network transport
+    let signer = identity.clone_ed25519_private_key();
+    let peer_id = identity.peer_id();
+
     let thread_handle = std::thread::Builder::new()
         .name("hellas-validator-p2p-thread".to_string())
         .spawn(move || {
@@ -78,6 +84,7 @@ where
                     ctx,
                     config,
                     signer,
+                    peer_id,
                     consensus_producer,
                     tx_producer,
                     broadcast_consumer,
@@ -105,6 +112,7 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     context: C,
     config: P2PConfig,
     signer: ed25519::PrivateKey,
+    peer_id: PeerId,
     mut consensus_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
     mut tx_producer: Producer<Transaction>,
     mut broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
@@ -115,7 +123,10 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
 ) where
     C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng,
 {
-    slog::info!(logger, "Starting P2P service"; "public_key" => ?signer.public_key());
+    slog::info!(logger, "Starting P2P service";
+        "ed25519_public_key" => ?signer.public_key(),
+        "bls_peer_id" => ?peer_id
+    );
 
     // Initialize Network
     let (mut network, mut receivers) =
