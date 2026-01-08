@@ -89,13 +89,18 @@ pub fn serialize_message<const N: usize, const F: usize, const M_SIZE: usize>(
 }
 
 /// Deserialize a message from bytes using rkyv.
+///
+/// This function handles potentially unaligned network data by copying
+/// to an aligned buffer before deserialization.
 pub fn deserialize_message<const N: usize, const F: usize, const M_SIZE: usize>(
     bytes: &[u8],
 ) -> Result<P2PMessage<N, F, M_SIZE>, anyhow::Error> {
-    let archived =
-        rkyv::access::<rkyv::Archived<P2PMessage<N, F, M_SIZE>>, rkyv::rancor::Error>(bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to access archived: {:?}", e))?;
-    let msg: P2PMessage<N, F, M_SIZE> = rkyv::deserialize::<_, rkyv::rancor::Error>(archived)
-        .map_err(|e| anyhow::anyhow!("Deserialization failed: {:?}", e))?;
+    // rkyv requires aligned data for zero-copy deserialization.
+    // Network data may not be properly aligned, so we copy to an aligned buffer.
+    let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(bytes.len());
+    aligned.extend_from_slice(bytes);
+    let msg: P2PMessage<N, F, M_SIZE> =
+        rkyv::from_bytes::<P2PMessage<N, F, M_SIZE>, rkyv::rancor::Error>(&aligned)
+            .map_err(|e| anyhow::anyhow!("Deserialization failed: {:?}", e))?;
     Ok(msg)
 }

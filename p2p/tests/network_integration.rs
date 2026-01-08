@@ -393,16 +393,16 @@ fn test_mutual_bootstrappers() {
         let logger = create_test_logger();
 
         // Assert: both can be created with mutual references
-        let (mut network1, _) =
+        let (network1, _) =
             NetworkService::new(ctx.clone(), signer1, config1, logger.clone()).await;
-        let (mut network2, _) = NetworkService::new(ctx, signer2, config2, logger).await;
+        let (network2, _) = NetworkService::new(ctx, signer2, config2, logger).await;
 
         // Assert: public keys match expected
         assert_eq!(network1.public_key(), pk1);
         assert_eq!(network2.public_key(), pk2);
 
-        network1.shutdown();
-        network2.shutdown();
+        drop(network1);
+        drop(network2);
     });
 }
 
@@ -451,7 +451,7 @@ fn test_real_message_delivery_between_nodes() {
         let (mut network1, _receivers1) =
             NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
 
-        let (mut network2, mut receivers2) =
+        let (network2, mut receivers2) =
             NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
 
         // Give peers time to discover each other and establish connections
@@ -491,9 +491,11 @@ fn test_real_message_delivery_between_nodes() {
             }
         }
 
-        // Cleanup
-        network1.shutdown();
-        network2.shutdown();
+        // Cleanup - drop networks to release ports
+        drop(network1);
+        drop(network2);
+        // Wait for socket cleanup
+        ctx.sleep(Duration::from_millis(100)).await;
     });
 }
 
@@ -574,8 +576,9 @@ fn test_bidirectional_message_delivery() {
             _ => panic!("Node1 failed to receive message from node2"),
         }
 
-        network1.shutdown();
-        network2.shutdown();
+        drop(network1);
+        drop(network2);
+        ctx.sleep(Duration::from_millis(100)).await;
     });
 }
 
@@ -595,8 +598,8 @@ fn test_transaction_channel_delivery() {
         let pk1_hex = hex::encode(pk1.as_ref());
         let pk2_hex = hex::encode(pk2.as_ref());
 
-        let port1: u16 = 19300;
-        let port2: u16 = 19301;
+        let port1: u16 = 19350;
+        let port2: u16 = 19351;
 
         let mut config1 = create_test_config(port1);
         config1.validators.push(ValidatorPeerInfo {
@@ -616,7 +619,7 @@ fn test_transaction_channel_delivery() {
 
         let (mut network1, _receivers1) =
             NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
-        let (mut network2, mut receivers2) =
+        let (network2, mut receivers2) =
             NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
 
         ctx.sleep(Duration::from_millis(1000)).await;
@@ -636,8 +639,9 @@ fn test_transaction_channel_delivery() {
             _ => panic!("Failed to receive transaction message"),
         }
 
-        network1.shutdown();
-        network2.shutdown();
+        drop(network1);
+        drop(network2);
+        ctx.sleep(Duration::from_millis(100)).await;
     });
 }
 
@@ -678,7 +682,7 @@ fn test_sync_channel_delivery() {
 
         let (mut network1, _receivers1) =
             NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
-        let (mut network2, mut receivers2) =
+        let (network2, mut receivers2) =
             NetworkService::new(ctx.clone(), signer2.clone(), config2, logger).await;
 
         ctx.sleep(Duration::from_millis(1000)).await;
@@ -698,8 +702,9 @@ fn test_sync_channel_delivery() {
             _ => panic!("Failed to receive sync message"),
         }
 
-        network1.shutdown();
-        network2.shutdown();
+        drop(network1);
+        drop(network2);
+        ctx.sleep(Duration::from_millis(100)).await;
     });
 }
 
@@ -722,9 +727,9 @@ fn test_broadcast_to_all_nodes() {
         let pk2_hex = hex::encode(pk2.as_ref());
         let pk3_hex = hex::encode(pk3.as_ref());
 
-        let port1: u16 = 19500;
-        let port2: u16 = 19501;
-        let port3: u16 = 19502;
+        let port1: u16 = 19800;
+        let port2: u16 = 19801;
+        let port3: u16 = 19802;
 
         // All nodes know about each other
         let mut config1 = create_test_config(port1);
@@ -767,13 +772,14 @@ fn test_broadcast_to_all_nodes() {
 
         let (mut network1, _receivers1) =
             NetworkService::new(ctx.clone(), signer1.clone(), config1, logger.clone()).await;
-        let (mut network2, mut receivers2) =
+        let (network2, mut receivers2) =
             NetworkService::new(ctx.clone(), signer2.clone(), config2, logger.clone()).await;
-        let (mut network3, mut receivers3) =
+        let (network3, mut receivers3) =
             NetworkService::new(ctx.clone(), signer3.clone(), config3, logger).await;
 
         // Give all peers time to discover each other
-        ctx.sleep(Duration::from_millis(2000)).await;
+        // 3-node discovery takes longer than 2-node
+        ctx.sleep(Duration::from_millis(3000)).await;
 
         // Broadcast from node1 to all (empty recipients = broadcast to all)
         let broadcast_msg = b"Broadcast message to all nodes".to_vec();
@@ -803,8 +809,9 @@ fn test_broadcast_to_all_nodes() {
             _ => panic!("Node3 failed to receive broadcast"),
         }
 
-        network1.shutdown();
-        network2.shutdown();
-        network3.shutdown();
+        drop(network1);
+        drop(network2);
+        drop(network3);
+        ctx.sleep(Duration::from_millis(100)).await;
     });
 }

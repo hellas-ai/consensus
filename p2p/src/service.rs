@@ -194,8 +194,11 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
         }
     }
 
-    // Graceful shutdown: stop network
-    network.shutdown();
+    // Let network be dropped naturally when this function returns
+    // Calling network.shutdown() here would abort tasks during poll,
+    // which can cause "Cannot drop a runtime in a context where blocking is not allowed" panics
+    // The network handle will be dropped when it goes out of scope
+    drop(network);
     slog::info!(logger, "P2P service shut down");
 }
 
@@ -226,4 +229,242 @@ pub fn route_incoming_message<const N: usize, const F: usize, const M_SIZE: usiz
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consensus::crypto::aggregated::BlsSecretKey;
+    use consensus::state::block::Block;
+    use consensus::state::transaction::Transaction;
+    use rtrb::RingBuffer;
+    use slog::Logger;
+
+    const N: usize = 6;
+    const F: usize = 1;
+    const M_SIZE: usize = 3;
+
+    fn create_test_logger() -> Logger {
+        Logger::root(slog::Discard, slog::o!())
+    }
+
+    #[test]
+    fn test_route_consensus_message() {
+        let logger = create_test_logger();
+        let (mut consensus_prod, mut consensus_cons) = RingBuffer::new(100);
+        let (mut tx_prod, _tx_cons) = RingBuffer::new(100);
+
+        // Create a test consensus message
+        let block = Block::new(
+            1,
+            12345,
+            [0u8; 32],
+            vec![],
+            1234567890,
+            BlsSecretKey::generate(&mut rand::thread_rng()).sign(b"test"),
+            false,
+            1,
+        );
+        let consensus_msg = ConsensusMessage::<N, F, M_SIZE>::BlockProposal(block);
+
+        // Serialize it
+        let p2p_msg = P2PMessage::Consensus(consensus_msg.clone());
+        let bytes = crate::message::serialize_message(&p2p_msg).unwrap();
+
+        // Route it
+        let result = route_incoming_message::<N, F, M_SIZE>(
+            &bytes,
+            &mut consensus_prod,
+            &mut tx_prod,
+            &logger,
+        );
+
+        assert!(result.is_ok(), "Routing should succeed");
+
+        // Verify message was pushed to consensus channel (check consumer side)
+        let received = consensus_cons.pop().unwrap();
+        match (received, consensus_msg) {
+            (ConsensusMessage::BlockProposal(b1), ConsensusMessage::BlockProposal(b2)) => {
+                assert_eq!(b1.view(), b2.view());
+            }
+            _ => panic!("Message type mismatch"),
+        }
+    }
+
+    #[test]
+    fn test_route_transaction_message() {
+        let logger = create_test_logger();
+        let (mut consensus_prod, _consensus_cons) = RingBuffer::new(100);
+        let (mut tx_prod, mut tx_cons) = RingBuffer::new(100);
+
+        // Create a test transaction
+        use consensus::crypto::transaction_crypto::TxSecretKey;
+        use consensus::state::address::Address;
+        let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
+        let tx = Transaction::new_transfer(
+            Address::from_public_key(&sk.public_key()),
+            Address::from_bytes([1u8; 32]),
+            100,
+            0,
+            10,
+            &sk,
+        );
+
+        // Serialize it
+        let p2p_msg: P2PMessage<N, F, M_SIZE> = P2PMessage::Transaction(tx.clone());
+        let bytes = crate::message::serialize_message(&p2p_msg).unwrap();
+
+        // Route it
+        let result = route_incoming_message::<N, F, M_SIZE>(
+            &bytes,
+            &mut consensus_prod,
+            &mut tx_prod,
+            &logger,
+        );
+
+        assert!(result.is_ok(), "Routing should succeed");
+
+        // Verify message was pushed to transaction channel (check consumer side)
+        let received = tx_cons.pop().unwrap();
+        assert_eq!(received.tx_hash, tx.tx_hash);
+    }
+
+    #[test]
+    fn test_route_message_channel_full() {
+        let logger = create_test_logger();
+        let (mut consensus_prod, _consensus_cons) = RingBuffer::new(1); // Small buffer
+        let (mut tx_prod, _tx_cons) = RingBuffer::new(100);
+
+        // Fill the consensus channel
+        let block1 = Block::new(
+            1,
+            12345,
+            [0u8; 32],
+            vec![],
+            1234567890,
+            BlsSecretKey::generate(&mut rand::thread_rng()).sign(b"test1"),
+            false,
+            1,
+        );
+        let msg1 = ConsensusMessage::<N, F, M_SIZE>::BlockProposal(block1);
+        consensus_prod.push(msg1).unwrap();
+
+        // Try to route another message - should fail with channel full
+        let block2 = Block::new(
+            2,
+            12345,
+            [0u8; 32],
+            vec![],
+            1234567891,
+            BlsSecretKey::generate(&mut rand::thread_rng()).sign(b"test2"),
+            false,
+            1,
+        );
+        let p2p_msg =
+            P2PMessage::Consensus(ConsensusMessage::<N, F, M_SIZE>::BlockProposal(block2));
+        let bytes = crate::message::serialize_message(&p2p_msg).unwrap();
+
+        let result = route_incoming_message::<N, F, M_SIZE>(
+            &bytes,
+            &mut consensus_prod,
+            &mut tx_prod,
+            &logger,
+        );
+
+        assert!(result.is_err(), "Routing should fail when channel is full");
+        match result.unwrap_err() {
+            P2PError::SendError(msg) => {
+                assert!(msg.contains("Consensus channel full"));
+            }
+            _ => panic!("Expected SendError"),
+        }
+    }
+
+    #[test]
+    fn test_route_invalid_message() {
+        let logger = create_test_logger();
+        let (mut consensus_prod, _consensus_cons) = RingBuffer::new(100);
+        let (mut tx_prod, _tx_cons) = RingBuffer::new(100);
+
+        // Invalid bytes
+        let invalid_bytes = b"not a valid message".to_vec();
+
+        let result = route_incoming_message::<N, F, M_SIZE>(
+            &invalid_bytes,
+            &mut consensus_prod,
+            &mut tx_prod,
+            &logger,
+        );
+
+        assert!(result.is_err(), "Routing invalid message should fail");
+    }
+
+    #[test]
+    fn test_route_unsupported_message_type() {
+        let logger = create_test_logger();
+        let (mut consensus_prod, mut consensus_cons) = RingBuffer::new(100);
+        let (mut tx_prod, mut tx_cons) = RingBuffer::new(100);
+
+        // Create a Ping message (not currently handled)
+        let p2p_msg = P2PMessage::<N, F, M_SIZE>::Ping(12345);
+        let bytes = crate::message::serialize_message(&p2p_msg).unwrap();
+
+        // Should succeed but not push anything (returns Ok(()))
+        let result = route_incoming_message::<N, F, M_SIZE>(
+            &bytes,
+            &mut consensus_prod,
+            &mut tx_prod,
+            &logger,
+        );
+
+        assert!(result.is_ok(), "Unsupported message types should return Ok");
+        // Verify nothing was pushed (consumers should be empty)
+        assert!(consensus_cons.pop().is_err());
+        assert!(tx_cons.pop().is_err());
+    }
+
+    #[test]
+    fn test_p2p_handle_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Create a dummy handle (we can't easily test the full spawn without a real runtime)
+        // But we can test the shutdown method
+        let handle = P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown: shutdown.clone(),
+            shutdown_notify: shutdown_notify.clone(),
+            broadcast_notify: Arc::new(Notify::new()),
+        };
+
+        assert!(!shutdown.load(Ordering::Relaxed));
+        handle.shutdown();
+        assert!(shutdown.load(Ordering::Relaxed));
+
+        // Cleanup
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_p2p_handle_shutdown_idempotent() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+
+        let handle = P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown: shutdown.clone(),
+            shutdown_notify: shutdown_notify.clone(),
+            broadcast_notify: Arc::new(Notify::new()),
+        };
+
+        // Call shutdown multiple times - should be idempotent
+        handle.shutdown();
+        handle.shutdown();
+        handle.shutdown();
+
+        assert!(shutdown.load(Ordering::Relaxed));
+
+        // Cleanup
+        let _ = handle.join();
+    }
 }
