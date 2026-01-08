@@ -43,11 +43,15 @@ fn create_test_config(port: u16) -> P2PConfig {
         listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         external_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         validators: vec![],
+        total_number_peers: 6,           // 5f + 1 for Minimmit (f=1)
+        maximum_number_faulty_peers: 1,  // f = 1
         cluster_id: "test-cluster".to_string(),
         max_message_size: 1024 * 1024,
         message_backlog: 1024,
         consensus_rate_per_second: 10000,
         tx_rate_per_second: 50000,
+        bootstrap_timeout_ms: 5000,      // 5s timeout for integration tests
+        ping_interval_ms: 200,           // Ping every 200ms during bootstrap
     }
 }
 
@@ -147,7 +151,11 @@ fn test_p2p_service_broadcast_notification() {
         let (mut network2, mut receivers2) =
             p2p::network::NetworkService::new(ctx.clone(), signer2, config2, logger).await;
 
-        // Give services time to initialize and connect
+        // Wait for handle1's P2P service to complete bootstrap phase
+        // This is important because broadcast_notify is only processed in the main loop
+        handle1.wait_ready().await;
+
+        // Give services additional time to establish connections
         ctx.sleep(Duration::from_millis(1000)).await;
 
         // Create a consensus message to broadcast

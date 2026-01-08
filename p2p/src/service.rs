@@ -1,10 +1,13 @@
 //! P2P node service orchestrating network and protocols.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use bytes::Bytes;
+use commonware_codec::ReadExt;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Receiver;
 use commonware_runtime::{Clock, Metrics, Network, Resolver, Runner, Spawner};
@@ -17,8 +20,8 @@ use tokio::sync::Notify;
 
 use crate::config::P2PConfig;
 use crate::error::P2PError;
-use crate::message::{P2PMessage, deserialize_message};
-use crate::network::NetworkService;
+use crate::message::{P2PMessage, deserialize_message, serialize_message};
+use crate::network::{NetworkReceivers, NetworkService};
 
 /// P2P service handle returned after spawning.
 pub struct P2PHandle {
@@ -32,6 +35,10 @@ pub struct P2PHandle {
     /// Notify to wake up the service when broadcast queue has data.
     /// Producer should call `broadcast_notify.notify_one()` after pushing.
     pub broadcast_notify: Arc<Notify>,
+    /// Notify signaled when P2P is ready (bootstrap phase completed).
+    pub ready_notify: Arc<Notify>,
+    /// Flag indicating if P2P is ready.
+    pub is_ready: Arc<AtomicBool>,
 }
 
 impl P2PHandle {
@@ -44,6 +51,20 @@ impl P2PHandle {
     /// Wait for the P2P thread to finish.
     pub fn join(self) -> std::thread::Result<()> {
         self.thread_handle.join()
+    }
+
+    /// Wait for the P2P service to be ready (bootstrap phase completed).
+    /// Returns immediately if already ready.
+    pub async fn wait_ready(&self) {
+        if self.is_ready() {
+            return;
+        }
+        self.ready_notify.notified().await;
+    }
+
+    /// Check if P2P is ready without blocking.
+    pub fn is_ready(&self) -> bool {
+        self.is_ready.load(Ordering::Acquire)
     }
 }
 
@@ -68,6 +89,10 @@ where
     let shutdown_notify_clone = Arc::clone(&shutdown_notify);
     let broadcast_notify = Arc::new(Notify::new());
     let broadcast_notify_clone = Arc::clone(&broadcast_notify);
+    let ready_notify = Arc::new(Notify::new());
+    let ready_notify_clone = Arc::clone(&ready_notify);
+    let is_ready = Arc::new(AtomicBool::new(false));
+    let is_ready_clone = Arc::clone(&is_ready);
 
     let thread_handle = std::thread::Builder::new()
         .name("hellas-validator-p2p-thread".to_string())
@@ -84,6 +109,8 @@ where
                     shutdown_clone,
                     shutdown_notify_clone,
                     broadcast_notify_clone,
+                    ready_notify_clone,
+                    is_ready_clone,
                     logger,
                 )
                 .await;
@@ -96,6 +123,8 @@ where
         shutdown,
         shutdown_notify,
         broadcast_notify,
+        ready_notify,
+        is_ready,
     }
 }
 
@@ -111,15 +140,76 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     broadcast_notify: Arc<Notify>,
+    ready_notify: Arc<Notify>,
+    is_ready: Arc<AtomicBool>,
     logger: Logger,
 ) where
     C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng,
 {
     slog::info!(logger, "Starting P2P service"; "public_key" => ?signer.public_key());
 
+    // Parse expected peer public keys from config
+    let expected_peers: HashSet<ed25519::PublicKey> = config
+        .validators
+        .iter()
+        .filter_map(|v| {
+            let pk_bytes = v.parse_public_key_bytes()?;
+            ed25519::PublicKey::read(&mut pk_bytes.as_slice()).ok()
+        })
+        .filter(|pk| pk != &signer.public_key()) // Exclude self
+        .collect();
+
+    // Minimmit protocol requires n >= 5f + 1 total nodes.
+    // For liveness we need n - f nodes ready (including ourselves).
+    // So we wait for (n - f - 1) = 4f other peers to be ready before proceeding.
+    // Note: We use total_number_peers from config which should be >= 5f + 1.
+    let f = config.maximum_number_faulty_peers;
+    let n = config.total_number_peers;
+    // Minimum OTHER peers needed = n - f - 1 (subtracting ourselves)
+    // For n = 5f + 1: min_other_peers = 5f + 1 - f - 1 = 4f
+    let min_other_peers = n.saturating_sub(f).saturating_sub(1);
+    // But also cap at the number of expected peers we actually have in config
+    let min_peers = min_other_peers.min(expected_peers.len());
+
     // Initialize Network
-    let (mut network, mut receivers) =
-        NetworkService::<C>::new(context.clone(), signer, config, logger.clone()).await;
+    let (mut network, mut receivers) = NetworkService::<C>::new(
+        context.clone(),
+        signer.clone(),
+        config.clone(),
+        logger.clone(),
+    )
+    .await;
+
+    // Bootstrap phase: wait for peer readiness
+    let bootstrap_success = run_bootstrap_phase::<C, N, F, M_SIZE>(
+        &context,
+        &mut network,
+        &mut receivers,
+        &expected_peers,
+        min_peers,
+        Duration::from_millis(config.bootstrap_timeout_ms),
+        Duration::from_millis(config.ping_interval_ms),
+        &shutdown,
+        &shutdown_notify,
+        &logger,
+    )
+    .await;
+
+    if shutdown.load(Ordering::Relaxed) {
+        slog::info!(logger, "Shutdown during bootstrap");
+        drop(network);
+        return;
+    }
+
+    if bootstrap_success {
+        slog::info!(logger, "Bootstrap complete, P2P ready"; "peers" => min_peers);
+    } else {
+        slog::warn!(logger, "Bootstrap timeout, proceeding anyway"; "min_peers" => min_peers);
+    }
+
+    // Signal readiness
+    is_ready.store(true, Ordering::Release);
+    ready_notify.notify_waiters();
 
     // Main event loop
     while !shutdown.load(Ordering::Relaxed) {
@@ -179,15 +269,31 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
             }
 
              // 4. Incoming Sync Messages (lowest priority)
-            res = receivers.sync.recv() => {
-                 match res {
+             res = receivers.sync.recv() => {
+                match res {
                     Ok((sender, msg)) => {
                         let msg: Bytes = msg;
-                        slog::debug!(logger, "Received sync message"; "peer" => ?sender, "len" => msg.len());
+                        // Handle Ping/Pong for liveness checks
+                        if let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
+                            match p2p_msg {
+                                P2PMessage::Ping(ts) => {
+                                    // Respond with Pong
+                                    if let Ok(pong_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Pong(ts)) {
+                                        network.send_sync(pong_bytes, vec![sender]).await;
+                                    }
+                                }
+                                P2PMessage::Pong(_ts) => {
+                                    // Liveness confirmed (could track for metrics)
+                                }
+                                _ => {
+                                    slog::debug!(logger, "Received sync message"; "peer" => ?sender, "len" => msg.len());
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                         slog::error!(logger, "Sync receiver error"; "error" => ?e);
-                         break;
+                        slog::error!(logger, "Sync receiver error"; "error" => ?e);
+                        break;
                     }
                 }
             }
@@ -200,6 +306,124 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     // The network handle will be dropped when it goes out of scope
     drop(network);
     slog::info!(logger, "P2P service shut down");
+}
+
+/// Bootstrap phase: discover peers and verify connectivity.
+///
+/// Returns `true` if minimum peers were discovered, `false` on timeout.
+#[allow(clippy::too_many_arguments)]
+async fn run_bootstrap_phase<C, const N: usize, const F: usize, const M_SIZE: usize>(
+    context: &C,
+    network: &mut NetworkService<C>,
+    receivers: &mut NetworkReceivers,
+    expected_peers: &HashSet<ed25519::PublicKey>,
+    min_peers: usize,
+    timeout: Duration,
+    ping_interval: Duration,
+    shutdown: &Arc<AtomicBool>,
+    shutdown_notify: &Arc<Notify>,
+    logger: &Logger,
+) -> bool
+where
+    C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng,
+{
+    use crate::message::{P2PMessage, serialize_message};
+
+    if min_peers == 0 {
+        slog::info!(logger, "No peers required, skipping bootstrap");
+        return true;
+    }
+
+    slog::info!(logger, "Starting bootstrap phase";
+        "expected_peers" => expected_peers.len(),
+        "min_peers" => min_peers,
+        "timeout_ms" => timeout.as_millis()
+    );
+
+    let mut ready_peers: HashSet<ed25519::PublicKey> = HashSet::new();
+    let start = std::time::Instant::now();
+    let mut last_ping = std::time::Instant::now() - ping_interval; // Trigger immediate ping
+
+    loop {
+        // Check shutdown
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // Check timeout
+        if start.elapsed() >= timeout {
+            slog::warn!(logger, "Bootstrap timeout"; "ready_peers" => ready_peers.len());
+            return false;
+        }
+
+        // Check if we have enough peers
+        if ready_peers.len() >= min_peers {
+            slog::info!(logger, "Bootstrap threshold reached"; "ready_peers" => ready_peers.len());
+            return true;
+        }
+
+        // Send pings periodically
+        if last_ping.elapsed() >= ping_interval {
+            let timestamp = context
+                .current()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            if let Ok(ping_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Ping(timestamp))
+            {
+                // Broadcast ping to all peers
+                network.send_sync(ping_bytes, vec![]).await;
+                slog::debug!(logger, "Sent bootstrap ping"; "timestamp" => timestamp);
+            }
+            last_ping = std::time::Instant::now();
+        }
+
+        // Wait for responses (with short timeout for responsiveness)
+        let recv_timeout = Duration::from_millis(100);
+
+        tokio::select! {
+            biased;
+
+            _ = shutdown_notify.notified() => {
+                return false;
+            }
+
+            _ = context.sleep(recv_timeout) => {
+                // Continue loop
+            }
+
+            res = receivers.sync.recv() => {
+                if let Ok((sender, msg)) = res {
+                    if let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
+                        match p2p_msg {
+                            P2PMessage::Ping(ts) => {
+                                // Respond with Pong
+                                if let Ok(pong_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Pong(ts)) {
+                                    network.send_sync(pong_bytes, vec![sender.clone()]).await;
+                                }
+                                // Also mark peer as ready (they can reach us)
+                                if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                                    slog::info!(logger, "Peer ready (received ping)"; "peer" => ?sender, "total" => ready_peers.len());
+                                }
+                            }
+                            P2PMessage::Pong(_ts) => {
+                                // Peer responded to our ping
+                                if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                                    slog::info!(logger, "Peer ready (received pong)"; "peer" => ?sender, "total" => ready_peers.len());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // NOTE: We intentionally do NOT listen on consensus or tx channels during bootstrap.
+            // Consuming messages from those channels would drop them, as they can't be re-sent.
+            // The sync channel ping/pong is sufficient for readiness detection.
+        }
+    }
 }
 
 /// Route an incoming network message to the appropriate channel.
@@ -427,6 +651,7 @@ mod tests {
     fn test_p2p_handle_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(Notify::new());
+        let is_ready = Arc::new(AtomicBool::new(false));
 
         // Create a dummy handle (we can't easily test the full spawn without a real runtime)
         // But we can test the shutdown method
@@ -435,6 +660,8 @@ mod tests {
             shutdown: shutdown.clone(),
             shutdown_notify: shutdown_notify.clone(),
             broadcast_notify: Arc::new(Notify::new()),
+            ready_notify: Arc::new(Notify::new()),
+            is_ready: is_ready.clone(),
         };
 
         assert!(!shutdown.load(Ordering::Relaxed));
@@ -449,12 +676,15 @@ mod tests {
     fn test_p2p_handle_shutdown_idempotent() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(Notify::new());
+        let is_ready = Arc::new(AtomicBool::new(false));
 
         let handle = P2PHandle {
             thread_handle: std::thread::spawn(|| {}),
             shutdown: shutdown.clone(),
             shutdown_notify: shutdown_notify.clone(),
             broadcast_notify: Arc::new(Notify::new()),
+            ready_notify: Arc::new(Notify::new()),
+            is_ready: is_ready.clone(),
         };
 
         // Call shutdown multiple times - should be idempotent
@@ -463,6 +693,30 @@ mod tests {
         handle.shutdown();
 
         assert!(shutdown.load(Ordering::Relaxed));
+
+        // Cleanup
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_p2p_handle_is_ready() {
+        let is_ready = Arc::new(AtomicBool::new(false));
+
+        let handle = P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            broadcast_notify: Arc::new(Notify::new()),
+            ready_notify: Arc::new(Notify::new()),
+            is_ready: is_ready.clone(),
+        };
+
+        // Initially not ready
+        assert!(!handle.is_ready());
+
+        // Simulate becoming ready
+        is_ready.store(true, Ordering::Release);
+        assert!(handle.is_ready());
 
         // Cleanup
         let _ = handle.join();

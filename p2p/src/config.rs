@@ -21,6 +21,12 @@ pub struct P2PConfig {
     /// List of known validators (bootstrap peers).
     pub validators: Vec<ValidatorPeerInfo>,
 
+    /// Total number of peers in the consensus network.
+    pub total_number_peers: usize,
+
+    /// Maximum number of faulty peers in the consensus network.
+    pub maximum_number_faulty_peers: usize,
+
     /// Cluster ID for network namespace (replay protection).
     #[serde(default = "default_cluster_id")]
     pub cluster_id: String,
@@ -40,6 +46,15 @@ pub struct P2PConfig {
     /// Rate limit for transaction messages (per second).
     #[serde(default = "default_tx_rate")]
     pub tx_rate_per_second: u32,
+
+    /// Timeout for bootstrap phase in milliseconds.
+    /// If exceeded, signal ready anyway (for single-node testing).
+    #[serde(default = "default_bootstrap_timeout_ms")]
+    pub bootstrap_timeout_ms: u64,
+
+    /// Interval between Ping retries during bootstrap (milliseconds).
+    #[serde(default = "default_ping_interval_ms")]
+    pub ping_interval_ms: u64,
 }
 
 fn default_max_message_size() -> u32 {
@@ -62,17 +77,29 @@ fn default_tx_rate() -> u32 {
     50000
 }
 
+fn default_bootstrap_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_ping_interval_ms() -> u64 {
+    500
+}
+
 impl Default for P2PConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:9000".parse().unwrap(),
             external_addr: "0.0.0.0:9000".parse().unwrap(),
             validators: vec![],
+            total_number_peers: 6, // 5 * f + 1
+            maximum_number_faulty_peers: 1,
             cluster_id: default_cluster_id(),
             max_message_size: default_max_message_size(),
             message_backlog: default_message_backlog(),
             consensus_rate_per_second: default_consensus_rate(),
             tx_rate_per_second: default_tx_rate(),
+            bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
+            ping_interval_ms: default_ping_interval_ms(),
         }
     }
 }
@@ -156,10 +183,14 @@ mod tests {
             "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
         );
         assert!(config.validators.is_empty());
+        assert_eq!(config.total_number_peers, 6); // 5f + 1 for f=1
+        assert_eq!(config.maximum_number_faulty_peers, 1);
         assert_eq!(config.max_message_size, 1024 * 1024);
         assert_eq!(config.message_backlog, 1024);
         assert_eq!(config.consensus_rate_per_second, 10000);
         assert_eq!(config.tx_rate_per_second, 50000);
+        assert_eq!(config.bootstrap_timeout_ms, 30_000);
+        assert_eq!(config.ping_interval_ms, 500);
     }
 
     #[test]
