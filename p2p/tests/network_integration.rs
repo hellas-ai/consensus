@@ -20,11 +20,15 @@ fn create_test_config(port: u16) -> P2PConfig {
         listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         external_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
         validators: vec![],
+        total_number_peers: 6,          // 5f + 1 for Minimmit (f=1)
+        maximum_number_faulty_peers: 1, // f = 1
         cluster_id: "test-cluster".to_string(),
         max_message_size: 1024 * 1024,
         message_backlog: 1024,
         consensus_rate_per_second: 10000,
         tx_rate_per_second: 50000,
+        bootstrap_timeout_ms: 100, // Short timeout for tests
+        ping_interval_ms: 50,
     }
 }
 
