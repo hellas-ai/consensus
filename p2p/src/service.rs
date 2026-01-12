@@ -170,15 +170,11 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
         .filter(|pk| pk != &signer.public_key()) // Exclude self
         .collect();
 
-    // Minimmit protocol requires n >= 5f + 1 total nodes.
-    // For liveness we need n - f nodes ready (including ourselves).
-    // So we wait for (n - f - 1) = 4f other peers to be ready before proceeding.
-    // Note: We use total_number_peers from config which should be >= 5f + 1.
-    let f = config.maximum_number_faulty_peers;
+    // For reliable consensus startup, we should wait for all peers to be connected.
+    //
+    // Wait for all expected peers (n - 1, excluding ourselves)
     let n = config.total_number_peers;
-    // Minimum OTHER peers needed = n - f - 1 (subtracting ourselves)
-    // For n = 5f + 1: min_other_peers = 5f + 1 - f - 1 = 4f
-    let min_other_peers = n.saturating_sub(f).saturating_sub(1);
+    let min_other_peers = n.saturating_sub(1);
     // But also cap at the number of expected peers we actually have in config
     let min_peers = min_other_peers.min(expected_peers.len());
 

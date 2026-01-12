@@ -3225,6 +3225,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-serialize",
+ "commonware-cryptography",
+ "commonware-runtime",
+ "consensus",
+ "hex",
+ "p2p",
+ "rand 0.8.5",
+ "rtrb",
+ "slog",
+ "slog-async",
+ "slog-stdlog",
+ "slog-term",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

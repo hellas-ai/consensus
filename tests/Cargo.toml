@@ -1,0 +1,21 @@
+[package]
+edition = "2024"
+name    = "tests"
+version = "0.1.0"
+
+[dependencies]
+anyhow                  = { workspace = true }
+ark-serialize           = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-runtime      = { workspace = true }
+consensus               = { workspace = true }
+hex                     = { workspace = true }
+p2p                     = { path = "../p2p" }
+rand                    = { workspace = true }
+rtrb                    = { workspace = true }
+slog                    = { workspace = true }
+slog-async              = { workspace = true }
+slog-stdlog             = { workspace = true }
+slog-term               = { workspace = true }
+tempfile                = { workspace = true }
+tokio                   = { workspace = true, features = [ "full" ] }

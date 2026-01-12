@@ -1,5 +1,5 @@
 [workspace]
-members  = [ "consensus", "crypto", "p2p", "storage", "utils" ]
+members  = [ "consensus", "crypto", "p2p", "storage", "tests", "utils" ]
 resolver = "3"
 
 [workspace.dependencies]
