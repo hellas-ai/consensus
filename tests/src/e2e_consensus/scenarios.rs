@@ -1269,10 +1269,8 @@ fn test_multi_node_equivocating_leader() {
 
         let mut futures = Vec::new();
         // Wait for honest nodes
-        for node in nodes.iter() {
-            if let Some(n) = node {
-                futures.push(n.p2p_handle.wait_ready());
-            }
+        for node in nodes.iter().flatten() {
+            futures.push(node.p2p_handle.wait_ready());
         }
         // Wait for byzantine node
         futures.push(byzantine_node.p2p_handle.wait_ready());
@@ -1800,10 +1798,8 @@ fn test_multi_node_invalid_block_from_leader() {
         // Phase 4: Bootstrap
         slog::info!(logger, "Phase 4: Bootstrapping P2P network");
         let mut futures = Vec::new();
-        for node in nodes.iter() {
-            if let Some(n) = node {
-                futures.push(n.p2p_handle.wait_ready());
-            }
+        for node in nodes.iter().flatten() {
+            futures.push(node.p2p_handle.wait_ready());
         }
         futures.push(byzantine_node.p2p_handle.wait_ready());
         for f in futures {
