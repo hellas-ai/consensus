@@ -34,9 +34,13 @@ pub struct P2PHandle {
     /// Notify to wake up the service when shutdown is requested.
     /// This ensures the service exits immediately rather than waiting for a recv timeout.
     pub shutdown_notify: Arc<Notify>,
-    /// Notify to wake up the service when broadcast queue has data.
+    /// Notify to wake up the service when consensus broadcast queue has data.
     /// Producer should call `broadcast_notify.notify_one()` after pushing.
     pub broadcast_notify: Arc<Notify>,
+    /// Producer for outgoing transaction broadcasts.
+    pub tx_broadcast_producer: Producer<Transaction>,
+    /// Notify to wake up the service when transaction broadcast queue has data.
+    pub tx_broadcast_notify: Arc<Notify>,
     /// Notify signaled when P2P is ready (bootstrap phase completed).
     pub ready_notify: Arc<Notify>,
     /// Flag indicating if P2P is ready.
@@ -68,6 +72,19 @@ impl P2PHandle {
     pub fn is_ready(&self) -> bool {
         self.is_ready.load(Ordering::Acquire)
     }
+
+    /// Broadcast a transaction to all peers.
+    ///
+    /// This queues the transaction for broadcast via the P2P network.
+    /// The transaction will be sent to all connected peers.
+    pub fn broadcast_transaction(
+        &mut self,
+        tx: Transaction,
+    ) -> Result<(), rtrb::PushError<Transaction>> {
+        self.tx_broadcast_producer.push(tx)?;
+        self.tx_broadcast_notify.notify_one();
+        Ok(())
+    }
 }
 
 /// Spawn the P2P service on a new thread.
@@ -91,10 +108,15 @@ where
     let shutdown_notify_clone = Arc::clone(&shutdown_notify);
     let broadcast_notify = Arc::new(Notify::new());
     let broadcast_notify_clone = Arc::clone(&broadcast_notify);
+    let tx_broadcast_notify = Arc::new(Notify::new());
+    let tx_broadcast_notify_clone = Arc::clone(&tx_broadcast_notify);
     let ready_notify = Arc::new(Notify::new());
     let ready_notify_clone = Arc::clone(&ready_notify);
     let is_ready = Arc::new(AtomicBool::new(false));
     let is_ready_clone = Arc::clone(&is_ready);
+
+    // Create transaction broadcast channel
+    let (tx_broadcast_producer, tx_broadcast_consumer) = rtrb::RingBuffer::new(10_000);
 
     // Extract the ed25519 key for network transport
     let signer = identity.clone_ed25519_private_key();
@@ -113,9 +135,11 @@ where
                     consensus_producer,
                     tx_producer,
                     broadcast_consumer,
+                    tx_broadcast_consumer,
                     shutdown_clone,
                     shutdown_notify_clone,
                     broadcast_notify_clone,
+                    tx_broadcast_notify_clone,
                     ready_notify_clone,
                     is_ready_clone,
                     logger,
@@ -130,6 +154,8 @@ where
         shutdown,
         shutdown_notify,
         broadcast_notify,
+        tx_broadcast_producer,
+        tx_broadcast_notify,
         ready_notify,
         is_ready,
     }
@@ -145,9 +171,11 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     mut consensus_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
     mut tx_producer: Producer<Transaction>,
     mut broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
+    mut tx_broadcast_consumer: Consumer<Transaction>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     broadcast_notify: Arc<Notify>,
+    tx_broadcast_notify: Arc<Notify>,
     ready_notify: Arc<Notify>,
     is_ready: Arc<AtomicBool>,
     logger: Logger,
@@ -275,7 +303,21 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
                 }
             }
 
-             // 4. Incoming Sync Messages (lowest priority)
+            // 4. Outgoing Transaction Broadcasts
+            _ = tx_broadcast_notify.notified() => {
+                while let Ok(tx) = tx_broadcast_consumer.pop() {
+                    match crate::message::serialize_message(&P2PMessage::<N, F, M_SIZE>::Transaction(tx)) {
+                        Ok(bytes) => {
+                            network.broadcast_transaction(bytes, vec![]).await;
+                        }
+                        Err(e) => {
+                            slog::error!(logger, "Failed to serialize transaction broadcast"; "error" => ?e);
+                        }
+                    }
+                }
+            }
+
+             // 5. Incoming Sync Messages (lowest priority)
              res = receivers.sync.recv() => {
                 match res {
                     Ok((sender, msg)) => {
@@ -477,6 +519,26 @@ mod tests {
         Logger::root(slog::Discard, slog::o!())
     }
 
+    /// Helper to create a P2PHandle for testing.
+    fn create_test_handle(
+        shutdown: Arc<AtomicBool>,
+        shutdown_notify: Arc<Notify>,
+        is_ready: Arc<AtomicBool>,
+        ready_notify: Arc<Notify>,
+    ) -> P2PHandle {
+        let (tx_broadcast_producer, _tx_broadcast_consumer) = RingBuffer::<Transaction>::new(100);
+        P2PHandle {
+            thread_handle: std::thread::spawn(|| {}),
+            shutdown,
+            shutdown_notify,
+            broadcast_notify: Arc::new(Notify::new()),
+            tx_broadcast_producer,
+            tx_broadcast_notify: Arc::new(Notify::new()),
+            ready_notify,
+            is_ready,
+        }
+    }
+
     #[test]
     fn test_route_consensus_message() {
         let logger = create_test_logger();
@@ -660,14 +722,12 @@ mod tests {
 
         // Create a dummy handle (we can't easily test the full spawn without a real runtime)
         // But we can test the shutdown method
-        let handle = P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: shutdown.clone(),
-            shutdown_notify: shutdown_notify.clone(),
-            broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: Arc::new(Notify::new()),
-            is_ready: is_ready.clone(),
-        };
+        let handle = create_test_handle(
+            shutdown.clone(),
+            shutdown_notify.clone(),
+            is_ready.clone(),
+            Arc::new(Notify::new()),
+        );
 
         assert!(!shutdown.load(Ordering::Relaxed));
         handle.shutdown();
@@ -683,14 +743,12 @@ mod tests {
         let shutdown_notify = Arc::new(Notify::new());
         let is_ready = Arc::new(AtomicBool::new(false));
 
-        let handle = P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: shutdown.clone(),
-            shutdown_notify: shutdown_notify.clone(),
-            broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: Arc::new(Notify::new()),
-            is_ready: is_ready.clone(),
-        };
+        let handle = create_test_handle(
+            shutdown.clone(),
+            shutdown_notify.clone(),
+            is_ready.clone(),
+            Arc::new(Notify::new()),
+        );
 
         // Call shutdown multiple times - should be idempotent
         handle.shutdown();
@@ -707,14 +765,12 @@ mod tests {
     fn test_p2p_handle_is_ready() {
         let is_ready = Arc::new(AtomicBool::new(false));
 
-        let handle = P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: Arc::new(Notify::new()),
-            is_ready: is_ready.clone(),
-        };
+        let handle = create_test_handle(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Notify::new()),
+            is_ready.clone(),
+            Arc::new(Notify::new()),
+        );
 
         // Initially not ready
         assert!(!handle.is_ready());
@@ -732,14 +788,12 @@ mod tests {
         let is_ready = Arc::new(AtomicBool::new(true));
         let ready_notify = Arc::new(Notify::new());
 
-        let handle = P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: ready_notify.clone(),
-            is_ready: is_ready.clone(),
-        };
+        let handle = create_test_handle(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Notify::new()),
+            is_ready.clone(),
+            ready_notify.clone(),
+        );
 
         // Should return immediately if already ready
         let start = std::time::Instant::now();
@@ -758,14 +812,12 @@ mod tests {
         let is_ready = Arc::new(AtomicBool::new(false));
         let ready_notify = Arc::new(Notify::new());
 
-        let handle = P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: ready_notify.clone(),
-            is_ready: is_ready.clone(),
-        };
+        let handle = create_test_handle(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Notify::new()),
+            is_ready.clone(),
+            ready_notify.clone(),
+        );
 
         // Spawn a task that will signal ready after a delay
         let ready_notify_clone = ready_notify.clone();
