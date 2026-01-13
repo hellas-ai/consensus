@@ -5,7 +5,8 @@
 //!
 //! Unlike the consensus e2e tests which push transactions directly to mempools,
 //! these tests verify the full gossip flow:
-//! Source Node -> P2P broadcast_transaction -> Network -> Peer Nodes -> route_incoming_message -> Mempool
+//! Source Node -> P2P broadcast_transaction -> Network -> Peer Nodes -> route_incoming_message ->
+//! Mempool
 
 #![cfg(test)]
 
@@ -83,19 +84,16 @@ fn test_single_node_broadcasts_tx_all_nodes_receive() {
                     continue;
                 }
 
-                match network.nodes[i].tx_consumer.pop() {
-                    Ok(received_tx) => {
-                        if received_tx.tx_hash == tx_hash {
-                            slog::info!(
-                                logger,
-                                "Transaction received";
-                                "node" => i,
-                                "elapsed_ms" => start.elapsed().as_millis(),
-                            );
-                            received_by.insert(i);
-                        }
-                    }
-                    Err(_) => {}
+                if let Ok(received_tx) = network.nodes[i].tx_consumer.pop()
+                    && received_tx.tx_hash == tx_hash
+                {
+                    slog::info!(
+                        logger,
+                        "Transaction received";
+                        "node" => i,
+                        "elapsed_ms" => start.elapsed().as_millis(),
+                    );
+                    received_by.insert(i);
                 }
             }
 
@@ -196,14 +194,14 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
         while start.elapsed() < timeout {
             let mut all_complete = true;
 
-            for i in 0..N {
+            for (i, received) in received_per_node.iter_mut().enumerate().take(N) {
                 // Each node should receive N-1 transactions (all except its own)
-                if received_per_node[i].len() < N - 1 {
+                if received.len() < N - 1 {
                     all_complete = false;
 
                     // Poll for received transactions
                     while let Ok(tx) = network.nodes[i].tx_consumer.pop() {
-                        received_per_node[i].insert(tx.tx_hash);
+                        received.insert(tx.tx_hash);
                     }
                 }
             }
@@ -218,8 +216,8 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
         // Phase 4: Verify results
         slog::info!(logger, "Phase 4: Verifying results");
 
-        for i in 0..N {
-            let received_count = received_per_node[i].len();
+        for (i, received) in received_per_node.iter_mut().enumerate().take(N) {
+            let received_count = received.len();
             slog::info!(
                 logger,
                 "Node received transactions";
@@ -524,13 +522,13 @@ fn test_gossip_resilience_with_byzantine_node() {
         while start.elapsed() < timeout {
             let mut all_complete = true;
 
-            for i in 1..N {
+            for (i, received) in received_per_node.iter_mut().enumerate().take(N).skip(1) {
                 // Only check honest nodes
-                if received_per_node[i].len() < expected_per_honest {
+                if received.len() < expected_per_honest {
                     all_complete = false;
 
                     while let Ok(tx) = network.nodes[i].tx_consumer.pop() {
-                        received_per_node[i].insert(tx.tx_hash);
+                        received.insert(tx.tx_hash);
                     }
                 }
             }
@@ -545,22 +543,22 @@ fn test_gossip_resilience_with_byzantine_node() {
         // Phase 4: Verify all honest nodes received transactions
         slog::info!(logger, "Phase 4: Verifying honest node reception");
 
-        for i in 1..N {
-            let received = received_per_node[i].len();
+        for (i, received) in received_per_node.iter_mut().enumerate().take(N).skip(1) {
+            let received_count = received.len();
             slog::info!(
                 logger,
                 "Honest node received";
                 "node" => i,
-                "received" => received,
+                "received" => received_count,
                 "expected" => expected_per_honest,
             );
 
             assert!(
-                received >= expected_per_honest,
+                received_count >= expected_per_honest,
                 "Honest node {} should receive at least {} txs, got {}",
                 i,
                 expected_per_honest,
-                received
+                received_count
             );
         }
 

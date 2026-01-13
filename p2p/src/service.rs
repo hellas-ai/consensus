@@ -80,8 +80,8 @@ impl P2PHandle {
     pub fn broadcast_transaction(
         &mut self,
         tx: Transaction,
-    ) -> Result<(), rtrb::PushError<Transaction>> {
-        self.tx_broadcast_producer.push(tx)?;
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.tx_broadcast_producer.push(tx).map_err(Box::new)?;
         self.tx_broadcast_notify.notify_one();
         Ok(())
     }

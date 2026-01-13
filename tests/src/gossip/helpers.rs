@@ -472,14 +472,11 @@ pub fn count_nodes_with_tx(
                 continue;
             }
 
-            match node.tx_consumer.pop() {
-                Ok(tx) => {
-                    if tx.tx_hash == expected_tx_hash {
-                        received.insert(i);
-                        count += 1;
-                    }
-                }
-                Err(_) => {}
+            if let Ok(tx) = node.tx_consumer.pop()
+                && tx.tx_hash == expected_tx_hash
+            {
+                received.insert(i);
+                count += 1;
             }
         }
 
