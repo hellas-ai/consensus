@@ -307,9 +307,16 @@ fn create_gossip_node(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Create shared tx channel - P2P writes, Mempool reads
+    let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
     // Spawn MempoolService
-    let (mempool_service, mempool_channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger.clone());
+    let (mempool_service, mempool_channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger.clone(),
+    );
 
     // Create P2P tx channel - THIS is where gossiped transactions arrive
     // The tx_consumer is what we'll poll in tests to verify gossip propagation
@@ -362,7 +369,7 @@ fn create_gossip_node(
         p2p_handle,
         consensus_engine,
         tx_consumer,
-        mempool_tx_producer: mempool_channels.tx_producer,
+        mempool_tx_producer: tx_producer,
         mempool_service,
         peer_id,
         node_idx,

@@ -43,9 +43,6 @@ use std::{
 /// Default ring buffer size for channels.
 const RING_BUFFER_SIZE: usize = 256;
 
-/// Ring buffer size for transaction channel (larger due to higher volume).
-const TX_RING_BUFFER_SIZE: usize = 1024;
-
 /// Constant for transaction batch size.
 const TX_BATCH_SIZE: usize = 1024;
 
@@ -64,8 +61,6 @@ pub struct MempoolService {
 
 /// Channel endpoints for communicating with the mempool service.
 pub struct MempoolChannels {
-    /// Producer for submitting transactions (P2P/RPC → Mempool)
-    pub tx_producer: Producer<Transaction>,
     /// Consumer for receiving block proposals (Mempool → Consensus)
     pub proposal_resp_consumer: Consumer<ProposalResponse>,
     /// Producer for requesting block proposals (Consensus → Mempool)
@@ -79,6 +74,7 @@ impl MempoolService {
     ///
     /// # Arguments
     ///
+    /// * tx_consumer - Consumer for incoming transactions
     /// * pending_state_reader - Reader for M-notarized pending state
     /// * shutdown - Shared shutdown signal
     /// * logger - Logger for diagnostics
@@ -87,12 +83,14 @@ impl MempoolService {
     ///
     /// A tuple containing the service handle and channel endpoints.
     pub fn spawn(
+        tx_consumer: Consumer<Transaction>,
         pending_state_reader: PendingStateReader,
         shutdown: Arc<AtomicBool>,
         logger: Logger,
     ) -> (Self, MempoolChannels) {
         Self::spawn_with_capacity(
             DEFAULT_POOL_CAPACITY,
+            tx_consumer,
             pending_state_reader,
             shutdown,
             logger,
@@ -102,12 +100,11 @@ impl MempoolService {
     /// Spawns the mempool service with custom pool capacity.
     pub fn spawn_with_capacity(
         pool_capacity: usize,
+        tx_consumer: Consumer<Transaction>,
         pending_state_reader: PendingStateReader,
         shutdown: Arc<AtomicBool>,
         logger: Logger,
     ) -> (Self, MempoolChannels) {
-        // Transaction input channel (P2P/RPC → Mempool)
-        let (tx_producer, tx_consumer) = RingBuffer::<Transaction>::new(TX_RING_BUFFER_SIZE);
         // Proposal request channel (Consensus → Mempool)
         let (proposal_req_producer, proposal_req_consumer) =
             RingBuffer::<ProposalRequest>::new(RING_BUFFER_SIZE);
@@ -138,7 +135,6 @@ impl MempoolService {
             .expect("Failed to spawn mempool thread");
 
         let channels = MempoolChannels {
-            tx_producer,
             proposal_resp_consumer,
             proposal_req_producer,
             finalized_producer,
@@ -666,6 +662,30 @@ mod tests {
     use crate::validation::PendingStateWriter;
     use std::path::PathBuf;
 
+    const TEST_BUFFER_SIZE: usize = 1024;
+
+    /// Test helper that bundles mempool service with its tx_producer
+    struct TestMempoolSetup {
+        service: MempoolService,
+        tx_producer: Producer<Transaction>,
+        channels: MempoolChannels,
+    }
+
+    /// Creates a mempool service for testing with a tx_producer
+    fn spawn_test_mempool(
+        reader: PendingStateReader,
+        shutdown: Arc<AtomicBool>,
+        logger: Logger,
+    ) -> TestMempoolSetup {
+        let (tx_producer, tx_consumer) = RingBuffer::new(TEST_BUFFER_SIZE);
+        let (service, channels) = MempoolService::spawn(tx_consumer, reader, shutdown, logger);
+        TestMempoolSetup {
+            service,
+            tx_producer,
+            channels,
+        }
+    }
+
     fn temp_db_path() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
@@ -702,13 +722,13 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, _channels) = MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
-        assert!(service.is_running());
+        assert!(setup.service.is_running());
 
-        service.shutdown();
+        setup.service.shutdown();
 
-        assert!(service.handle.is_none());
+        assert!(setup.service.handle.is_none());
     }
 
     #[test]
@@ -728,13 +748,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions with sequential nonces
         for nonce in 0..5 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10 + nonce);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         // Wait for processing
@@ -747,16 +766,16 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         // Wait for response
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp.view, 1);
         assert_eq!(resp.transactions.len(), 5);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -768,8 +787,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         let (sk, _sender) = gen_keypair();
         let (_, wrong_sender) = gen_keypair();
@@ -777,7 +795,7 @@ mod tests {
 
         // Create tx with mismatched sender/signature
         let invalid_tx = create_tx(&sk, wrong_sender, recipient, 100, 0, 10);
-        channels.tx_producer.push(invalid_tx).unwrap();
+        setup.tx_producer.push(invalid_tx).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -787,14 +805,14 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert!(resp.transactions.is_empty());
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -813,12 +831,11 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transaction that exceeds balance (needs 210, has 100)
         let tx = create_tx(&sk, sender, recipient, 200, 0, 10);
-        channels.tx_producer.push(tx).unwrap();
+        setup.tx_producer.push(tx).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -828,14 +845,14 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert!(resp.transactions.is_empty());
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -854,16 +871,15 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions with nonce gap (0, 2 - missing 1)
         // tx0 goes to pending, tx2 goes to queued
         let tx0 = create_tx(&sk, sender, recipient, 100, 0, 20);
         let tx2 = create_tx(&sk, sender, recipient, 100, 2, 10);
 
-        channels.tx_producer.push(tx0).unwrap();
-        channels.tx_producer.push(tx2).unwrap();
+        setup.tx_producer.push(tx0).unwrap();
+        setup.tx_producer.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -873,16 +889,16 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Only tx with nonce 0 should be included (tx2 is in queued pool)
         assert_eq!(resp.transactions.len(), 1);
         assert_eq!(resp.transactions[0].nonce, 0);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -901,8 +917,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions out of order (2, 0, 1)
         // This tests that the pool promotes correctly
@@ -910,9 +925,9 @@ mod tests {
         let tx0 = create_tx(&sk, sender, recipient, 100, 0, 30);
         let tx1 = create_tx(&sk, sender, recipient, 100, 1, 20);
 
-        channels.tx_producer.push(tx2).unwrap(); // Goes to queued
-        channels.tx_producer.push(tx0).unwrap(); // Goes to pending
-        channels.tx_producer.push(tx1).unwrap(); // Goes to pending, promotes tx2
+        setup.tx_producer.push(tx2).unwrap(); // Goes to queued
+        setup.tx_producer.push(tx0).unwrap(); // Goes to pending
+        setup.tx_producer.push(tx1).unwrap(); // Goes to pending, promotes tx2
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -922,15 +937,15 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // All 3 should be included (tx2 was promoted when tx1 was added)
         assert_eq!(resp.transactions.len(), 3);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -955,16 +970,15 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // sender1: fee 50, sender2: fee 100
         // sender2 should come first in proposal
         let tx1 = create_tx(&sk1, sender1, recipient, 100, 0, 50);
         let tx2 = create_tx(&sk2, sender2, recipient, 100, 0, 100);
 
-        channels.tx_producer.push(tx1).unwrap();
-        channels.tx_producer.push(tx2).unwrap();
+        setup.tx_producer.push(tx1).unwrap();
+        setup.tx_producer.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -974,17 +988,17 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp.transactions.len(), 2);
         // Higher fee tx should come first
         assert_eq!(resp.transactions[0].fee, 100);
         assert_eq!(resp.transactions[1].fee, 50);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1003,13 +1017,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit 10 transactions
         for nonce in 0..10 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1022,16 +1035,16 @@ mod tests {
             max_bytes: 400, // Should fit ~2 transactions
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Should have fewer than 10 transactions due to size limit
         assert!(resp.transactions.len() < 10);
         assert!(!resp.transactions.is_empty());
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1050,13 +1063,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit 10 transactions
         for nonce in 0..10 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1068,18 +1080,18 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp.transactions.len(), 3);
         // Should be nonces 0, 1, 2
         assert_eq!(resp.transactions[0].nonce, 0);
         assert_eq!(resp.transactions[1].nonce, 1);
         assert_eq!(resp.transactions[2].nonce, 2);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1100,13 +1112,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit 3 transactions, each costs 110 (100 amount + 10 fee)
         for nonce in 0..3 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1117,17 +1128,17 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Only 2 txs should be included (balance exhausted after 2)
         assert_eq!(resp.transactions.len(), 2);
         assert_eq!(resp.transactions[0].nonce, 0);
         assert_eq!(resp.transactions[1].nonce, 1);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1147,16 +1158,15 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // tx0: amount 500, fee 10 -> needs 510 (can't afford)
         // tx1: amount 50, fee 10 -> needs 60 (could afford if tx0 didn't exist)
         let tx0 = create_tx(&sk, sender, recipient, 500, 0, 10);
         let tx1 = create_tx(&sk, sender, recipient, 50, 1, 10);
 
-        channels.tx_producer.push(tx0).unwrap();
-        channels.tx_producer.push(tx1).unwrap();
+        setup.tx_producer.push(tx0).unwrap();
+        setup.tx_producer.push(tx1).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1166,17 +1176,17 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Neither tx should be included:
         // - tx0 fails balance check
         // - tx1 is skipped because tx0 created a nonce gap
         assert!(resp.transactions.is_empty());
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1195,15 +1205,14 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit 5 transactions
         let mut tx_hashes = Vec::new();
         for nonce in 0..5 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
             tx_hashes.push(tx.tx_hash);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1215,10 +1224,10 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp.transactions.len(), 5);
 
         // Finalize first 2 transactions
@@ -1226,7 +1235,7 @@ mod tests {
             view: 1,
             tx_hashes: vec![tx_hashes[0], tx_hashes[1]],
         };
-        channels.finalized_producer.push(finalized).unwrap();
+        setup.channels.finalized_producer.push(finalized).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1242,17 +1251,17 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req2).unwrap();
+        setup.channels.proposal_req_producer.push(req2).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp2 = channels.proposal_resp_consumer.pop().unwrap();
+        let resp2 = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp2.transactions.len(), 3);
         // Should be nonces 2, 3, 4
         assert_eq!(resp2.transactions[0].nonce, 2);
         assert_eq!(resp2.transactions[1].nonce, 3);
         assert_eq!(resp2.transactions[2].nonce, 4);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1272,13 +1281,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions with nonces 0, 1, 2
         for nonce in 0..3 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1295,16 +1303,16 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Only nonce 2 should be included (0 and 1 are stale)
         assert_eq!(resp.transactions.len(), 1);
         assert_eq!(resp.transactions[0].nonce, 2);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1316,8 +1324,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Request proposal without submitting any transactions
         let req = ProposalRequest {
@@ -1326,15 +1333,15 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert!(resp.transactions.is_empty());
         assert_eq!(resp.total_fees, 0);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1353,13 +1360,12 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // Submit transactions with fees 10, 20, 30
         for (nonce, fee) in [(0, 10), (1, 20), (2, 30)] {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, fee);
-            channels.tx_producer.push(tx).unwrap();
+            setup.tx_producer.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1370,15 +1376,15 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         assert_eq!(resp.transactions.len(), 3);
         assert_eq!(resp.total_fees, 60); // 10 + 20 + 30
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 
     #[test]
@@ -1402,16 +1408,15 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        let (mut service, mut channels) =
-            MempoolService::spawn(reader, Arc::clone(&shutdown), logger);
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
 
         // sender1 sends 500 to sender2 (fee 10)
         let tx1 = create_tx(&sk1, sender1, sender2, 500, 0, 10);
         // sender2 tries to send 400 (fee 10) - needs the 500 from tx1
         let tx2 = create_tx(&sk2, sender2, sender1, 400, 0, 10);
 
-        channels.tx_producer.push(tx1).unwrap();
-        channels.tx_producer.push(tx2).unwrap();
+        setup.tx_producer.push(tx1).unwrap();
+        setup.tx_producer.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1421,16 +1426,16 @@ mod tests {
             max_bytes: 100_000,
             parent_block_hash: [0u8; 32],
         };
-        channels.proposal_req_producer.push(req).unwrap();
+        setup.channels.proposal_req_producer.push(req).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let resp = channels.proposal_resp_consumer.pop().unwrap();
+        let resp = setup.channels.proposal_resp_consumer.pop().unwrap();
         // Both transactions should be included:
         // - tx1: sender1 (1000) sends 500+10 to sender2
         // - tx2: sender2 (50 + 500 received = 550) sends 400+10
         assert_eq!(resp.transactions.len(), 2);
 
-        service.shutdown();
+        setup.service.shutdown();
     }
 }

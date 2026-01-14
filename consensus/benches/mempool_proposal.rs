@@ -3,6 +3,7 @@
 //! Measures the time from ProposalRequest to ProposalResponse under various conditions.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use rtrb::RingBuffer;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -44,15 +45,21 @@ fn setup_mempool() -> (
     let (writer, _reader) = PendingStateWriter::new(storage, 0);
     let pending_state_reader = writer.reader();
 
+    let (tx_producer, tx_consumer) = RingBuffer::new(1024);
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-    let (service, channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger);
+    let (service, channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger,
+    );
 
     (
         service,
-        channels.tx_producer,
+        tx_producer,
         channels.proposal_req_producer,
         channels.proposal_resp_consumer,
         shutdown,

@@ -148,12 +148,18 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Spawn MempoolService - this creates the transaction channels
-    let (mempool_service, mempool_channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger.clone());
+    // Create transaction channel for mempool
+    let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Spawn MempoolService with the tx_consumer
+    let (mempool_service, mempool_channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger.clone(),
+    );
 
     // Create a separate tx channel for P2P (P2P will receive gossipped transactions)
-    // The mempool's tx_producer is kept for test to submit transactions directly
     let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
     // Clone the BLS secret key before moving identity
@@ -195,7 +201,7 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     let node = NodeSetup {
         p2p_handle,
         consensus_engine,
-        tx_producer: mempool_channels.tx_producer, // Test can submit directly to mempool
+        tx_producer, // Test can submit directly to mempool
         mempool_service,
     };
 
@@ -1118,9 +1124,16 @@ fn create_byzantine_node_setup<const N: usize, const F: usize, const M_SIZE: usi
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Create transaction channel for mempool
+    let (_tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
     // Spawn Mempool
-    let (_mempool_service, _mempool_channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger.clone());
+    let (_mempool_service, _mempool_channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger.clone(),
+    );
 
     let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
