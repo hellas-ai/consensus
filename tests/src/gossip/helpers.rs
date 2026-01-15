@@ -307,20 +307,52 @@ fn create_gossip_node(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Create shared tx channel - P2P writes, Mempool reads
-    let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Create transaction routing:
+    // P2P -> intermediate buffer -> forwarder -> (mempool buffer, test buffer)
+    // This allows both mempool and tests to receive gossiped transactions
 
-    // Spawn MempoolService
+    // Channel from P2P to forwarder
+    let (p2p_tx_producer, p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Channel from forwarder to mempool
+    let (mempool_tx_producer, mempool_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Channel from forwarder to test verification
+    let (test_tx_producer, test_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Channel for direct mempool submission (for comparison tests)
+    let (direct_tx_producer, _direct_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Spawn forwarder thread that routes transactions to both mempool and test consumer
+    let forwarder_shutdown = Arc::clone(&shutdown);
+    std::thread::spawn(move || {
+        let mut p2p_consumer: Consumer<Transaction> = p2p_tx_consumer;
+        let mut mempool_producer: Producer<Transaction> = mempool_tx_producer;
+        let mut test_producer: Producer<Transaction> = test_tx_producer;
+
+        while !forwarder_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            match p2p_consumer.pop() {
+                Ok(tx) => {
+                    // Forward to mempool
+                    let _ = mempool_producer.push(tx.clone());
+                    // Forward to test consumer
+                    let _ = test_producer.push(tx);
+                }
+                Err(_) => {
+                    // No transactions available, sleep briefly
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        }
+    });
+
+    // Spawn MempoolService - reads from the forwarded tx channel
     let (mempool_service, mempool_channels) = MempoolService::spawn(
-        tx_consumer,
+        mempool_tx_consumer,
         pending_state_reader,
         Arc::clone(&shutdown),
         logger.clone(),
     );
-
-    // Create P2P tx channel - THIS is where gossiped transactions arrive
-    // The tx_consumer is what we'll poll in tests to verify gossip propagation
-    let (p2p_tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
     // Extract values from identity before consuming it
     let peer_id = identity.peer_id();
@@ -368,8 +400,8 @@ fn create_gossip_node(
     let node = GossipTestNode {
         p2p_handle,
         consensus_engine,
-        tx_consumer,
-        mempool_tx_producer: tx_producer,
+        tx_consumer: test_tx_consumer,
+        mempool_tx_producer: direct_tx_producer,
         mempool_service,
         peer_id,
         node_idx,
