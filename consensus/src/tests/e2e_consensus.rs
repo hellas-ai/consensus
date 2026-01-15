@@ -3309,6 +3309,8 @@ fn test_e2e_consensus_invalid_tx_rejection() {
     let mut invalid_transactions = Vec::new();
     let mut valid_tx_hashes = HashSet::new();
     let mut invalid_tx_hashes = HashSet::new();
+    // Track transactions that compete for the same (sender, nonce) - exactly one should be included
+    let mut conflicting_tx_hashes: HashSet<[u8; 32]> = HashSet::new();
 
     // Generate 20 VALID transactions
     for i in 0..20 {
@@ -3376,26 +3378,51 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         invalid_transactions.push(tx);
     }
 
-    // Type 2: Bad nonce (stale - already used)
+    // Type 2: Conflicting nonce (competing for same nonce as a valid tx)
+    // This is NOT strictly invalid - it competes with another valid tx for nonce 0.
+    // Exactly ONE of the two nonce-0 transactions should be included.
+    // We use the SAME amount/fee as the valid tx so balance tracking works regardless of winner.
     {
         let (sender_sk, sender_pk) = &user_keys[1];
-        let (_, receiver_pk) = &user_keys[2];
         let sender_addr = Address::from_public_key(sender_pk);
-        let receiver_addr = Address::from_public_key(receiver_pk);
+
+        // Find the valid tx from user[1] with nonce 0 to get its parameters
+        let mut conflicting_amount = 100u64;
+        let mut conflicting_fee = 10u64;
+        let mut conflicting_recipient = Address::from_bytes([0u8; 32]);
+
+        for valid_tx in &valid_transactions {
+            if valid_tx.sender == sender_addr && valid_tx.nonce == 0 {
+                // Use the same parameters so balance impact is identical
+                conflicting_amount = valid_tx.amount();
+                conflicting_fee = valid_tx.fee;
+                conflicting_recipient = valid_tx
+                    .recipient()
+                    .unwrap_or(Address::from_bytes([0u8; 32]));
+                // Track the valid tx as conflicting
+                conflicting_tx_hashes.insert(valid_tx.tx_hash);
+                // Remove from valid_tx_hashes since it's now in conflicting set
+                valid_tx_hashes.remove(&valid_tx.tx_hash);
+                break;
+            }
+        }
 
         let tx = Transaction::new_transfer(
             sender_addr,
-            receiver_addr,
-            50,
-            0, // Invalid: nonce 0 already used
-            10,
+            conflicting_recipient,
+            conflicting_amount, // Same amount as valid tx
+            0,                  // Competing for nonce 0
+            conflicting_fee,    // Same fee as valid tx
             sender_sk,
         );
 
-        slog::debug!(logger, "Created invalid tx: stale nonce");
+        slog::debug!(logger, "Created conflicting tx: competing for nonce 0";
+            "amount" => conflicting_amount,
+            "fee" => conflicting_fee);
 
-        invalid_tx_hashes.insert(tx.tx_hash);
-        invalid_transactions.push(tx);
+        // Track this tx in conflicting set (NOT invalid_tx_hashes)
+        conflicting_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx); // Still submit it to test the conflict
     }
 
     // Type 3: Insufficient balance
@@ -3446,7 +3473,8 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         logger,
         "Generated transactions";
         "valid_count" => valid_transactions.len(),
-        "invalid_count" => invalid_transactions.len(),
+        "conflicting_count" => conflicting_tx_hashes.len(),
+        "invalid_count" => invalid_tx_hashes.len(),
     );
 
     // Combine and shuffle transactions
@@ -3645,14 +3673,36 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         valid_inclusion_rate * 100.0
     );
 
-    // Check 2: NO invalid transactions should be included
+    // Check 2: Exactly ONE of the conflicting nonce transactions should be included
+    // (Tests that we don't double-spend and that at least one valid tx wins)
+    let conflicting_included: Vec<_> = conflicting_tx_hashes
+        .intersection(&included_tx_hashes)
+        .collect();
+
+    assert_eq!(
+        conflicting_included.len(),
+        1,
+        "Exactly one of the conflicting nonce-0 transactions should be included. \
+         Found {} included. If > 1, this is a double-spend bug! If 0, valid tx was lost.",
+        conflicting_included.len()
+    );
+
+    slog::info!(
+        logger,
+        "Conflicting nonce test passed! ✓";
+        "conflicting_txs" => conflicting_tx_hashes.len(),
+        "included" => 1,
+        "correctly_rejected" => conflicting_tx_hashes.len() - 1,
+    );
+
+    // Check 3: NO truly invalid transactions should be included
     let included_invalid: Vec<_> = invalid_tx_hashes
         .intersection(&included_tx_hashes)
         .collect();
 
     assert!(
         included_invalid.is_empty(),
-        "Invalid transactions were incorrectly included! Found {} invalid txs in finalized blocks",
+        "Truly invalid transactions were incorrectly included! Found {} invalid txs in finalized blocks",
         included_invalid.len()
     );
 
@@ -3662,6 +3712,8 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         "valid_submitted" => valid_tx_hashes.len(),
         "valid_included" => valid_tx_hashes.len() - missing_valid.len(),
         "valid_inclusion_rate" => format!("{:.2}%", valid_inclusion_rate * 100.0),
+        "conflicting_txs" => conflicting_tx_hashes.len(),
+        "conflicting_included" => 1,
         "invalid_submitted" => invalid_tx_hashes.len(),
         "invalid_included" => 0,
         "invalid_correctly_rejected" => true,
