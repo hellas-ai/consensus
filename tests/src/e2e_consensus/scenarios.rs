@@ -148,12 +148,18 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Spawn MempoolService - this creates the transaction channels
-    let (mempool_service, mempool_channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger.clone());
+    // Create transaction channel for mempool
+    let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Spawn MempoolService with the tx_consumer
+    let (mempool_service, mempool_channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger.clone(),
+    );
 
     // Create a separate tx channel for P2P (P2P will receive gossipped transactions)
-    // The mempool's tx_producer is kept for test to submit transactions directly
     let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
     // Clone the BLS secret key before moving identity
@@ -195,7 +201,7 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     let node = NodeSetup {
         p2p_handle,
         consensus_engine,
-        tx_producer: mempool_channels.tx_producer, // Test can submit directly to mempool
+        tx_producer, // Test can submit directly to mempool
         mempool_service,
     };
 
@@ -871,6 +877,7 @@ fn test_multi_node_continuous_load() {
         drop(store_with_dirs);
     });
 }
+
 /// Crashed replica integration test.
 ///
 /// This test verifies that the consensus network remains live and functional
@@ -1076,6 +1083,7 @@ fn test_multi_node_crashed_replica() {
         drop(store_with_dirs);
     });
 }
+
 use consensus::consensus::ConsensusMessage;
 use consensus::crypto::aggregated::PeerId;
 
@@ -1118,9 +1126,16 @@ fn create_byzantine_node_setup<const N: usize, const F: usize, const M_SIZE: usi
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Create transaction channel for mempool
+    let (_tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
     // Spawn Mempool
-    let (_mempool_service, _mempool_channels) =
-        MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger.clone());
+    let (_mempool_service, _mempool_channels) = MempoolService::spawn(
+        tx_consumer,
+        pending_state_reader,
+        Arc::clone(&shutdown),
+        logger.clone(),
+    );
 
     let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
@@ -1410,6 +1425,8 @@ fn test_multi_node_invalid_tx_rejection() {
     let mut invalid_transactions = Vec::new();
     let mut valid_tx_hashes = HashSet::new();
     let mut invalid_tx_hashes = HashSet::new();
+    // Track transactions that compete for the same (sender, nonce) - exactly one should be included
+    let mut conflicting_tx_hashes: HashSet<[u8; 32]> = HashSet::new();
     let mut local_nonces = vec![0; num_accounts];
 
     // 1. Generate VALID transactions (Transfer 0 -> 1, 1 -> 2, etc.)
@@ -1454,18 +1471,47 @@ fn test_multi_node_invalid_tx_rejection() {
         invalid_transactions.push(tx);
     }
 
-    // Type B: Stale Nonce (0)
+    // Type B: Conflicting Nonce (competing for nonce 0 with a valid tx)
+    // This is NOT strictly invalid - it competes with another valid tx for nonce 0.
+    // Exactly ONE of the two nonce-0 transactions should be included.
     {
         let sender_idx = 0;
         let (sender_sk, sender_pk) = &user_keys[sender_idx];
-        let (_, receiver_pk) = &user_keys[1];
         let sender_addr = Address::from_public_key(sender_pk);
-        let receiver_addr = Address::from_public_key(receiver_pk);
 
-        // Nonce 0 was definitely used (we generated 20 txs for 5 accounts, each did ~4 txs)
-        let tx = Transaction::new_transfer(sender_addr, receiver_addr, 50, 0, 10, sender_sk);
-        invalid_tx_hashes.insert(tx.tx_hash);
-        invalid_transactions.push(tx);
+        // Find the valid tx from user[0] with nonce 0 to get its parameters
+        let mut conflicting_amount = 100u64;
+        let mut conflicting_fee = 10u64;
+        let mut conflicting_recipient = Address::from_bytes([0u8; 32]);
+
+        for valid_tx in &valid_transactions {
+            if valid_tx.sender == sender_addr && valid_tx.nonce == 0 {
+                // Use the same parameters so balance impact is identical
+                conflicting_amount = valid_tx.amount();
+                conflicting_fee = valid_tx.fee;
+                conflicting_recipient = valid_tx
+                    .recipient()
+                    .unwrap_or(Address::from_bytes([0u8; 32]));
+                // Track the valid tx as conflicting
+                conflicting_tx_hashes.insert(valid_tx.tx_hash);
+                // Remove from valid_tx_hashes since it's now in conflicting set
+                valid_tx_hashes.remove(&valid_tx.tx_hash);
+                break;
+            }
+        }
+
+        let tx = Transaction::new_transfer(
+            sender_addr,
+            conflicting_recipient,
+            conflicting_amount, // Same amount as valid tx
+            0,                  // Competing for nonce 0
+            conflicting_fee,    // Same fee as valid tx
+            sender_sk,
+        );
+
+        // Track this tx in conflicting set (NOT invalid_tx_hashes)
+        conflicting_tx_hashes.insert(tx.tx_hash);
+        invalid_transactions.push(tx); // Still submit it to test the conflict
     }
 
     // Type C: Insufficient Funds
@@ -1627,7 +1673,25 @@ fn test_multi_node_invalid_tx_rejection() {
             }
         }
 
-        // Verify NO invalid txs are included
+        // Verify exactly ONE of the conflicting nonce transactions is included
+        let conflicting_included: Vec<_> =
+            conflicting_tx_hashes.intersection(&included_txs).collect();
+
+        assert_eq!(
+            conflicting_included.len(),
+            1,
+            "Exactly one of the conflicting nonce-0 transactions should be included. \
+             Found {} included. If > 1, this is a double-spend bug! If 0, valid tx was lost.",
+            conflicting_included.len()
+        );
+
+        slog::info!(logger, "Conflicting nonce test passed! ✓";
+            "conflicting_txs" => conflicting_tx_hashes.len(),
+            "included" => 1,
+            "correctly_rejected" => conflicting_tx_hashes.len() - 1,
+        );
+
+        // Verify NO truly invalid txs are included
         let mut included_invalid_hashes: Vec<[u8; 32]> = Vec::new();
         for hash in &invalid_tx_hashes {
             if included_txs.contains(hash) {
@@ -1640,13 +1704,15 @@ fn test_multi_node_invalid_tx_rejection() {
         slog::info!(logger, "Verification Results";
             "valid_included" => confirmed_valid,
             "total_valid" => valid_tx_hashes.len(),
+            "conflicting_included" => 1,
+            "conflicting_total" => conflicting_tx_hashes.len(),
             "invalid_included" => confirmed_invalid,
             "total_invalid" => invalid_tx_hashes.len()
         );
 
         assert_eq!(
             confirmed_invalid, 0,
-            "No invalid transactions should be included in finalized blocks.\n\
+            "No truly invalid transactions should be included in finalized blocks.\n\
              Found {} invalid tx(s) incorrectly included:\n{:?}\n\
              This indicates a bug in mempool validation or block proposal logic.",
             confirmed_invalid, included_invalid_hashes
@@ -1662,6 +1728,7 @@ fn test_multi_node_invalid_tx_rejection() {
         drop(store_with_dirs);
     });
 }
+
 /// Invalid block from leader integration test.
 ///
 /// This test verifies that if a Byzantine leader proposes a block containing an invalid transaction

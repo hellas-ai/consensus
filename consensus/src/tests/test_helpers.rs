@@ -139,9 +139,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
         let (persistence_writer, pending_state_reader) =
             PendingStateWriter::new(Arc::clone(&storage), 0);
 
-        // Spawn MempoolService - creates transaction and proposal channels
-        let (mempool_service, mempool_channels) =
-            MempoolService::spawn(pending_state_reader, Arc::clone(&shutdown), logger);
+        // Create transaction channel (external to mempool)
+        let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+        // Spawn MempoolService with externally-provided tx_consumer
+        let (mempool_service, mempool_channels) = MempoolService::spawn(
+            tx_consumer,
+            pending_state_reader,
+            Arc::clone(&shutdown),
+            logger,
+        );
 
         Self {
             replica_id,
@@ -156,7 +163,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             proposal_req_producer: mempool_channels.proposal_req_producer,
             proposal_resp_consumer: mempool_channels.proposal_resp_consumer,
             finalized_producer: mempool_channels.finalized_producer,
-            transaction_producer: mempool_channels.tx_producer,
+            transaction_producer: tx_producer,
             persistence_writer,
             shutdown,
             _temp_dir: temp_dir,
