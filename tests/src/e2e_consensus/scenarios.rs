@@ -748,6 +748,24 @@ fn test_multi_node_continuous_load() {
         let node_logger = logger.new(o!("node" => i, "peer_id" => identity.peer_id()));
         let (node, storage, temp_dir) =
             create_node_setup(identity, p2p_config, consensus_config.clone(), node_logger);
+
+        // Verify the store has the genesis block (written during consensus engine init)
+        let genesis_blocks = storage
+            .get_all_finalized_blocks()
+            .expect("Failed to get finalized blocks from store");
+        slog::info!(
+            logger,
+            "Node created with store verification";
+            "node" => i,
+            "db_path" => temp_dir.path().display().to_string(),
+            "initial_blocks" => genesis_blocks.len(),
+        );
+        assert!(
+            !genesis_blocks.is_empty(),
+            "Node {} store should have genesis block after creation",
+            i
+        );
+
         nodes.push(node);
         store_with_dirs.push((storage, temp_dir));
     }
@@ -823,10 +841,46 @@ fn test_multi_node_continuous_load() {
             "total_transactions_submitted" => tx_count,
         );
 
-        // Phase 6: Shutdown
+        // Phase 6: Graceful shutdown
         slog::info!(logger, "Phase 6: Shutting down all nodes");
-        // Wait a bit for pending blocks to finalize
-        ctx.sleep(Duration::from_secs(5)).await;
+
+        // 1. Signal ALL consensus engines to stop immediately.
+        // This prevents one node from advancing while others are already stopped.
+        for node in &nodes {
+            node.consensus_engine.shutdown();
+        }
+
+        // 2. Signal all P2P services to shutdown.
+        // This prevents new messages from being delivered during shutdown.
+        for node in &nodes {
+            node.p2p_handle.shutdown();
+        }
+
+        // 3. Shutdown mempool services
+        for node in &mut nodes {
+            node.mempool_service.shutdown();
+        }
+
+        // 4. Wait for each consensus engine to finish its thread
+        for (i, node) in nodes.into_iter().enumerate() {
+            slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
+            node.consensus_engine
+                .shutdown_and_wait(Duration::from_secs(5))
+                .unwrap_or_else(|e| {
+                    slog::error!(
+                        logger,
+                        "Consensus engine shutdown failed";
+                        "node" => i,
+                        "error" => ?e,
+                    );
+                    panic!("Node {} consensus engine failed to shutdown: {}", i, e)
+                });
+        }
+
+        slog::info!(logger, "All nodes shut down successfully");
+
+        // Small delay to ensure storage writes are flushed
+        ctx.sleep(Duration::from_millis(100)).await;
 
         // Phase 7: Verify state
         slog::info!(logger, "Phase 7: Verifying state consistency");
