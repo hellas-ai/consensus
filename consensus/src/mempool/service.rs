@@ -22,13 +22,14 @@
 //! 6. Finalization Cleanup: Remove transactions included in finalized blocks
 
 use super::{
-    pool::{AddResult, DEFAULT_POOL_CAPACITY, TransactionPool},
+    pool::{AddResult, DEFAULT_POOL_CAPACITY, PoolStats, TransactionPool},
     types::{FinalizedNotification, ProposalRequest, ProposalResponse},
 };
 use crate::{
     state::{address::Address, transaction::Transaction},
     validation::PendingStateReader,
 };
+use arc_swap::ArcSwap;
 use rtrb::{Consumer, Producer, RingBuffer};
 use slog::Logger;
 use std::{
@@ -67,6 +68,24 @@ pub struct MempoolChannels {
     pub proposal_req_producer: Producer<ProposalRequest>,
     /// Producer for notifying about finalized blocks (Consensus → Mempool)
     pub finalized_producer: Producer<FinalizedNotification>,
+    /// Lock-free reader for mempool statistics (updated periodically by mempool thread)
+    pub stats_reader: MempoolStatsReader,
+}
+
+/// Lock-free reader for mempool statistics.
+///
+/// Uses ArcSwap for wait-free reads from the gRPC layer while the
+/// mempool thread periodically updates the stats.
+#[derive(Clone)]
+pub struct MempoolStatsReader {
+    inner: Arc<ArcSwap<PoolStats>>,
+}
+
+impl MempoolStatsReader {
+    /// Load the current stats snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<PoolStats>> {
+        self.inner.load()
+    }
 }
 
 impl MempoolService {
@@ -115,6 +134,13 @@ impl MempoolService {
         let (finalized_producer, finalized_consumer) =
             RingBuffer::<FinalizedNotification>::new(RING_BUFFER_SIZE);
 
+        // Shared stats for lock-free reads from gRPC
+        let stats_shared = Arc::new(ArcSwap::from_pointee(PoolStats::default()));
+        let stats_writer = Arc::clone(&stats_shared);
+        let stats_reader = MempoolStatsReader {
+            inner: stats_shared,
+        };
+
         let shutdown_clone = Arc::clone(&shutdown);
         let logger_clone = logger.clone();
 
@@ -128,6 +154,7 @@ impl MempoolService {
                     proposal_req_consumer,
                     proposal_resp_producer,
                     finalized_consumer,
+                    stats_writer,
                     shutdown_clone,
                     logger_clone,
                 );
@@ -138,6 +165,7 @@ impl MempoolService {
             proposal_resp_consumer,
             proposal_req_producer,
             finalized_producer,
+            stats_reader,
         };
 
         (
@@ -178,6 +206,7 @@ pub fn mempool_loop(
     mut proposal_req_consumer: Consumer<ProposalRequest>,
     mut proposal_resp_producer: Producer<ProposalResponse>,
     mut finalized_consumer: Consumer<FinalizedNotification>,
+    stats_writer: Arc<ArcSwap<PoolStats>>,
     shutdown: Arc<AtomicBool>,
     logger: Logger,
 ) {
@@ -326,9 +355,13 @@ pub fn mempool_loop(
             );
         }
 
-        // Periodic stats logging
+        // Periodic stats logging and publishing
         if stats_interval.elapsed() >= std::time::Duration::from_secs(30) {
             let pool_stats = pool.stats();
+
+            // Publish to gRPC layer (lock-free write)
+            stats_writer.store(Arc::new(pool_stats.clone()));
+
             slog::info!(
                 logger,
                 "Mempool stats";

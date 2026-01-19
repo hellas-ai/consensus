@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow                  = { workspace = true }
+arc-swap                = { workspace = true }
 ark-bls12-381           = { workspace = true, features = [ "curve" ] }
 ark-ec                  = { workspace = true }
 ark-serialize           = { workspace = true }

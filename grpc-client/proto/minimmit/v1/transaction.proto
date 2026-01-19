@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+
+// Service for submitting and querying transactions
+service TransactionService {
+    // Submit a single signed transaction
+    // Validates signature, adds to mempool, and broadcasts via P2P
+    rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
+    
+    // Submit multiple transactions in a stream
+    // Useful for batch operations or high-throughput clients
+    rpc SubmitTransactionStream(stream SubmitTransactionRequest) returns (SubmitTransactionResponse);
+
+    // Get transaction by hash
+    rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+    
+    // Get transaction status (pending, finalized, not found)
+    rpc GetTransactionStatus(GetTransactionRequest) returns (TransactionStatusResponse);
+    
+    // Get transactions for an address (as sender or recipient)
+    rpc GetTransactionsByAddress(GetTransactionsByAddressRequest) returns (GetTransactionsByAddressResponse);
+}
+
+// ============================================================================
+// Submit Transaction
+// ============================================================================
+
+message SubmitTransactionRequest {
+    // Serialized Transaction (rkyv format)
+    bytes transaction_bytes = 1;
+}
+
+message SubmitTransactionResponse {
+    bool success = 1;
+    // Transaction hash (hex-encoded, 32 bytes)
+    string tx_hash = 2;
+    // Error message if success = false
+    string error_message = 3;
+    // Structured error code
+    ErrorCode error_code = 4;
+}
+
+// ============================================================================
+// Query Transactions
+// ============================================================================
+
+message GetTransactionRequest {
+    // Transaction hash (hex-encoded, 32 bytes)
+    string tx_hash = 1;
+}
+
+message GetTransactionResponse {
+    // Transaction info
+    TransactionInfo transaction = 1;
+    // Block hash if transaction is in a block (hex-encoded)
+    string block_hash = 2;
+    // Block height if transaction is in a block
+    uint64 block_height = 3;
+    // Index of transaction within the block
+    uint32 tx_index = 4;
+}
+
+// Transaction status enum
+enum TransactionStatus {
+    TRANSACTION_STATUS_UNSPECIFIED = 0;
+    // Transaction not found anywhere
+    TRANSACTION_STATUS_NOT_FOUND = 1;
+    // In mempool, waiting to be included in a block
+    TRANSACTION_STATUS_PENDING_MEMPOOL = 2;
+    // In an M-notarized block, waiting for finalization
+    TRANSACTION_STATUS_PENDING_BLOCK = 3;
+    // In a finalized (L-notarized) block
+    TRANSACTION_STATUS_FINALIZED = 4;
+    // In a nullified block
+    TRANSACTION_STATUS_NULLIFIED = 5;
+}
+
+message TransactionStatusResponse {
+    // Current status
+    TransactionStatus status = 1;
+    // Block hash if transaction is in a block
+    string block_hash = 2;
+    // Block height if transaction is in a block
+    uint64 block_height = 3;
+    // Number of views since finalization (0 if not finalized)
+    uint64 confirmations = 4;
+}
+
+// Filter for address role in transactions
+enum AddressRole {
+    ADDRESS_ROLE_UNSPECIFIED = 0;  // Both sender and recipient
+    ADDRESS_ROLE_SENDER = 1;
+    ADDRESS_ROLE_RECIPIENT = 2;
+}
+
+message GetTransactionsByAddressRequest {
+    // Address to query (hex-encoded, 32 bytes)
+    string address = 1;
+    // Filter by role (sender, recipient, or both)
+    AddressRole role = 2;
+    // Pagination: start from this block height
+    uint64 from_height = 3;
+    // Pagination: end at this block height (0 = latest)
+    uint64 to_height = 4;
+    // Maximum number of transactions to return
+    uint32 limit = 5;
+    // Pagination cursor from previous response
+    string cursor = 6;
+}
+
+message GetTransactionsByAddressResponse {
+    // List of transactions
+    repeated GetTransactionResponse transactions = 1;
+    // Cursor for next page
+    string next_cursor = 2;
+    // True if there are more results
+    bool has_more = 3;
+}

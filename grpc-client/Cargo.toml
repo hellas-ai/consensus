@@ -1,0 +1,25 @@
+[package]
+edition = "2024"
+name    = "grpc-client"
+version = "0.1.0"
+
+[dependencies]
+anyhow       = { workspace = true }
+consensus    = { workspace = true }
+hex          = { workspace = true }
+p2p          = { workspace = true }
+prost        = { workspace = true }
+prost-types  = { workspace = true }
+rtrb         = { workspace = true }
+slog         = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true, features = [ "full" ] }
+tokio-stream = { workspace = true }
+tonic        = { workspace = true }
+tonic-prost  = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
