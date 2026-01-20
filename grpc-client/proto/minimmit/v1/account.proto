@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+// Service for querying account state
+service AccountService {
+    // Get account balance and nonce from finalized state
+    rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+    
+    // Get account with pending state overlay
+    // Includes effects of M-notarized (but not yet finalized) transactions
+    rpc GetAccountPending(GetAccountRequest) returns (GetAccountResponse);
+    
+    // Get the next valid nonce for an account
+    // Considers both finalized state and pending mempool transactions
+    rpc GetNonce(GetNonceRequest) returns (GetNonceResponse);
+}
+
+message GetAccountRequest {
+    // Account address (hex-encoded, 32 bytes)
+    string address = 1;
+}
+
+message GetAccountResponse {
+    // Whether the account exists
+    bool exists = 1;
+    // Account balance
+    uint64 balance = 2;
+    // Current nonce (number of transactions sent)
+    uint64 nonce = 3;
+    // Public key if account exists (hex-encoded)
+    string public_key = 4;
+}
+
+message GetNonceRequest {
+    // Account address (hex-encoded, 32 bytes)
+    string address = 1;
+}
+
+message GetNonceResponse {
+    // Next valid nonce to use for a new transaction
+    uint64 next_nonce = 1;
+    // Number of pending transactions in mempool for this address
+    uint32 pending_tx_count = 2;
+}

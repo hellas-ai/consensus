@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+
+// Service for querying blocks
+service BlockService {
+    // Get a specific block by hash
+    rpc GetBlock(GetBlockRequest) returns (BlockResponse);
+    
+    // Get the latest finalized block
+    rpc GetLatestBlock(Empty) returns (BlockResponse);
+    
+    // Get block by height
+    rpc GetBlockByHeight(GetBlockByHeightRequest) returns (BlockResponse);
+    
+    // Get a range of finalized blocks (paginated)
+    rpc GetBlocks(GetBlocksRequest) returns (GetBlocksResponse);
+    
+    // Stream blocks in a range
+    rpc StreamBlocks(GetBlocksRequest) returns (stream BlockResponse);
+}
+
+message GetBlockRequest {
+    // Block hash (hex-encoded, 32 bytes)
+    string hash = 1;
+}
+
+message GetBlockByHeightRequest {
+    // Block height
+    uint64 height = 1;
+}
+
+message GetBlocksRequest {
+    // Start height (inclusive)
+    uint64 from_height = 1;
+    // End height (inclusive), 0 means latest
+    uint64 to_height = 2;
+    // Maximum number of blocks to return (default: 100, max: 1000)
+    uint32 limit = 3;
+}
+
+message GetBlocksResponse {
+    // List of blocks
+    repeated BlockResponse blocks = 1;
+    // True if there are more blocks after this batch
+    bool has_more = 2;
+}
+
+message BlockResponse {
+    // Block hash (hex-encoded, 32 bytes)
+    string hash = 1;
+    // Consensus view number
+    uint64 view = 2;
+    // Block height in the chain
+    uint64 height = 3;
+    // Parent block hash (hex-encoded, 32 bytes)
+    string parent_hash = 4;
+    // Block timestamp (unix milliseconds)
+    uint64 timestamp = 5;
+    // Leader peer ID that proposed this block
+    uint64 leader_id = 6;
+    // Transactions in this block
+    repeated TransactionInfo transactions = 7;
+    // Transaction count (convenience field)
+    uint32 tx_count = 8;
+    // Whether block is finalized (L-notarized)
+    bool is_finalized = 9;
+}

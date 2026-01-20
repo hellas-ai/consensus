@@ -16,4 +16,5 @@ pub use config::P2PConfig;
 pub use error::P2PError;
 pub use identity::ValidatorIdentity;
 pub use network::NetworkService;
+pub use peer::{PeerInfo, PeerRegistry, PeerStats, PeerStatsReader, PeerStatsWriter};
 pub use service::{P2PHandle, route_incoming_message, spawn};

@@ -803,6 +803,20 @@ impl PoolStats {
     }
 }
 
+impl Default for PoolStats {
+    fn default() -> Self {
+        Self {
+            pending_size: 0,
+            queued_size: 0,
+            total_size: 0,
+            capacity: 10_000,
+            unique_senders: 0,
+            total_added: 0,
+            total_removed: 0,
+        }
+    }
+}
+
 impl Default for TransactionPool {
     fn default() -> Self {
         Self::new(DEFAULT_POOL_CAPACITY)

@@ -4,6 +4,31 @@ use crate::{
 };
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error};
 
+/// Error type for transaction deserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionError {
+    /// Transaction bytes were empty.
+    EmptyBytes,
+    /// Transaction bytes have invalid archive format.
+    InvalidFormat,
+    /// Failed to deserialize the transaction.
+    DeserializationFailed,
+}
+
+impl std::fmt::Display for TransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionError::EmptyBytes => write!(f, "Transaction bytes cannot be empty"),
+            TransactionError::InvalidFormat => write!(f, "Invalid transaction archive format"),
+            TransactionError::DeserializationFailed => {
+                write!(f, "Failed to deserialize transaction")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {}
+
 /// Transaction instruction types
 #[derive(Clone, Debug, Archive, Deserialize, Serialize)]
 pub enum TransactionInstruction {
@@ -127,13 +152,46 @@ impl Transaction {
         }
     }
 
-    /// Computes the transaction from its bytes
+    /// Computes the transaction from its bytes.
+    ///
+    /// # Safety
+    /// This method uses unchecked deserialization for performance.
+    /// Only use with trusted input (e.g., from storage or P2P after validation).
+    /// For untrusted external input, use [`try_from_tx_bytes`] instead.
+    ///
+    /// # Panics
+    /// Panics if the bytes cannot be deserialized into a valid Transaction.
     pub fn from_tx_bytes(bytes: &[u8]) -> Self {
         let tx_hash = blake3::hash(bytes);
         let archived = unsafe { rkyv::access_unchecked::<ArchivedTransaction>(bytes) };
         let mut tx = deserialize::<Transaction, Error>(archived).expect("Failed to deserialize");
         tx.tx_hash = tx_hash.into();
         tx
+    }
+
+    /// Safely deserialize a transaction from bytes.
+    ///
+    /// This method validates the archive format before deserializing,
+    /// making it safe to use with untrusted external input (e.g., from gRPC clients).
+    ///
+    /// # Errors
+    /// Returns an error if the bytes are malformed or cannot be deserialized.
+    pub fn try_from_tx_bytes(bytes: &[u8]) -> Result<Self, TransactionError> {
+        if bytes.is_empty() {
+            return Err(TransactionError::EmptyBytes);
+        }
+
+        let tx_hash = blake3::hash(bytes);
+
+        // Use safe access with validation
+        let archived = rkyv::access::<ArchivedTransaction, Error>(bytes)
+            .map_err(|_| TransactionError::InvalidFormat)?;
+
+        let mut tx = deserialize::<Transaction, Error>(archived)
+            .map_err(|_| TransactionError::DeserializationFailed)?;
+
+        tx.tx_hash = tx_hash.into();
+        Ok(tx)
     }
 
     /// Verifies the transaction signature

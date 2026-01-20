@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+import "minimmit/v1/block.proto";
+
+// Real-time streaming subscriptions for events
+service SubscriptionService {
+    // Subscribe to new finalized blocks
+    rpc SubscribeBlocks(SubscribeBlocksRequest) returns (stream BlockEvent);
+    
+    // Subscribe to transactions for a specific address
+    rpc SubscribeAddress(SubscribeAddressRequest) returns (stream TransactionEvent);
+    
+    // Subscribe to new pending transactions in mempool
+    rpc SubscribePendingTransactions(SubscribePendingRequest) returns (stream TransactionEvent);
+    
+    // Subscribe to consensus events (view changes, leader elections)
+    rpc SubscribeConsensus(Empty) returns (stream ConsensusEvent);
+}
+
+// ============================================================================
+// Block Subscriptions
+// ============================================================================
+
+message SubscribeBlocksRequest {
+    // Start from this height (0 = latest only)
+    uint64 from_height = 1;
+    // Include full transaction data (vs just hashes)
+    bool include_transactions = 2;
+}
+
+message BlockEvent {
+    // Block data (reuses BlockResponse from block.proto)
+    BlockResponse block = 1;
+    // Event type
+    BlockEventType type = 2;
+}
+
+enum BlockEventType {
+    BLOCK_EVENT_TYPE_UNSPECIFIED = 0;
+    BLOCK_EVENT_TYPE_NEW = 1;
+    BLOCK_EVENT_TYPE_FINALIZED = 2;
+    BLOCK_EVENT_TYPE_NULLIFY = 3;
+}
+
+// ============================================================================
+// Address Subscriptions
+// ============================================================================
+
+message SubscribeAddressRequest {
+    // Address to watch (hex-encoded, 32 bytes)
+    string address = 1;
+    // Include pending mempool transactions
+    bool include_pending = 2;
+}
+
+message TransactionEvent {
+    // Event type
+    TransactionEventType type = 1;
+    // Transaction data
+    TransactionInfo transaction = 2;
+    // Block hash if in a block
+    string block_hash = 3;
+    // Block height if in a block
+    uint64 block_height = 4;
+}
+
+enum TransactionEventType {
+    TRANSACTION_EVENT_TYPE_UNSPECIFIED = 0;
+    // Transaction submitted to mempool
+    TRANSACTION_EVENT_TYPE_SUBMITTED = 1;
+    // Transaction included in M-notarized block
+    TRANSACTION_EVENT_TYPE_INCLUDED = 2;
+    // Transaction's block was finalized
+    TRANSACTION_EVENT_TYPE_FINALIZED = 3;
+    // Transaction was dropped from mempool
+    TRANSACTION_EVENT_TYPE_DROPPED = 4;
+}
+
+// ============================================================================
+// Pending Transaction Subscriptions
+// ============================================================================
+
+message SubscribePendingRequest {
+    // Optional: filter by sender address
+    string sender_filter = 1;
+    // Optional: filter by minimum fee
+    uint64 min_fee = 2;
+}
+
+// ============================================================================
+// Consensus Event Subscriptions
+// ============================================================================
+
+message ConsensusEvent {
+    // Event type
+    ConsensusEventType type = 1;
+    // View number
+    uint64 view = 2;
+    // Leader peer ID
+    uint64 leader = 3;
+    // Event timestamp (unix milliseconds)
+    uint64 timestamp = 4;
+    // Additional data depending on event type
+    bytes data = 5;
+}
+
+enum ConsensusEventType {
+    CONSENSUS_EVENT_TYPE_UNSPECIFIED = 0;
+    CONSENSUS_EVENT_TYPE_VIEW_CHANGE = 1;
+    CONSENSUS_EVENT_TYPE_BLOCK_PROPOSED = 2;
+    CONSENSUS_EVENT_TYPE_BLOCK_NOTARIZED = 3;
+    CONSENSUS_EVENT_TYPE_BLOCK_FINALIZED = 4;
+    CONSENSUS_EVENT_TYPE_VIEW_NULLIFIED = 5;
+}

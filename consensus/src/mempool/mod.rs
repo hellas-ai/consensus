@@ -32,6 +32,6 @@ mod pool;
 mod service;
 mod types;
 
-pub use pool::TransactionPool;
-pub use service::{MempoolChannels, MempoolService};
+pub use pool::{PoolStats, TransactionPool};
+pub use service::{MempoolChannels, MempoolService, MempoolStatsReader};
 pub use types::{FinalizedNotification, ProposalRequest, ProposalResponse, ValidatedTransaction};

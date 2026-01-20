@@ -1,7 +1,10 @@
 //! Peer identity and registry management.
 
-use consensus::crypto::aggregated::PeerId;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use consensus::crypto::aggregated::PeerId;
 
 /// Registry mapping network identities to consensus peer IDs.
 ///
@@ -59,5 +62,75 @@ impl PeerRegistry {
 impl Default for PeerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Information about a connected peer.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// ED25519 public key bytes
+    pub ed25519_key: [u8; 32],
+    /// Whether this peer is a validator
+    pub is_validator: bool,
+}
+
+/// Statistics about P2P connections.
+#[derive(Debug, Clone, Default)]
+pub struct PeerStats {
+    /// Number of connected peers
+    pub connected_count: u32,
+    /// Total validators expected
+    pub total_validators: u32,
+    /// List of connected peer information
+    pub peers: Vec<PeerInfo>,
+}
+
+/// Lock-free reader for peer statistics.
+///
+/// Uses ArcSwap for wait-free reads from the gRPC layer while the
+/// P2P thread periodically updates the stats.
+#[derive(Clone)]
+pub struct PeerStatsReader {
+    inner: Arc<ArcSwap<PeerStats>>,
+}
+
+impl PeerStatsReader {
+    /// Create a new peer stats reader/writer pair.
+    pub fn new(total_validators: u32) -> (Self, PeerStatsWriter) {
+        let stats = PeerStats {
+            connected_count: 0,
+            total_validators,
+            peers: Vec::new(),
+        };
+        let shared = Arc::new(ArcSwap::from_pointee(stats));
+        (
+            Self {
+                inner: Arc::clone(&shared),
+            },
+            PeerStatsWriter { inner: shared },
+        )
+    }
+
+    /// Load the current stats snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<PeerStats>> {
+        self.inner.load()
+    }
+}
+
+/// Writer for peer statistics (used by P2P thread).
+pub struct PeerStatsWriter {
+    inner: Arc<ArcSwap<PeerStats>>,
+}
+
+impl PeerStatsWriter {
+    /// Update the peer stats.
+    pub fn update(&self, connected_count: u32, peers: Vec<PeerInfo>) {
+        let current = self.inner.load();
+        let new_stats = PeerStats {
+            connected_count,
+            total_validators: current.total_validators,
+            peers,
+        };
+        self.inner.store(Arc::new(new_stats));
     }
 }

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use rkyv::de::Pool;
 use rkyv::rancor::Strategy;
 use rkyv::util::AlignedVec;
@@ -227,6 +227,114 @@ impl ConsensusStore {
         blocks.sort_by_key(|b| b.view());
 
         Ok(blocks)
+    }
+
+    /// Check if there are any finalized blocks in the database.
+    /// This is an O(1) operation that doesn't deserialize any blocks.
+    pub fn has_finalized_blocks(&self) -> Result<bool> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+        Ok(!table.is_empty()?)
+    }
+
+    /// Count the number of finalized blocks without deserializing them.
+    /// This is more efficient than loading all blocks just to count them.
+    pub fn count_finalized_blocks(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+        Ok(table.len()?)
+    }
+
+    /// Get the latest finalized block by iterating and finding the highest view.
+    /// Returns None if there are no finalized blocks.
+    pub fn get_latest_finalized_block(&self) -> Result<Option<Block>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+
+        let mut latest: Option<Block> = None;
+        let mut highest_view = 0u64;
+
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let val = value.value();
+            let mut aligned = AlignedVec::<1024>::with_capacity(val.len());
+            aligned.extend_from_slice(val);
+            let archived = unsafe { access_archived::<Block>(aligned.as_slice()) };
+            let block: Block = deserialize(archived).map_err(|e: rkyv::rancor::Error| {
+                anyhow::anyhow!("Failed to deserialize: {:?}", e)
+            })?;
+
+            if block.view() >= highest_view {
+                highest_view = block.view();
+                latest = Some(block);
+            }
+        }
+
+        Ok(latest)
+    }
+
+    /// Get a finalized block by its height.
+    /// Returns None if no block exists at that height.
+    pub fn get_finalized_block_by_height(&self, height: u64) -> Result<Option<Block>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let val = value.value();
+            let mut aligned = AlignedVec::<1024>::with_capacity(val.len());
+            aligned.extend_from_slice(val);
+            let archived = unsafe { access_archived::<Block>(aligned.as_slice()) };
+            let block: Block = deserialize(archived).map_err(|e: rkyv::rancor::Error| {
+                anyhow::anyhow!("Failed to deserialize: {:?}", e)
+            })?;
+
+            if block.height == height {
+                return Ok(Some(block));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get finalized blocks within a height range with pagination.
+    /// Returns blocks sorted by height, up to the specified limit.
+    pub fn get_finalized_blocks_in_range(
+        &self,
+        from_height: u64,
+        to_height: u64,
+        limit: usize,
+    ) -> Result<(Vec<Block>, bool)> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FINALIZED_BLOCKS)?;
+
+        let mut blocks = Vec::new();
+
+        for result in table.iter()? {
+            let (_, value) = result?;
+            let val = value.value();
+            let mut aligned = AlignedVec::<1024>::with_capacity(val.len());
+            aligned.extend_from_slice(val);
+            let archived = unsafe { access_archived::<Block>(aligned.as_slice()) };
+            let block: Block = deserialize(archived).map_err(|e: rkyv::rancor::Error| {
+                anyhow::anyhow!("Failed to deserialize: {:?}", e)
+            })?;
+
+            if block.height >= from_height && block.height <= to_height {
+                blocks.push(block);
+            }
+        }
+
+        // Sort by height
+        blocks.sort_by_key(|b| b.height);
+
+        // Check if there are more results beyond the limit
+        let has_more = blocks.len() > limit;
+
+        // Truncate to limit
+        blocks.truncate(limit);
+
+        Ok((blocks, has_more))
     }
 
     /// Puts a non-finalized block into the database.

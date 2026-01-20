@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+
+// Administrative operations (requires authentication in production)
+service AdminService {
+    // Get detailed node metrics (Prometheus format)
+    rpc GetMetrics(Empty) returns (MetricsResponse);
+    
+    // Get validator set
+    rpc GetValidators(Empty) returns (ValidatorsResponse);
+    
+    // Manually trigger peer discovery
+    rpc RefreshPeers(Empty) returns (RefreshPeersResponse);
+    
+    // Get debug info for a specific view
+    rpc GetViewDebugInfo(GetViewDebugInfoRequest) returns (ViewDebugInfoResponse);
+}
+
+// ============================================================================
+// Metrics
+// ============================================================================
+
+message MetricsResponse {
+    // Prometheus-formatted metrics
+    string metrics = 1;
+}
+
+// ============================================================================
+// Validators
+// ============================================================================
+
+message ValidatorsResponse {
+    // List of validators
+    repeated ValidatorInfo validators = 1;
+}
+
+message ValidatorInfo {
+    // Validator peer ID
+    uint64 peer_id = 1;
+    // BLS public key (hex-encoded)
+    string bls_public_key = 2;
+    // Whether this validator is connected
+    bool is_connected = 3;
+}
+
+// ============================================================================
+// Peer Discovery
+// ============================================================================
+
+message RefreshPeersResponse {
+    // Number of peers discovered
+    uint32 discovered_count = 1;
+    // Number of peers now connected
+    uint32 connected_count = 2;
+}
+
+// ============================================================================
+// View Debug Info
+// ============================================================================
+
+message GetViewDebugInfoRequest {
+    // View number to query
+    uint64 view = 1;
+}
+
+message ViewDebugInfoResponse {
+    // View number
+    uint64 view = 1;
+    // Leader peer ID for this view
+    uint64 leader = 2;
+    // Whether a block was proposed for this view
+    bool has_block = 3;
+    // Block hash if block exists (hex-encoded)
+    string block_hash = 4;
+    // Number of votes received
+    uint32 votes_received = 5;
+    // Whether block is M-notarized
+    bool is_m_notarized = 6;
+    // Whether block is L-notarized (finalized)
+    bool is_l_notarized = 7;
+    // Whether view was nullified
+    bool is_nullified = 8;
+}

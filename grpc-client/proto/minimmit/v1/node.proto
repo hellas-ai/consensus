@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+
+// Service for node health, status, and operational information
+service NodeService {
+    // Health check (for load balancers)
+    rpc Health(Empty) returns (HealthResponse);
+    
+    // Detailed node sync status
+    rpc GetSyncStatus(Empty) returns (SyncStatusResponse);
+    
+    // Get connected peers
+    rpc GetPeers(Empty) returns (PeersResponse);
+    
+    // Get mempool statistics
+    rpc GetMempoolStats(Empty) returns (MempoolStatsResponse);
+    
+    // Get consensus status
+    rpc GetConsensusStatus(Empty) returns (ConsensusStatusResponse);
+    
+    // Get node version and info
+    rpc GetNodeInfo(Empty) returns (NodeInfoResponse);
+}
+
+// ============================================================================
+// Health Check
+// ============================================================================
+
+message HealthResponse {
+    // Overall health status
+    bool healthy = 1;
+    // Component health status (e.g., "consensus": true, "p2p": true)
+    map<string, bool> components = 2;
+}
+
+// ============================================================================
+// Sync Status
+// ============================================================================
+
+message SyncStatusResponse {
+    // Current consensus view
+    uint64 current_view = 1;
+    // Highest finalized view
+    uint64 highest_finalized_view = 2;
+    // Highest finalized block height
+    uint64 highest_finalized_height = 3;
+    // Whether node is synced with network
+    bool is_synced = 4;
+}
+
+// ============================================================================
+// Peers
+// ============================================================================
+
+message PeersResponse {
+    // Number of connected peers
+    uint32 connected_count = 1;
+    // Required peers for consensus (N-F)
+    uint32 required_peers = 2;
+    // List of connected peer info
+    repeated PeerInfo peers = 3;
+}
+
+message PeerInfo {
+    // Peer ID (BLS-based)
+    uint64 peer_id = 1;
+    // Network address
+    string address = 2;
+    // Whether peer is a validator
+    bool is_validator = 3;
+    // Latency in milliseconds
+    uint32 latency_ms = 4;
+    // Connection status
+    PeerStatus status = 5;
+}
+
+enum PeerStatus {
+    PEER_STATUS_UNSPECIFIED = 0;
+    PEER_STATUS_CONNECTED = 1;
+    PEER_STATUS_CONNECTING = 2;
+    PEER_STATUS_DISCONNECTED = 3;
+}
+
+// ============================================================================
+// Mempool Stats
+// ============================================================================
+
+message MempoolStatsResponse {
+    // Transactions ready to be included in blocks
+    uint64 pending_count = 1;
+    // Transactions waiting for nonce gaps to fill
+    uint64 queued_count = 2;
+    // Total transactions in mempool
+    uint64 total_count = 3;
+    // Unique sender addresses
+    uint64 unique_senders = 4;
+    // Mempool capacity
+    uint64 capacity = 5;
+    // Lifetime stats
+    uint64 total_added = 6;
+    uint64 total_removed = 7;
+    uint64 total_rejected = 8;
+    uint64 invalid_signatures = 9;
+}
+
+// ============================================================================
+// Consensus Status
+// ============================================================================
+
+message ConsensusStatusResponse {
+    // Current view number
+    uint64 current_view = 1;
+    // Last finalized view
+    uint64 last_finalized_view = 2;
+    // This node's peer ID
+    uint64 peer_id = 3;
+    // Whether this node is leader for current view
+    bool is_leader_current_view = 4;
+    // Current view's leader peer ID
+    uint64 current_leader = 5;
+    // Total validators in the network
+    uint32 total_validators = 6;
+    // Consensus parameters
+    uint32 n = 7;  // Total validators
+    uint32 f = 8;  // Maximum faulty validators
+}
+
+// ============================================================================
+// Node Info
+// ============================================================================
+
+message NodeInfoResponse {
+    // Node version
+    string version = 1;
+    // Git commit hash
+    string git_commit = 2;
+    // Network name ("mainnet", "testnet", "local")
+    string network = 3;
+    // This node's peer ID
+    uint64 peer_id = 4;
+    // Node uptime in seconds
+    uint64 uptime_seconds = 5;
+}
