@@ -49,8 +49,6 @@ message SyncStatusResponse {
     uint64 highest_finalized_height = 3;
     // Whether node is synced with network
     bool is_synced = 4;
-    // Number of views behind (0 if synced)
-    uint64 views_behind = 5;
 }
 
 // ============================================================================

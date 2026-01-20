@@ -1,8 +1,7 @@
-//! gRPC server setup and configuration.
+//! gRPC server setup and context management.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use consensus::mempool::MempoolStatsReader;
 use consensus::storage::store::ConsensusStore;
@@ -10,46 +9,21 @@ use consensus::validation::PendingStateReader;
 use p2p::PeerStatsReader;
 use p2p::service::P2PHandle;
 use slog::Logger;
-use tonic::service::Routes;
+use tokio::sync::broadcast;
 use tonic::transport::Server;
 
+use crate::config::RpcConfig;
 use crate::proto::account_service_server::AccountServiceServer;
+use crate::proto::admin_service_server::AdminServiceServer;
 use crate::proto::block_service_server::BlockServiceServer;
 use crate::proto::node_service_server::NodeServiceServer;
-use crate::services::{AccountServiceImpl, BlockServiceImpl, NodeServiceImpl};
-
-/// Configuration for the RPC server.
-#[derive(Debug, Clone)]
-pub struct RpcConfig {
-    /// Address to listen on (e.g., "0.0.0.0:50051")
-    pub listen_addr: SocketAddr,
-    /// Maximum concurrent streams per connection
-    pub max_concurrent_streams: u32,
-    /// Request timeout in seconds
-    pub request_timeout_secs: u64,
-    /// This node's peer ID
-    pub peer_id: u64,
-    /// Network name (e.g., "mainnet", "testnet", "local")
-    pub network: String,
-    /// Total validators in network
-    pub total_validators: u32,
-    /// Fault tolerance parameter F
-    pub f: u32,
-}
-
-impl Default for RpcConfig {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0:50051".parse().unwrap(),
-            max_concurrent_streams: 100,
-            request_timeout_secs: 30,
-            peer_id: 0,
-            network: "local".to_string(),
-            total_validators: 4,
-            f: 1,
-        }
-    }
-}
+use crate::proto::subscription_service_server::SubscriptionServiceServer;
+use crate::proto::transaction_service_server::TransactionServiceServer;
+use crate::proto::{BlockEvent, ConsensusEvent, TransactionEvent};
+use crate::services::{
+    AccountServiceImpl, AdminServiceImpl, BlockServiceImpl, NodeServiceImpl,
+    SubscriptionServiceImpl, TransactionServiceImpl,
+};
 
 /// Read-only context for services that only query state.
 ///
@@ -65,6 +39,12 @@ pub struct ReadOnlyContext {
     pub mempool_stats: Option<MempoolStatsReader>,
     /// Peer stats reader (lock-free access to P2P peer information)
     pub peer_stats: Option<PeerStatsReader>,
+    /// Block event sender for subscriptions
+    pub block_events: Option<broadcast::Sender<BlockEvent>>,
+    /// Consensus event sender for subscriptions
+    pub consensus_events: Option<broadcast::Sender<ConsensusEvent>>,
+    /// Transaction/mempool event sender for subscriptions
+    pub tx_events: Option<broadcast::Sender<TransactionEvent>>,
     /// Logger
     pub logger: Logger,
 }
@@ -84,11 +64,15 @@ pub struct RpcContext {
 
 impl RpcContext {
     /// Create a new RPC context.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<ConsensusStore>,
         pending_state: PendingStateReader,
         mempool_stats: Option<MempoolStatsReader>,
         peer_stats: Option<PeerStatsReader>,
+        block_events: Option<broadcast::Sender<BlockEvent>>,
+        consensus_events: Option<broadcast::Sender<ConsensusEvent>>,
+        tx_events: Option<broadcast::Sender<TransactionEvent>>,
         p2p_handle: P2PHandle,
         p2p_ready: Arc<AtomicBool>,
         logger: Logger,
@@ -99,6 +83,9 @@ impl RpcContext {
                 pending_state,
                 mempool_stats,
                 peer_stats,
+                block_events,
+                consensus_events,
+                tx_events,
                 logger,
             },
             p2p_handle,
@@ -140,20 +127,30 @@ impl RpcServer {
         let read_ctx = self.context.read_only_context();
         let account_service = AccountServiceImpl::new(read_ctx.clone());
         let block_service = BlockServiceImpl::new(read_ctx.clone());
+        let tx_ctx = read_ctx.clone();
         let node_service = NodeServiceImpl::new(
             read_ctx,
             self.config.peer_id,
-            self.config.network.clone(),
+            self.config.network,
             self.config.total_validators,
             self.config.f,
             Arc::clone(&self.context.p2p_ready),
         );
 
-        // Build routes with implemented services
-        let routes = Routes::new(AccountServiceServer::new(account_service))
-            .add_service(BlockServiceServer::new(block_service))
-            .add_service(NodeServiceServer::new(node_service));
+        let p2p = Arc::new(Mutex::new(self.context.p2p_handle));
+        let transaction_service = TransactionServiceImpl::new(tx_ctx.clone(), p2p);
+        let subscription_service = SubscriptionServiceImpl::new(tx_ctx.clone());
+        let admin_service = AdminServiceImpl::new(tx_ctx);
 
-        Server::builder().serve(addr, routes).await
+        // Build routes with implemented services
+        Server::builder()
+            .add_service(AccountServiceServer::new(account_service))
+            .add_service(AdminServiceServer::new(admin_service))
+            .add_service(BlockServiceServer::new(block_service))
+            .add_service(NodeServiceServer::new(node_service))
+            .add_service(TransactionServiceServer::new(transaction_service))
+            .add_service(SubscriptionServiceServer::new(subscription_service))
+            .serve(addr)
+            .await
     }
 }

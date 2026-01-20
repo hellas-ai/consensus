@@ -1490,12 +1490,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "consensus",
+ "figment",
  "hex",
  "p2p",
  "prost",
  "prost-types",
  "rand 0.8.5",
  "rtrb",
+ "serde",
+ "serde_json",
  "slog",
  "thiserror 2.0.17",
  "tokio",
@@ -3557,6 +3560,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

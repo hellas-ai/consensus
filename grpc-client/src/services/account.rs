@@ -1,10 +1,12 @@
 //! Account service implementation.
-use consensus::state::address::Address;
+
 use tonic::{Request, Response, Status};
 
 use crate::proto::account_service_server::AccountService;
 use crate::proto::{GetAccountRequest, GetAccountResponse, GetNonceRequest, GetNonceResponse};
 use crate::server::ReadOnlyContext;
+
+use super::utils::parse_address;
 
 /// Implementation of the AccountService gRPC service.
 pub struct AccountServiceImpl {
@@ -103,23 +105,6 @@ impl AccountService for AccountServiceImpl {
     }
 }
 
-/// Parse a hex-encoded address string into an Address.
-fn parse_address(hex_str: &str) -> Result<Address, Status> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| Status::invalid_argument(format!("Invalid hex address: {}", e)))?;
-
-    if bytes.len() != 32 {
-        return Err(Status::invalid_argument(format!(
-            "Address must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Address::from_bytes(arr))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +113,7 @@ mod tests {
 
     use consensus::crypto::transaction_crypto::TxSecretKey;
     use consensus::state::account::Account;
+    use consensus::state::address::Address;
     use consensus::storage::store::ConsensusStore;
     use consensus::validation::pending_state::PendingStateWriter;
     use consensus::validation::types::StateDiff;
@@ -156,60 +142,13 @@ mod tests {
             pending_state: reader,
             mempool_stats: None,
             peer_stats: None,
+            block_events: None,
+            consensus_events: None,
+            tx_events: None,
             logger: create_test_logger(),
         };
 
         (context, store, writer)
-    }
-
-    #[test]
-    fn parse_address_valid_hex() {
-        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
-        let result = parse_address(hex);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().as_bytes(), &[0u8; 32]);
-    }
-
-    #[test]
-    fn parse_address_valid_hex_nonzero() {
-        let hex = "0102030405060708091011121314151617181920212223242526272829303132";
-        let result = parse_address(hex);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_address_invalid_hex_chars() {
-        let hex = "zzzz0000000000000000000000000000000000000000000000000000000000";
-        let result = parse_address(hex);
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("Invalid hex address"));
-    }
-
-    #[test]
-    fn parse_address_too_short() {
-        let hex = "0102030405"; // Only 5 bytes
-        let result = parse_address(hex);
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("32 bytes"));
-    }
-
-    #[test]
-    fn parse_address_too_long() {
-        let hex = "000000000000000000000000000000000000000000000000000000000000000000"; // 33 bytes
-        let result = parse_address(hex);
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_address_empty() {
-        let result = parse_address("");
-        assert!(result.is_err());
     }
 
     #[tokio::test]

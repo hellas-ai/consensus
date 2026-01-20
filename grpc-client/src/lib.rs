@@ -7,6 +7,7 @@
 //! - Node health and status
 //! - Real-time subscriptions
 
+pub mod config;
 pub mod error;
 pub mod server;
 pub mod services;
@@ -20,5 +21,6 @@ pub mod proto {
 }
 
 // Re-export key types for convenience
+pub use config::{Network, RpcConfig};
 pub use error::RpcError;
 pub use server::RpcServer;

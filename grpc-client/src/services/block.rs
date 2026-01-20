@@ -11,6 +11,8 @@ use crate::proto::{
 };
 use crate::server::ReadOnlyContext;
 
+use super::utils::parse_hash;
+
 /// Implementation of the BlockService gRPC service.
 pub struct BlockServiceImpl {
     context: ReadOnlyContext,
@@ -109,14 +111,14 @@ impl BlockService for BlockServiceImpl {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<BlockResponse>, Status> {
-        let blocks = self
+        let block = self
             .context
             .store
-            .get_all_finalized_blocks()
+            .get_latest_finalized_block()
             .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
 
-        match blocks.last() {
-            Some(b) => Ok(Response::new(block_to_response(b))),
+        match block {
+            Some(b) => Ok(Response::new(block_to_response(&b))),
             None => Err(Status::not_found("No blocks found")),
         }
     }
@@ -128,16 +130,14 @@ impl BlockService for BlockServiceImpl {
     ) -> Result<Response<BlockResponse>, Status> {
         let req = request.into_inner();
 
-        let blocks = self
+        let block = self
             .context
             .store
-            .get_all_finalized_blocks()
+            .get_finalized_block_by_height(req.height)
             .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
 
-        let block = blocks.iter().find(|b| b.height == req.height);
-
         match block {
-            Some(b) => Ok(Response::new(block_to_response(b))),
+            Some(b) => Ok(Response::new(block_to_response(&b))),
             None => Err(Status::not_found(format!(
                 "Block not found at height {}",
                 req.height
@@ -157,90 +157,89 @@ impl BlockService for BlockServiceImpl {
             req.limit as usize
         };
 
-        let all_blocks = self
-            .context
-            .store
-            .get_all_finalized_blocks()
-            .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
-
-        // Filter by height range
         let to_height = if req.to_height == 0 {
             u64::MAX
         } else {
             req.to_height
         };
 
-        let filtered: Vec<_> = all_blocks
-            .iter()
-            .filter(|b| b.height >= req.from_height && b.height <= to_height)
-            .collect();
+        let (block_list, has_more) = self
+            .context
+            .store
+            .get_finalized_blocks_in_range(req.from_height, to_height, limit)
+            .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
 
-        let has_more = filtered.len() > limit;
-        let blocks: Vec<BlockResponse> = filtered
-            .into_iter()
-            .take(limit)
-            .map(block_to_response)
-            .collect();
+        let blocks: Vec<BlockResponse> = block_list.iter().map(block_to_response).collect();
 
         Ok(Response::new(GetBlocksResponse { blocks, has_more }))
     }
 
     type StreamBlocksStream = ReceiverStream<Result<BlockResponse, Status>>;
 
-    /// Stream blocks in a range.
+    /// Stream blocks in a range using cursor-based pagination.
     async fn stream_blocks(
         &self,
         request: Request<GetBlocksRequest>,
     ) -> Result<Response<Self::StreamBlocksStream>, Status> {
         let req = request.into_inner();
 
-        let all_blocks = self
-            .context
-            .store
-            .get_all_finalized_blocks()
-            .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
-
-        // Filter by height range
         let to_height = if req.to_height == 0 {
             u64::MAX
         } else {
             req.to_height
         };
 
-        let filtered: Vec<_> = all_blocks
-            .into_iter()
-            .filter(|b| b.height >= req.from_height && b.height <= to_height)
-            .collect();
+        let store = self.context.store.clone();
+        let from_height = req.from_height;
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
 
+        // Cursor-based streaming: fetch blocks in batches
         tokio::spawn(async move {
-            for block in filtered {
-                if tx.send(Ok(block_to_response(&block))).await.is_err() {
-                    break; // Client disconnected
+            const BATCH_SIZE: usize = 100;
+            let mut cursor = from_height;
+
+            loop {
+                // Fetch next batch starting from cursor
+                let batch_result =
+                    store.get_finalized_blocks_in_range(cursor, to_height, BATCH_SIZE);
+
+                let (blocks, has_more) = match batch_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("Database error: {}", e))))
+                            .await;
+                        break;
+                    }
+                };
+
+                if blocks.is_empty() {
+                    break;
+                }
+
+                // Stream each block in the batch
+                for block in &blocks {
+                    if tx.send(Ok(block_to_response(block))).await.is_err() {
+                        return; // Client disconnected
+                    }
+                }
+
+                if !has_more {
+                    break;
+                }
+
+                // Move cursor to next batch (last block height + 1)
+                cursor = blocks.last().map(|b| b.height + 1).unwrap_or(u64::MAX);
+
+                if cursor > to_height {
+                    break;
                 }
             }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
-}
-
-/// Parse a hex-encoded hash string into a 32-byte array.
-fn parse_hash(hex_str: &str) -> Result<[u8; 32], Status> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| Status::invalid_argument(format!("Invalid hex hash: {}", e)))?;
-
-    if bytes.len() != 32 {
-        return Err(Status::invalid_argument(format!(
-            "Hash must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
 }
 
 #[cfg(test)]
@@ -278,6 +277,9 @@ mod tests {
             pending_state: reader,
             mempool_stats: None,
             peer_stats: None,
+            block_events: None,
+            consensus_events: None,
+            tx_events: None,
             logger: create_test_logger(),
         };
 
@@ -312,43 +314,6 @@ mod tests {
             true, // is_finalized
             height,
         )
-    }
-
-    #[test]
-    fn parse_hash_valid() {
-        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
-        let result = parse_hash(hex);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), [0u8; 32]);
-    }
-
-    #[test]
-    fn parse_hash_valid_nonzero() {
-        let hex = "0102030405060708091011121314151617181920212223242526272829303132";
-        let result = parse_hash(hex);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_hash_invalid_hex() {
-        let hex = "zzzz0000000000000000000000000000000000000000000000000000000000";
-        let result = parse_hash(hex);
-        assert!(result.is_err());
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn parse_hash_wrong_length() {
-        let hex = "0102030405"; // Only 5 bytes
-        let result = parse_hash(hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_hash_empty() {
-        let result = parse_hash("");
-        assert!(result.is_err());
     }
 
     #[test]

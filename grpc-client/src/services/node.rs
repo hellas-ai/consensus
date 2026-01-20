@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
 
+use crate::config::Network;
 use crate::proto::node_service_server::NodeService;
 use crate::proto::{
     ConsensusStatusResponse, Empty, HealthResponse, MempoolStatsResponse, NodeInfoResponse,
@@ -34,8 +35,8 @@ pub struct NodeServiceImpl {
     start_time: Instant,
     /// This node's peer ID (set during construction)
     peer_id: u64,
-    /// Network name (e.g., "mainnet", "testnet", "local")
-    network: String,
+    /// Network environment
+    network: Network,
     /// Total validators in network
     total_validators: u32,
     /// Fault tolerance parameter
@@ -53,7 +54,7 @@ impl NodeServiceImpl {
     pub fn new(
         context: ReadOnlyContext,
         peer_id: u64,
-        network: String,
+        network: Network,
         total_validators: u32,
         f: u32,
         p2p_ready: std::sync::Arc<AtomicBool>,
@@ -85,8 +86,8 @@ impl NodeService for NodeServiceImpl {
         let p2p_healthy = self.p2p_ready.load(Ordering::Acquire);
         components.insert("p2p".to_string(), p2p_healthy);
 
-        // Storage is healthy if we can read finalized blocks without error
-        let storage_healthy = self.context.store.get_all_finalized_blocks().is_ok();
+        // Storage is healthy if we can query the database without error
+        let storage_healthy = self.context.store.has_finalized_blocks().is_ok();
         components.insert("storage".to_string(), storage_healthy);
 
         // Consensus health check with liveness tracking:
@@ -118,12 +119,7 @@ impl NodeService for NodeServiceImpl {
                 // - It's still within the stall timeout, OR
                 // - It has at least the genesis block (view 0)
                 let within_timeout = time_since_progress < CONSENSUS_STALL_TIMEOUT;
-                let has_genesis = self
-                    .context
-                    .store
-                    .get_all_finalized_blocks()
-                    .map(|blocks| !blocks.is_empty())
-                    .unwrap_or(false);
+                let has_genesis = self.context.store.has_finalized_blocks().unwrap_or(false);
 
                 within_timeout || has_genesis
             }
@@ -147,33 +143,68 @@ impl NodeService for NodeServiceImpl {
     }
 
     /// Get detailed sync status.
+    ///
+    /// Provides a multi-criteria assessment of node sync state:
+    /// - Uses pending state to estimate current view
+    /// - Tracks liveness via progress monitoring
+    /// - Considers both block existence and progress for sync determination
     async fn get_sync_status(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<SyncStatusResponse>, Status> {
         let snapshot = self.context.pending_state.load();
         let last_finalized_view = snapshot.last_finalized_view();
+        let pending_count = snapshot.pending_count() as u64;
 
-        // Get all finalized blocks to determine height
-        let blocks = self
+        // Current view is the one being actively worked on
+        // = last finalized + pending views + 1 (the current consensus round)
+        let current_view = last_finalized_view + pending_count + 1;
+
+        // Get the latest finalized block to determine height
+        let latest_block = self
             .context
             .store
-            .get_all_finalized_blocks()
+            .get_latest_finalized_block()
             .map_err(|e| Status::internal(format!("Database error: {}", e)))?;
 
-        let highest_finalized_height = blocks.last().map(|b| b.height).unwrap_or(0);
+        let highest_finalized_height = latest_block.as_ref().map(|b| b.height).unwrap_or(0);
 
-        // For now, we assume the node is synced if it has finalized blocks
-        // In a real implementation, you'd compare with network peers
-        let is_synced = !blocks.is_empty();
-        let views_behind = 0; // Would need network comparison
+        // Multi-criteria sync assessment:
+        // 1. Must have at least the genesis block
+        // 2. Must be making progress (or recently started)
+        let has_blocks = latest_block.is_some();
+
+        // Check liveness: are we making progress?
+        let stored_finalized = self.last_finalized_view.load(Ordering::Acquire);
+        let is_making_progress = last_finalized_view > stored_finalized;
+
+        // Update progress tracking if we've advanced
+        if is_making_progress {
+            self.last_finalized_view
+                .store(last_finalized_view, Ordering::Release);
+            if let Ok(mut last_progress) = self.last_progress_time.lock() {
+                *last_progress = Instant::now();
+            }
+        }
+
+        // Time since last progress
+        let time_since_progress = self
+            .last_progress_time
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        // Node is synced if:
+        // - It has finalized blocks AND
+        // - (It's making progress OR hasn't stalled for too long)
+        let within_stall_timeout = time_since_progress < CONSENSUS_STALL_TIMEOUT;
+        let is_synced = has_blocks && (is_making_progress || within_stall_timeout);
 
         Ok(Response::new(SyncStatusResponse {
-            current_view: last_finalized_view + 1, // Approximate: next view after finalized
+            current_view,
             highest_finalized_view: last_finalized_view,
             highest_finalized_height,
             is_synced,
-            views_behind,
         }))
     }
 
@@ -198,7 +229,7 @@ impl NodeService for NodeServiceImpl {
 
                     crate::proto::PeerInfo {
                         peer_id,
-                        address: String::new(), // Address not currently tracked
+                        address: String::new(), // TODO: Address not currently tracked
                         is_validator: p.is_validator,
                         status: if p.is_validator {
                             crate::proto::PeerStatus::Connected.into()
@@ -274,6 +305,7 @@ impl NodeService for NodeServiceImpl {
         let current_view = last_finalized_view + 1;
 
         // Leader is determined by view mod N in round-robin
+        // TODO: Make this implementation robust for other leader selection strategies.
         let current_leader = current_view % self.total_validators as u64;
         let is_leader_current_view = current_leader == self.peer_id;
 
@@ -299,7 +331,7 @@ impl NodeService for NodeServiceImpl {
         Ok(Response::new(NodeInfoResponse {
             version: VERSION.to_string(),
             git_commit: GIT_COMMIT.to_string(),
-            network: self.network.clone(),
+            network: self.network.to_string(),
             peer_id: self.peer_id,
             uptime_seconds,
         }))
@@ -336,12 +368,15 @@ mod tests {
             pending_state: reader,
             mempool_stats: None,
             peer_stats: None,
+            block_events: None,
+            consensus_events: None,
+            tx_events: None,
             logger: create_test_logger(),
         };
 
         let p2p_ready = Arc::new(AtomicBool::new(true));
 
-        NodeServiceImpl::new(context, 0, "test".to_string(), 4, 1, p2p_ready)
+        NodeServiceImpl::new(context, 0, Network::Local, 4, 1, p2p_ready)
     }
 
     #[tokio::test]
@@ -369,11 +404,14 @@ mod tests {
             pending_state: reader,
             mempool_stats: None,
             peer_stats: None,
+            block_events: None,
+            consensus_events: None,
+            tx_events: None,
             logger: create_test_logger(),
         };
 
         let p2p_ready = Arc::new(AtomicBool::new(false)); // Not ready!
-        let service = NodeServiceImpl::new(context, 0, "test".to_string(), 4, 1, p2p_ready);
+        let service = NodeServiceImpl::new(context, 0, Network::Local, 4, 1, p2p_ready);
 
         let request = Request::new(Empty {});
         let response = service.health(request).await.unwrap();
@@ -418,7 +456,7 @@ mod tests {
         let resp = response.into_inner();
 
         assert!(!resp.version.is_empty());
-        assert_eq!(resp.network, "test");
+        assert_eq!(resp.network, "local");
         assert_eq!(resp.peer_id, 0);
         assert!(resp.uptime_seconds < 10); // Should be less than 10 seconds
     }
