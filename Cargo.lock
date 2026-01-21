@@ -3388,6 +3388,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "consensus",
+ "grpc-client",
  "hex",
  "p2p",
  "rand 0.8.5",
@@ -3398,6 +3399,7 @@ dependencies = [
  "slog-term",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

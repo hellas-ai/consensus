@@ -1,12 +1,11 @@
-//! End-to-end integration tests for transaction gossiping via P2P network.
+//! End-to-end integration tests for transaction submission via gRPC.
 //!
-//! These tests verify that transactions broadcast via P2P gossip are correctly
-//! propagated to all nodes' mempools across the network.
+//! These tests verify that transactions submitted via gRPC are correctly
+//! propagated to all nodes' mempools across the network via P2P gossip.
 //!
-//! Unlike the consensus e2e tests which push transactions directly to mempools,
-//! these tests verify the full gossip flow:
-//! Source Node -> P2P broadcast_transaction -> Network -> Peer Nodes -> route_incoming_message ->
-//! Mempool
+//! This matches the production flow:
+//! gRPC Client -> TransactionService -> P2P broadcast_transaction -> Network ->
+//! Peer Nodes -> route_incoming_message -> Mempool
 
 #![cfg(test)]
 
@@ -18,11 +17,12 @@ use commonware_runtime::{Clock, Runner};
 
 use super::helpers::{F, N, create_gossip_test_network, create_test_logger};
 
-/// Test that a single node broadcasting a transaction results in all other nodes receiving it.
+/// Test that a single node submitting a transaction via gRPC results in all other nodes receiving
+/// it.
 ///
-/// This is the fundamental gossip propagation test:
-/// 1. Setup 6 nodes with P2P networking
-/// 2. Node 0 broadcasts a transaction via P2P
+/// This is the fundamental gRPC -> gossip propagation test:
+/// 1. Setup 6 nodes with P2P networking and gRPC servers
+/// 2. Submit a transaction via gRPC to node 0
 /// 3. Verify all other 5 nodes receive the transaction in their tx_consumer
 ///
 /// # Run Instructions
@@ -36,7 +36,7 @@ fn test_single_node_broadcasts_tx_all_nodes_receive() {
 
     slog::info!(
         logger,
-        "Starting gossip propagation test: single node broadcast";
+        "Starting gRPC -> gossip propagation test: single node submission";
         "nodes" => N,
     );
 
@@ -52,23 +52,27 @@ fn test_single_node_broadcasts_tx_all_nodes_receive() {
         // Give extra time for peer connections to stabilize
         ctx.sleep(Duration::from_millis(500)).await;
 
-        // Phase 2: Create and broadcast a transaction from node 0
-        slog::info!(logger, "Phase 2: Broadcasting transaction from node 0");
+        // Phase 2: Create and submit a transaction via gRPC to node 0
+        slog::info!(logger, "Phase 2: Submitting transaction via gRPC to node 0");
 
         let tx = network.create_transaction(0, 0);
         let tx_hash = tx.tx_hash;
 
-        // Broadcast via node 0's P2P network
-        network.nodes[0]
-            .p2p_handle
-            .broadcast_transaction(tx)
-            .expect("Failed to broadcast transaction");
-
-        slog::info!(
-            logger,
-            "Transaction broadcast";
-            "tx_hash" => hex::encode(&tx_hash[..8]),
-        );
+        // Submit via gRPC to node 0's TransactionService
+        match network.submit_transaction_via_grpc(0, &tx).await {
+            Ok(resp) => {
+                slog::info!(
+                    logger,
+                    "Transaction submitted via gRPC";
+                    "tx_hash" => hex::encode(&tx_hash[..8]),
+                    "success" => resp.success,
+                );
+            }
+            Err(e) => {
+                slog::error!(logger, "Failed to submit transaction via gRPC"; "error" => ?e);
+                panic!("Failed to submit transaction via gRPC: {:?}", e);
+            }
+        }
 
         // Phase 3: Wait for transaction to propagate to all other nodes
         slog::info!(logger, "Phase 3: Waiting for gossip propagation");
@@ -126,10 +130,10 @@ fn test_single_node_broadcasts_tx_all_nodes_receive() {
     });
 }
 
-/// Test concurrent broadcasts from multiple nodes.
+/// Test concurrent submissions via gRPC from multiple nodes.
 ///
-/// All 6 nodes simultaneously broadcast different transactions, and we verify
-/// that each node's mempool eventually contains all 6 transactions.
+/// All 6 nodes simultaneously submit different transactions via their gRPC endpoints,
+/// and we verify that each node's mempool eventually contains all 6 transactions.
 ///
 /// # Run Instructions
 /// ```bash
@@ -142,7 +146,7 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
 
     slog::info!(
         logger,
-        "Starting gossip propagation test: concurrent broadcasts";
+        "Starting gRPC -> gossip propagation test: concurrent submissions";
         "nodes" => N,
     );
 
@@ -156,8 +160,11 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
         // Give extra time for all peer connections to fully stabilize
         ctx.sleep(Duration::from_secs(2)).await;
 
-        // Phase 2: Each node broadcasts a unique transaction
-        slog::info!(logger, "Phase 2: All nodes broadcasting transactions");
+        // Phase 2: Each node submits a unique transaction via gRPC
+        slog::info!(
+            logger,
+            "Phase 2: All nodes submitting transactions via gRPC"
+        );
 
         let mut tx_hashes: Vec<[u8; 32]> = Vec::new();
         for i in 0..N {
@@ -166,19 +173,29 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
 
             slog::debug!(
                 logger,
-                "Node broadcasting transaction";
+                "Node submitting transaction via gRPC";
                 "node" => i,
                 "tx_hash" => hex::encode(&tx.tx_hash[..8]),
             );
 
-            // Broadcast via P2P to all peers
-            if let Err(e) = network.nodes[i].p2p_handle.broadcast_transaction(tx) {
-                slog::warn!(
-                    logger,
-                    "Failed to broadcast transaction";
-                    "node" => i,
-                    "error" => ?e,
-                );
+            // Submit via gRPC
+            match network.submit_transaction_via_grpc(i, &tx).await {
+                Ok(resp) => {
+                    slog::debug!(
+                        logger,
+                        "Transaction submitted";
+                        "node" => i,
+                        "success" => resp.success,
+                    );
+                }
+                Err(e) => {
+                    slog::warn!(
+                        logger,
+                        "Failed to submit transaction via gRPC";
+                        "node" => i,
+                        "error" => ?e,
+                    );
+                }
             }
         }
 
@@ -245,10 +262,10 @@ fn test_concurrent_broadcasts_from_multiple_nodes() {
     });
 }
 
-/// Test gossip propagation to a late-joining node.
+/// Test gRPC submission propagation to a late-joining node.
 ///
 /// This verifies that a node joining the network late can still receive
-/// transactions that were broadcast before it joined.
+/// transactions that were submitted via gRPC before it joined.
 ///
 /// # Run Instructions
 /// ```bash
@@ -261,16 +278,16 @@ fn test_gossip_propagation_with_delayed_node() {
 
     slog::info!(
         logger,
-        "Starting gossip propagation test: delayed node join";
+        "Starting gRPC -> gossip propagation test: delayed node join";
         "nodes" => N,
     );
 
-    // For this test, we start with N-1 nodes, broadcast transactions,
+    // For this test, we start with N-1 nodes, submit transactions via gRPC,
     // then start the final node and verify it receives pending txs
 
     // Note: This test requires special handling since late-joining nodes
     // need a sync mechanism to get pending transactions. For now, we test
-    // that transactions broadcast while all nodes are up reach all nodes.
+    // that transactions submitted while all nodes are up reach all nodes.
 
     let mut network = create_gossip_test_network(N, false, logger.clone());
 
@@ -281,8 +298,8 @@ fn test_gossip_propagation_with_delayed_node() {
         network.wait_for_bootstrap().await;
         ctx.sleep(Duration::from_secs(1)).await;
 
-        // Phase 2: Broadcast transactions from first few nodes
-        slog::info!(logger, "Phase 2: Broadcasting transactions");
+        // Phase 2: Submit transactions via gRPC from first few nodes
+        slog::info!(logger, "Phase 2: Submitting transactions via gRPC");
 
         let num_txs = 10;
         let mut tx_hashes: Vec<[u8; 32]> = Vec::new();
@@ -292,8 +309,8 @@ fn test_gossip_propagation_with_delayed_node() {
             tx_hashes.push(tx.tx_hash);
 
             let node_idx = i % (N - 1); // Distribute across all but last node
-            if let Err(e) = network.nodes[node_idx].p2p_handle.broadcast_transaction(tx) {
-                slog::warn!(logger, "Failed to broadcast tx"; "error" => ?e);
+            if let Err(e) = network.submit_transaction_via_grpc(node_idx, &tx).await {
+                slog::warn!(logger, "Failed to submit tx via gRPC"; "error" => ?e);
             }
         }
 
@@ -327,12 +344,13 @@ fn test_gossip_propagation_with_delayed_node() {
     });
 }
 
-/// Full end-to-end test: transaction gossip leading to block inclusion.
+/// Full end-to-end test: gRPC transaction submission leading to block inclusion.
 ///
-/// This test verifies the complete flow:
-/// 1. Transaction broadcast via P2P gossip
-/// 2. Transaction arrives in mempool
-/// 3. Transaction is included in a finalized block
+/// This test verifies the complete production flow:
+/// 1. Transaction submitted via gRPC
+/// 2. Transaction gossiped via P2P
+/// 3. Transaction arrives in mempool
+/// 4. Transaction is included in a finalized block
 ///
 /// # Run Instructions
 /// ```bash
@@ -345,12 +363,12 @@ fn test_transaction_gossip_to_block_inclusion() {
 
     slog::info!(
         logger,
-        "Starting full e2e gossip test: gossip to block inclusion";
+        "Starting full e2e gRPC test: submit via gRPC -> gossip -> block inclusion";
         "nodes" => N,
     );
 
     // Create network WITH consensus enabled
-    let mut network = create_gossip_test_network(N, true, logger.clone());
+    let network = create_gossip_test_network(N, true, logger.clone());
 
     let executor = TokioRunner::default();
     executor.start(|ctx| async move {
@@ -359,8 +377,8 @@ fn test_transaction_gossip_to_block_inclusion() {
         network.wait_for_bootstrap().await;
         ctx.sleep(Duration::from_secs(1)).await;
 
-        // Phase 2: Submit transactions
-        slog::info!(logger, "Phase 2: Submitting transactions via gossip");
+        // Phase 2: Submit transactions via gRPC
+        slog::info!(logger, "Phase 2: Submitting transactions via gRPC");
 
         let num_txs = 20;
         let mut expected_tx_hashes: HashSet<[u8; 32]> = HashSet::new();
@@ -369,16 +387,31 @@ fn test_transaction_gossip_to_block_inclusion() {
             let tx = network.create_transaction(i, 0);
             expected_tx_hashes.insert(tx.tx_hash);
 
-            // Broadcast transactions via P2P gossip
+            // Submit transactions via gRPC, rotating nodes
             let node_idx = i % N;
-            if let Err(e) = network.nodes[node_idx].p2p_handle.broadcast_transaction(tx) {
-                slog::warn!(logger, "Failed to broadcast tx"; "node" => node_idx, "error" => ?e);
+            match network.submit_transaction_via_grpc(node_idx, &tx).await {
+                Ok(resp) => {
+                    slog::debug!(
+                        logger,
+                        "Transaction submitted via gRPC";
+                        "node" => node_idx,
+                        "success" => resp.success,
+                    );
+                }
+                Err(e) => {
+                    slog::warn!(
+                        logger,
+                        "Failed to submit tx via gRPC";
+                        "node" => node_idx,
+                        "error" => ?e,
+                    );
+                }
             }
         }
 
         slog::info!(
             logger,
-            "Transactions submitted";
+            "Transactions submitted via gRPC";
             "count" => num_txs,
         );
 
@@ -440,15 +473,15 @@ fn test_transaction_gossip_to_block_inclusion() {
         slog::info!(logger, "Phase 5: Shutting down");
         network.shutdown();
 
-        slog::info!(logger, "Full e2e gossip test completed successfully! ✓");
+        slog::info!(logger, "Full e2e gRPC test completed successfully! ✓");
     });
 }
 
-/// Test gossip resilience with a Byzantine node dropping messages.
+/// Test gRPC submission resilience with a Byzantine node dropping messages.
 ///
 /// This verifies that even when one node (simulated as Byzantine) drops
 /// all outgoing transaction gossip, the honest nodes still receive all
-/// transactions from each other.
+/// transactions submitted via gRPC to each other.
 ///
 /// # Run Instructions
 /// ```bash
@@ -461,13 +494,13 @@ fn test_gossip_resilience_with_byzantine_node() {
 
     slog::info!(
         logger,
-        "Starting gossip resilience test: Byzantine node";
+        "Starting gRPC submission resilience test: Byzantine node";
         "nodes" => N,
         "byzantine_tolerance" => F,
     );
 
     // In this test, we designate node 0 as "Byzantine" (it won't broadcast)
-    // All other nodes broadcast transactions, and we verify they all receive
+    // All other nodes submit transactions via gRPC, and we verify they all receive
     // each other's transactions despite the Byzantine node.
 
     let mut network = create_gossip_test_network(N, false, logger.clone());
@@ -479,10 +512,10 @@ fn test_gossip_resilience_with_byzantine_node() {
         network.wait_for_bootstrap().await;
         ctx.sleep(Duration::from_millis(500)).await;
 
-        // Phase 2: Honest nodes (1 to N-1) broadcast transactions
+        // Phase 2: Honest nodes (1 to N-1) submit transactions via gRPC
         slog::info!(
             logger,
-            "Phase 2: Honest nodes broadcasting transactions";
+            "Phase 2: Honest nodes submitting transactions via gRPC";
             "byzantine_node" => 0,
         );
 
@@ -494,15 +527,15 @@ fn test_gossip_resilience_with_byzantine_node() {
 
             slog::debug!(
                 logger,
-                "Honest node broadcasting";
+                "Honest node submitting via gRPC";
                 "node" => i,
                 "tx_hash" => hex::encode(&tx.tx_hash[..8]),
             );
 
-            if let Err(e) = network.nodes[i].p2p_handle.broadcast_transaction(tx) {
+            if let Err(e) = network.submit_transaction_via_grpc(i, &tx).await {
                 slog::warn!(
                     logger,
-                    "Failed to broadcast transaction";
+                    "Failed to submit transaction via gRPC";
                     "node" => i,
                     "error" => ?e,
                 );

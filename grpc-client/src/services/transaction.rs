@@ -33,9 +33,12 @@ impl TransactionServiceImpl {
         }
     }
 
-    /// Deserialize a transaction from bytes safely.
+    /// Deserialize a transaction from bytes safely, preserving the original tx_hash.
+    ///
+    /// This uses `try_deserialize_preserving_hash` which keeps the original tx_hash
+    /// from the serialized transaction content, allowing signature verification to work.
     fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction, TransactionError> {
-        Transaction::try_from_tx_bytes(bytes)
+        Transaction::try_deserialize_preserving_hash(bytes)
     }
 
     /// Convert a Transaction to a TransactionInfo proto message.

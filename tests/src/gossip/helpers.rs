@@ -29,6 +29,12 @@ use p2p::{
 use rtrb::{Consumer, Producer, RingBuffer};
 use slog::{Drain, Level, Logger, o};
 use tempfile::TempDir;
+use tonic::transport::Channel;
+
+use grpc_client::config::{Network as RpcNetwork, RpcConfig};
+use grpc_client::proto::transaction_service_client::TransactionServiceClient;
+use grpc_client::proto::{SubmitTransactionRequest, SubmitTransactionResponse};
+use grpc_client::server::{RpcContext, RpcServer};
 
 /// Test configuration constants (n = 5f + 1 = 6 when f = 1)
 pub const N: usize = 6;
@@ -89,6 +95,12 @@ pub struct GossipTestNode<const N: usize, const F: usize, const M_SIZE: usize> {
 
     /// Node index (0-based)
     pub node_idx: usize,
+
+    /// gRPC server address for this node
+    pub grpc_addr: std::net::SocketAddr,
+
+    /// P2P ready flag (shared with RpcServer for health checks)
+    pub p2p_ready: Arc<std::sync::atomic::AtomicBool>,
 
     /// Logger for this node
     pub logger: Logger,
@@ -349,7 +361,7 @@ fn create_gossip_node(
     // Spawn MempoolService - reads from the forwarded tx channel
     let (mempool_service, mempool_channels) = MempoolService::spawn(
         mempool_tx_consumer,
-        pending_state_reader,
+        pending_state_reader.clone(),
         Arc::clone(&shutdown),
         logger.clone(),
     );
@@ -359,7 +371,7 @@ fn create_gossip_node(
     let bls_secret_key = identity.bls_secret_key().clone();
 
     // Spawn P2P service (consumes identity)
-    let p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
+    let mut p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
         TokioRunner::default(),
         p2p_config,
         identity, // identity is consumed here
@@ -371,6 +383,9 @@ fn create_gossip_node(
 
     // Get broadcast_notify from P2P
     let broadcast_notify = Arc::clone(&p2p_handle.broadcast_notify);
+
+    // P2P ready flag for health checks
+    let p2p_ready = Arc::clone(&p2p_handle.is_ready);
 
     // Optionally create consensus engine
     let consensus_engine = if with_consensus {
@@ -395,6 +410,65 @@ fn create_gossip_node(
         None
     };
 
+    // Find an available port for gRPC server
+    let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+    let grpc_addr = grpc_listener.local_addr().expect("get local addr");
+    drop(grpc_listener); // Release the port for the server
+
+    // Take the real tx_broadcast_producer from the P2P handle and give it to the gRPC handle.
+    // This way, when the gRPC TransactionService broadcasts a transaction, it goes directly
+    // into the P2P network's ring buffer that the P2P service is consuming from.
+    // We replace the original with a dummy producer (the node struct won't use it directly
+    // for gRPC tests - all tx submissions go through gRPC).
+    let (dummy_producer, _dummy_consumer) = RingBuffer::<Transaction>::new(1);
+    let real_tx_producer = std::mem::replace(&mut p2p_handle.tx_broadcast_producer, dummy_producer);
+
+    // Create a P2P handle for gRPC that uses the REAL tx_broadcast_producer
+    let grpc_p2p_handle = p2p::service::P2PHandle {
+        thread_handle: std::thread::spawn(|| {}),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        broadcast_notify: Arc::clone(&p2p_handle.broadcast_notify),
+        tx_broadcast_producer: real_tx_producer, // Use the REAL producer
+        tx_broadcast_notify: Arc::clone(&p2p_handle.tx_broadcast_notify),
+        ready_notify: Arc::clone(&p2p_handle.ready_notify),
+        is_ready: Arc::clone(&p2p_ready),
+    };
+
+    // Create RPC context for gRPC server
+    let rpc_context = RpcContext::new(
+        Arc::clone(&storage),
+        pending_state_reader,
+        None, // mempool_stats
+        None, // peer_stats
+        None, // block_events
+        None, // consensus_events
+        None, // tx_events
+        grpc_p2p_handle,
+        Arc::clone(&p2p_ready),
+        logger.new(o!("component" => "grpc")),
+    );
+
+    let rpc_config = RpcConfig {
+        listen_addr: grpc_addr,
+        max_concurrent_streams: 100,
+        request_timeout_secs: 30,
+        peer_id,
+        network: RpcNetwork::Local,
+        total_validators: N as u32,
+        f: F as u32,
+    };
+
+    // Spawn gRPC server in a separate thread with its own Tokio runtime
+    // This is necessary because create_gossip_node is called before the TokioRunner starts
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("create tokio runtime for grpc");
+        rt.block_on(async move {
+            let server = RpcServer::new(rpc_config, rpc_context);
+            let _ = server.serve().await;
+        });
+    });
+
     // Create a minimal identity info struct to store in node
     // (the actual identity was consumed by spawn_p2p)
     let node = GossipTestNode {
@@ -405,6 +479,8 @@ fn create_gossip_node(
         mempool_service,
         peer_id,
         node_idx,
+        grpc_addr,
+        p2p_ready,
         logger,
     };
 
@@ -464,6 +540,52 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> GossipTestNetwork<N, F
         self.stores[node_idx]
             .get_all_finalized_blocks()
             .expect("Failed to get finalized blocks")
+    }
+
+    /// Get a gRPC transaction service client for a specific node.
+    pub async fn transaction_client(
+        &self,
+        node_idx: usize,
+    ) -> Result<TransactionServiceClient<Channel>, tonic::transport::Error> {
+        let addr = self.nodes[node_idx].grpc_addr;
+        let endpoint = format!("http://{}", addr);
+        let channel = Channel::from_shared(endpoint)
+            .expect("valid endpoint")
+            .connect()
+            .await?;
+        Ok(TransactionServiceClient::new(channel))
+    }
+
+    /// Submit a transaction via gRPC to a specific node.
+    ///
+    /// This exercises the full gRPC -> P2P -> Gossip flow.
+    pub async fn submit_transaction_via_grpc(
+        &self,
+        node_idx: usize,
+        tx: &Transaction,
+    ) -> Result<SubmitTransactionResponse, tonic::Status> {
+        let mut client = self
+            .transaction_client(node_idx)
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("failed to connect: {}", e)))?;
+
+        let tx_bytes = consensus::storage::conversions::serialize_for_db(tx)
+            .expect("serialize transaction")
+            .to_vec();
+
+        let request = SubmitTransactionRequest {
+            transaction_bytes: tx_bytes,
+        };
+
+        let response = client.submit_transaction(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Serialize a transaction for gRPC submission.
+    pub fn serialize_transaction(tx: &Transaction) -> Vec<u8> {
+        consensus::storage::conversions::serialize_for_db(tx)
+            .expect("serialize transaction")
+            .to_vec()
     }
 }
 
