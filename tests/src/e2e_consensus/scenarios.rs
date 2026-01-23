@@ -93,6 +93,78 @@ struct NodeSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     grpc_addr: std::net::SocketAddr,
 }
 
+impl<const N: usize, const F: usize, const M_SIZE: usize> NodeSetup<N, F, M_SIZE> {
+    /// Signal this node to begin shutdown (non-blocking).
+    ///
+    /// This signals all components to stop but doesn't wait for them.
+    /// Call `shutdown_and_wait` after signaling all nodes.
+    fn signal_shutdown(&self) {
+        self.consensus_engine.shutdown();
+        self.p2p_handle.shutdown();
+    }
+
+    /// Shutdown mempool service (blocking - waits for thread to join).
+    fn shutdown_mempool(&mut self) {
+        self.mempool_service.shutdown();
+    }
+
+    /// Wait for consensus engine to finish with timeout.
+    fn wait_for_consensus(self, timeout: Duration, logger: &Logger, node_idx: usize) {
+        self.consensus_engine
+            .shutdown_and_wait(timeout)
+            .unwrap_or_else(|e| {
+                slog::error!(
+                    logger,
+                    "Consensus engine shutdown failed";
+                    "node" => node_idx,
+                    "error" => ?e,
+                );
+                panic!(
+                    "Node {} consensus engine failed to shutdown: {}",
+                    node_idx, e
+                )
+            });
+    }
+}
+
+/// Hierarchical shutdown for a collection of nodes.
+///
+/// Shutdown order is critical to avoid race conditions:
+/// 1. Signal Consensus (stops proposing/voting)
+/// 2. Signal P2P (stops network I/O)
+/// 3. Shutdown Mempool (drains queues, waits for thread)
+/// 4. Wait for Consensus (join with timeout)
+fn shutdown_nodes<const N: usize, const F: usize, const M_SIZE: usize>(
+    mut nodes: Vec<NodeSetup<N, F, M_SIZE>>,
+    timeout: Duration,
+    logger: &Logger,
+) {
+    slog::info!(
+        logger,
+        "Beginning hierarchical shutdown of {} nodes",
+        nodes.len()
+    );
+
+    // Step 1 & 2: Signal ALL nodes to stop (consensus + P2P)
+    // This prevents one node from advancing while others are already stopped.
+    for node in &nodes {
+        node.signal_shutdown();
+    }
+
+    // Step 3: Shutdown mempool services (blocking - waits for each thread)
+    for node in &mut nodes {
+        node.shutdown_mempool();
+    }
+
+    // Step 4: Wait for each consensus engine to finish
+    for (i, node) in nodes.into_iter().enumerate() {
+        slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
+        node.wait_for_consensus(timeout, logger, i);
+    }
+
+    slog::info!(logger, "All nodes shut down successfully");
+}
+
 /// Creates funded test transactions and genesis accounts.
 ///
 /// Each transaction is created from a unique funded account.
@@ -542,51 +614,9 @@ fn test_multi_node_happy_path() {
             assert!(is_running, "Node {} should still be running", i);
         }
 
-        // Phase 8: Graceful shutdown
-        // Shutdown order is critical to avoid race conditions:
-        // 1. Signal consensus to stop (prevents new proposals/votes)
-        // 2. Signal P2P to stop (prevents new messages)
-        // 3. Shutdown mempool (drains queues, stops bridge threads)
-        // 4. Wait for consensus threads to finish
+        // Phase 8: Graceful shutdown using hierarchical shutdown
         slog::info!(logger, "Phase 8: Shutting down all nodes");
-
-        // Step 1: Signal ALL consensus engines to stop immediately.
-        // This prevents one node from advancing while others are already stopped.
-        for node in &nodes {
-            node.consensus_engine.shutdown();
-        }
-
-        // Step 2: Signal all P2P services to shutdown.
-        // This prevents new messages from being delivered during shutdown.
-        for node in &nodes {
-            node.p2p_handle.shutdown();
-        }
-
-        // Step 3: Shutdown mempool services.
-        // This also signals bridge threads to drain and stop.
-        // The mempool service waits for its thread to join.
-        for node in &mut nodes {
-            node.mempool_service.shutdown();
-        }
-
-        // Step 4: Wait for each consensus engine to finish its thread.
-        // Note: temp_dirs are kept alive in a separate vec for verification.
-        for (i, node) in nodes.into_iter().enumerate() {
-            slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
-            node.consensus_engine
-                .shutdown_and_wait(Duration::from_secs(10))
-                .unwrap_or_else(|e| {
-                    slog::error!(
-                        logger,
-                        "Consensus engine shutdown failed";
-                        "node" => i,
-                        "error" => ?e,
-                    );
-                    panic!("Node {} consensus engine failed to shutdown: {}", i, e)
-                });
-        }
-
-        slog::info!(logger, "All nodes shut down successfully");
+        shutdown_nodes(nodes, Duration::from_secs(10), &logger);
 
         // Small delay to ensure storage writes are flushed
         ctx.sleep(Duration::from_millis(100)).await;
@@ -955,50 +985,9 @@ fn test_multi_node_continuous_load() {
             "total_transactions_submitted" => tx_count,
         );
 
-        // Phase 6: Graceful shutdown
-        // Shutdown order is critical to avoid race conditions:
-        // 1. Signal consensus to stop (prevents new proposals/votes)
-        // 2. Signal P2P to stop (prevents new messages)
-        // 3. Shutdown mempool (drains queues, stops bridge threads)
-        // 4. Wait for consensus threads to finish
+        // Phase 6: Graceful shutdown using hierarchical shutdown
         slog::info!(logger, "Phase 6: Shutting down all nodes");
-
-        // Step 1: Signal ALL consensus engines to stop immediately.
-        // This prevents one node from advancing while others are already stopped.
-        for node in &nodes {
-            node.consensus_engine.shutdown();
-        }
-
-        // Step 2: Signal all P2P services to shutdown.
-        // This prevents new messages from being delivered during shutdown.
-        for node in &nodes {
-            node.p2p_handle.shutdown();
-        }
-
-        // Step 3: Shutdown mempool services.
-        // This also signals bridge threads to drain and stop.
-        // The mempool service waits for its thread to join.
-        for node in &mut nodes {
-            node.mempool_service.shutdown();
-        }
-
-        // Step 4: Wait for each consensus engine to finish its thread.
-        for (i, node) in nodes.into_iter().enumerate() {
-            slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
-            node.consensus_engine
-                .shutdown_and_wait(Duration::from_secs(10))
-                .unwrap_or_else(|e| {
-                    slog::error!(
-                        logger,
-                        "Consensus engine shutdown failed";
-                        "node" => i,
-                        "error" => ?e,
-                    );
-                    panic!("Node {} consensus engine failed to shutdown: {}", i, e)
-                });
-        }
-
-        slog::info!(logger, "All nodes shut down successfully");
+        shutdown_nodes(nodes, Duration::from_secs(10), &logger);
 
         // Small delay to ensure storage writes are flushed
         ctx.sleep(Duration::from_millis(100)).await;

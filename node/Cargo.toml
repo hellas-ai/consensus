@@ -1,0 +1,23 @@
+[package]
+edition = "2024"
+name    = "node"
+version = "0.1.0"
+
+[dependencies]
+# Workspace crates
+consensus   = { workspace = true }
+grpc-client = { workspace = true }
+p2p         = { workspace = true }
+
+# Core dependencies
+anyhow    = { workspace = true }
+arc-swap  = { workspace = true }
+crossbeam = { workspace = true }
+figment   = { workspace = true, features = [ "env", "toml", "yaml" ] }
+rtrb      = { workspace = true }
+serde     = { workspace = true, features = [ "derive" ] }
+slog      = { workspace = true }
+tokio     = { workspace = true }
+
+# Async runtime for P2P
+commonware-runtime = { workspace = true }
