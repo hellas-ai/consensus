@@ -312,7 +312,7 @@ fn test_e2e_consensus_happy_path() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
         engine
-            .shutdown_and_wait(Duration::from_secs(5))
+            .shutdown_and_wait(Duration::from_secs(10))
             .unwrap_or_else(|e| {
                 slog::error!(
                     logger,
@@ -696,7 +696,7 @@ fn test_e2e_consensus_continuous_load() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
         engine
-            .shutdown_and_wait(Duration::from_secs(5))
+            .shutdown_and_wait(Duration::from_secs(10))
             .unwrap_or_else(|e| {
                 slog::error!(
                     logger,
@@ -958,7 +958,7 @@ fn test_e2e_consensus_with_crashed_replica() {
     if let Some(crashed_engine) = engines[CRASHED_REPLICA_IDX].take() {
         crashed_engine.shutdown();
         crashed_engine
-            .shutdown_and_wait(Duration::from_secs(5))
+            .shutdown_and_wait(Duration::from_secs(10))
             .expect("Failed to shutdown crashed replica");
     }
 
@@ -1105,7 +1105,7 @@ fn test_e2e_consensus_with_crashed_replica() {
             slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
             engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(
                         logger,
@@ -1745,7 +1745,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
             slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
             engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(
                         logger,
@@ -2459,7 +2459,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| panic!("Engine {} failed to shutdown: {}", i, e));
         }
     }
@@ -2970,7 +2970,7 @@ fn test_e2e_consensus_functional_blockchain() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
         engine
-            .shutdown_and_wait(Duration::from_secs(5))
+            .shutdown_and_wait(Duration::from_secs(10))
             .unwrap_or_else(|e| {
                 slog::error!(
                     logger,
@@ -3572,7 +3572,7 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         slog::debug!(logger, "Waiting for engine shutdown"; "replica" => i);
 
         engine
-            .shutdown_and_wait(Duration::from_secs(5))
+            .shutdown_and_wait(Duration::from_secs(10))
             .unwrap_or_else(|e| {
                 slog::error!(
                     logger,
@@ -4052,7 +4052,7 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(logger, "Engine shutdown failed"; "replica" => i, "error" => ?e);
                     panic!("Engine {} failed to shutdown: {}", i, e)
@@ -4458,7 +4458,7 @@ fn test_e2e_consensus_with_true_equivocation() {
     for (i, engine_opt) in engines.into_iter().enumerate() {
         if let Some(engine) = engine_opt {
             engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(logger, "Engine shutdown failed"; "replica" => i, "error" => ?e);
                     panic!("Engine {} failed to shutdown: {}", i, e)

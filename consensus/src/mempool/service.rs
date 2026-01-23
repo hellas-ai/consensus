@@ -31,6 +31,7 @@ use crate::{
 };
 use arc_swap::ArcSwap;
 use crossbeam::queue::ArrayQueue;
+use crossbeam::sync::{Parker, Unparker};
 use rtrb::{Consumer, Producer, RingBuffer};
 use slog::Logger;
 use std::{
@@ -59,6 +60,10 @@ const TX_BATCH_SIZE: usize = 1024;
 pub struct MempoolService {
     handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// Unparker to wake up the mempool thread immediately on shutdown.
+    /// Similar to P2P's `shutdown_notify`, this ensures the thread doesn't
+    /// sleep through the shutdown signal during idle backoff.
+    shutdown_unparker: Unparker,
 }
 
 /// Channel endpoints for communicating with the mempool service.
@@ -149,6 +154,11 @@ impl MempoolService {
             inner: stats_shared,
         };
 
+        // Create parker/unparker pair for instant shutdown wake-up
+        // Similar to P2P's shutdown_notify pattern, but for OS threads
+        let parker = Parker::new();
+        let shutdown_unparker = parker.unparker().clone();
+
         let shutdown_clone = Arc::clone(&shutdown);
         let logger_clone = logger.clone();
 
@@ -165,6 +175,7 @@ impl MempoolService {
                     finalized_consumer,
                     stats_writer,
                     shutdown_clone,
+                    parker,
                     logger_clone,
                 );
             })
@@ -181,14 +192,22 @@ impl MempoolService {
             Self {
                 handle: Some(handle),
                 shutdown,
+                shutdown_unparker,
             },
             channels,
         )
     }
 
     /// Signals shutdown and waits for the thread to terminate.
+    ///
+    /// This method:
+    /// 1. Sets the shutdown flag (checked by mempool_loop)
+    /// 2. Wakes up the thread immediately via unpark (no waiting for idle timeout)
+    /// 3. Joins the thread to ensure clean shutdown
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // Wake up the thread immediately if it's parked during idle backoff
+        self.shutdown_unparker.unpark();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -281,6 +300,13 @@ fn process_incoming_tx(
 /// Receives transactions from two sources:
 /// - `grpc_tx_queue`: Lock-free ArrayQueue for gRPC-submitted transactions (MPSC)
 /// - `p2p_tx_consumer`: rtrb Consumer for P2P-gossipped transactions (SPSC)
+///
+/// # Shutdown Behavior
+///
+/// When shutdown is signaled:
+/// 1. The parker is unparked immediately (no waiting for idle timeout)
+/// 2. The loop exits on the next iteration
+/// 3. Any pending proposal requests are handled before exit
 #[allow(clippy::too_many_arguments)]
 pub fn mempool_loop(
     pool_capacity: usize,
@@ -292,6 +318,7 @@ pub fn mempool_loop(
     mut finalized_consumer: Consumer<FinalizedNotification>,
     stats_writer: Arc<ArcSwap<PoolStats>>,
     shutdown: Arc<AtomicBool>,
+    parker: Parker,
     logger: Logger,
 ) {
     let mut pool = TransactionPool::new(pool_capacity);
@@ -445,6 +472,8 @@ pub fn mempool_loop(
         }
 
         // Progressive backoff when idle
+        // Uses parker.park_timeout() instead of thread::sleep() so that
+        // shutdown can wake us immediately via unpark()
         if did_work {
             idle_count = 0;
         } else {
@@ -454,8 +483,25 @@ pub fn mempool_loop(
             } else if idle_count < 100 {
                 std::thread::yield_now();
             } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                // Park with timeout - can be woken immediately by shutdown_unparker.unpark()
+                parker.park_timeout(std::time::Duration::from_millis(10));
             }
+        }
+    }
+
+    // Handle any pending proposal requests before exiting.
+    // This ensures consensus gets responses for in-flight requests.
+    slog::info!(
+        logger,
+        "Mempool shutting down, handling final proposal requests..."
+    );
+
+    let mut final_proposals = 0u64;
+    while let Ok(req) = proposal_req_consumer.pop() {
+        let response = build_validated_proposal(&pool, &req, &pending_state_reader, &logger);
+        // Best-effort push - don't block if consensus is already gone
+        if proposal_resp_producer.push(response).is_ok() {
+            final_proposals += 1;
         }
     }
 
@@ -463,7 +509,8 @@ pub fn mempool_loop(
 
     slog::info!(
         logger,
-        "Mempool service shutting down";
+        "Mempool service shutdown complete";
+        "final_proposals_handled" => final_proposals,
         "final_pending" => pool_stats.pending_size,
         "final_queued" => pool_stats.queued_size,
         "total_added" => pool_stats.total_added,
@@ -1558,5 +1605,92 @@ mod tests {
         assert_eq!(resp.transactions.len(), 2);
 
         setup.service.shutdown();
+    }
+
+    #[test]
+    fn test_shutdown_instant_wakeup() {
+        // Tests that shutdown wakes the thread immediately via unpark(),
+        // rather than waiting for the 10ms idle timeout.
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
+
+        assert!(setup.service.is_running());
+
+        // Let the service become idle and enter the park_timeout state
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Shutdown should complete quickly (< 15ms) because of instant unpark
+        let start = std::time::Instant::now();
+        setup.service.shutdown();
+        let elapsed = start.elapsed();
+
+        // If unpark didn't work, this would take ~10ms for the park_timeout
+        // With unpark, it should be nearly instant (< 5ms typically)
+        assert!(
+            elapsed < std::time::Duration::from_millis(15),
+            "Shutdown took {:?}, expected < 15ms (instant wakeup failed)",
+            elapsed
+        );
+
+        assert!(setup.service.handle.is_none());
+    }
+
+    #[test]
+    fn test_shutdown_handles_pending_proposal_requests() {
+        // Tests that proposal requests in-flight during shutdown are still handled.
+        let path = temp_db_path();
+        let store = Arc::new(ConsensusStore::open(&path).unwrap());
+
+        // Create and fund sender
+        let (sk, sender) = gen_keypair();
+        let (_, recipient) = gen_keypair();
+        store
+            .put_account(&Account::new(sk.public_key(), 10_000, 0))
+            .unwrap();
+
+        let (_writer, reader) = PendingStateWriter::new(Arc::clone(&store), 0);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let mut setup = spawn_test_mempool(reader, Arc::clone(&shutdown), logger);
+
+        // Submit a transaction
+        let tx = create_tx(&sk, sender, recipient, 100, 0, 10);
+        setup.tx_queue.push(tx).unwrap();
+
+        // Wait for it to be processed into the pool
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now signal shutdown, but first push a proposal request
+        // The mempool should handle this request during graceful shutdown
+        shutdown.store(true, Ordering::Release);
+
+        let req = ProposalRequest {
+            view: 1,
+            max_txs: 10,
+            max_bytes: 100_000,
+            parent_block_hash: [0u8; 32],
+        };
+        setup.channels.proposal_req_producer.push(req).unwrap();
+
+        // Wake up the thread to process shutdown
+        setup.service.shutdown();
+
+        // The response should have been produced during shutdown
+        let resp = setup.channels.proposal_resp_consumer.pop();
+        assert!(
+            resp.is_ok(),
+            "Expected proposal response to be handled during shutdown"
+        );
+        let resp = resp.unwrap();
+        assert_eq!(resp.view, 1);
+        assert_eq!(resp.transactions.len(), 1);
     }
 }

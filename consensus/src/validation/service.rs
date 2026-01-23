@@ -34,6 +34,8 @@ const RING_BUFFER_SIZE: usize = 64;
 pub struct BlockValidationService {
     handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// Unparker to wake up the validation thread immediately on shutdown.
+    shutdown_unparker: crossbeam::sync::Unparker,
 }
 
 impl BlockValidationService {
@@ -87,6 +89,10 @@ impl BlockValidationService {
         let (pending_state_writer, pending_state_reader) =
             PendingStateWriter::new(Arc::clone(&store), last_finalized_view);
 
+        // Create parker/unparker pair for instant shutdown wake-up
+        let parker = crossbeam::sync::Parker::new();
+        let shutdown_unparker = parker.unparker().clone();
+
         let logger_clone = logger.clone();
         let shutdown_clone = Arc::clone(&shutdown);
 
@@ -98,6 +104,7 @@ impl BlockValidationService {
                     block_consumer,
                     validated_producer,
                     shutdown_clone,
+                    parker,
                     logger_clone,
                 );
             })
@@ -107,6 +114,7 @@ impl BlockValidationService {
             Self {
                 handle: Some(handle),
                 shutdown,
+                shutdown_unparker,
             },
             block_producer,
             validated_consumer,
@@ -115,8 +123,14 @@ impl BlockValidationService {
     }
 
     /// Signals shutdown and waits for the thread to terminate.
+    ///
+    /// This method:
+    /// 1. Sets the shutdown flag
+    /// 2. Wakes up the thread immediately via unpark
+    /// 3. Joins the thread to ensure clean shutdown
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.shutdown_unparker.unpark();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -135,11 +149,16 @@ impl Drop for BlockValidationService {
 }
 
 /// Main validation event loop.
+///
+/// # Shutdown Behavior
+///
+/// When shutdown is signaled, the parker is unparked immediately for instant wake-up.
 fn validation_loop(
     pending_state_reader: PendingStateReader,
     mut block_consumer: Consumer<Block>,
     mut validated_producer: Producer<ValidatedBlock>,
     shutdown: Arc<AtomicBool>,
+    parker: crossbeam::sync::Parker,
     logger: Logger,
 ) {
     let validator = BlockValidator::new(pending_state_reader);
@@ -198,6 +217,7 @@ fn validation_loop(
             }
             Err(_) => {
                 // No blocks available - progressive backoff
+                // Uses parker.park_timeout() for instant shutdown wake-up
                 idle_count = idle_count.saturating_add(1);
 
                 if idle_count < 10 {
@@ -205,8 +225,8 @@ fn validation_loop(
                 } else if idle_count < 100 {
                     std::thread::yield_now();
                 } else {
-                    // Extended idle - sleep briefly
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    // Park with timeout - can be woken immediately by shutdown_unparker.unpark()
+                    parker.park_timeout(std::time::Duration::from_micros(100));
                 }
             }
         }
@@ -478,12 +498,19 @@ mod tests {
             producer.push(block).unwrap();
         }
 
-        // Drain all
-        std::thread::sleep(std::time::Duration::from_millis(4));
-
+        // Wait for all blocks to be processed with timeout
+        // Use a polling loop instead of fixed sleep for reliability
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(2);
         let mut received = 0;
-        while consumer.pop().is_ok() {
-            received += 1;
+
+        while received < num_blocks && start.elapsed() < timeout {
+            while let Ok(_) = consumer.pop() {
+                received += 1;
+            }
+            if received < num_blocks {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
 
         assert_eq!(received, num_blocks);

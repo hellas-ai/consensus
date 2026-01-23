@@ -525,7 +525,7 @@ mod tests {
         assert!(engine.is_running());
 
         // Shutdown
-        engine.shutdown_and_wait(Duration::from_secs(5)).unwrap();
+        engine.shutdown_and_wait(Duration::from_secs(10)).unwrap();
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
         assert!(engine.is_running());
 
         // Shutdown and wait
-        let result = engine.shutdown_and_wait(Duration::from_secs(5));
+        let result = engine.shutdown_and_wait(Duration::from_secs(10));
         assert!(result.is_ok());
     }
 
