@@ -505,7 +505,7 @@ mod tests {
         let mut received = 0;
 
         while received < num_blocks && start.elapsed() < timeout {
-            while let Ok(_) = consumer.pop() {
+            while consumer.pop().is_ok() {
                 received += 1;
             }
             if received < num_blocks {
