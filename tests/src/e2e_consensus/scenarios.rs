@@ -25,6 +25,10 @@ use consensus::{
     storage::store::ConsensusStore,
     validation::PendingStateWriter,
 };
+use crossbeam::queue::ArrayQueue;
+use grpc_client::config::{Network as RpcNetwork, RpcConfig};
+use grpc_client::proto::{SubmitTransactionRequest, SubmitTransactionResponse};
+use grpc_client::server::{RpcContext, RpcServer};
 use p2p::{
     config::P2PConfig, config::ValidatorPeerInfo, identity::ValidatorIdentity,
     service::spawn as spawn_p2p,
@@ -82,11 +86,11 @@ struct NodeSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Consensus engine
     consensus_engine: ConsensusEngine<N, F, M_SIZE>,
 
-    /// Transaction producer (for submitting transactions directly to mempool)
-    tx_producer: Producer<Transaction>,
-
     /// Mempool service
     mempool_service: MempoolService,
+
+    /// gRPC server address
+    grpc_addr: std::net::SocketAddr,
 }
 
 /// Creates funded test transactions and genesis accounts.
@@ -145,6 +149,9 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     let (persistence_writer, pending_state_reader) =
         PendingStateWriter::new(Arc::clone(&storage), 0);
 
+    // Create a second reader for gRPC server
+    let grpc_pending_state_reader = pending_state_reader.clone();
+
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -181,6 +188,9 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     // This way when consensus calls notify_one(), P2P wakes up to broadcast
     let broadcast_notify = Arc::clone(&p2p_handle.broadcast_notify);
 
+    // P2P ready flag for health checks
+    let p2p_ready = Arc::clone(&p2p_handle.is_ready);
+
     // Create consensus engine with P2P's broadcast_notify
     let consensus_engine = ConsensusEngine::<N, F, M_SIZE>::new(
         consensus_config,
@@ -198,14 +208,102 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     )
     .expect("Failed to create consensus engine");
 
+    // Find an available port for gRPC server
+    let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+    let grpc_addr = grpc_listener.local_addr().expect("get local addr");
+    drop(grpc_listener); // Release the port for the server
+
+    // Create mempool queue for gRPC → mempool bridge.
+    // When gRPC receives a transaction, it pushes to this queue.
+    // A bridge thread forwards to the mempool's tx_producer.
+    let mempool_tx_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
+    let mempool_tx_queue_clone = Arc::clone(&mempool_tx_queue);
+    let bridge_shutdown = Arc::clone(&shutdown);
+
+    // Spawn bridge thread: mempool_tx_queue → tx_producer (for local mempool)
+    // This ensures transactions submitted via gRPC reach the local mempool.
+    std::thread::spawn(move || {
+        let mut tx_producer = tx_producer; // Take ownership
+        while !bridge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(tx) = mempool_tx_queue_clone.pop() {
+                let _ = tx_producer.push(tx); // Ignore if full
+            } else {
+                // No transactions, yield briefly
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+
+    // Create RPC context for gRPC server
+    // Uses lock-free ArrayQueues - no mutex needed
+    let rpc_context = RpcContext::new(
+        Arc::clone(&storage),
+        grpc_pending_state_reader,
+        None,                                        // mempool_stats
+        None,                                        // peer_stats
+        None,                                        // block_events
+        None,                                        // consensus_events
+        None,                                        // tx_events
+        Arc::clone(&p2p_handle.tx_broadcast_queue),  // P2P broadcast queue
+        Arc::clone(&p2p_handle.tx_broadcast_notify), // P2P broadcast notify
+        mempool_tx_queue,                            // Local mempool queue
+        Arc::clone(&p2p_ready),
+        logger.new(o!("component" => "grpc")),
+    );
+
+    let rpc_config = RpcConfig {
+        listen_addr: grpc_addr,
+        max_concurrent_streams: 100,
+        request_timeout_secs: 30,
+        peer_id,
+        network: RpcNetwork::Local,
+        total_validators: N as u32,
+        f: F as u32,
+    };
+
+    // Spawn gRPC server in a separate thread with its own Tokio runtime
+    // This is necessary because create_node_setup is called before the TokioRunner starts
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("create tokio runtime for grpc");
+        rt.block_on(async move {
+            let server = RpcServer::new(rpc_config, rpc_context);
+            let _ = server.serve().await;
+        });
+    });
+
     let node = NodeSetup {
         p2p_handle,
         consensus_engine,
-        tx_producer, // Test can submit directly to mempool
         mempool_service,
+        grpc_addr,
     };
 
     (node, storage, temp_dir)
+}
+
+/// Submit a transaction via gRPC to a specific node.
+///
+/// This exercises the full gRPC -> P2P -> Gossip -> Consensus flow.
+async fn submit_transaction_via_grpc(
+    grpc_addr: std::net::SocketAddr,
+    tx: &Transaction,
+) -> Result<SubmitTransactionResponse, tonic::Status> {
+    let addr = format!("http://{}", grpc_addr);
+    let mut client =
+        grpc_client::proto::transaction_service_client::TransactionServiceClient::connect(addr)
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("failed to connect: {}", e)))?;
+
+    let tx_bytes = consensus::storage::conversions::serialize_for_db(tx)
+        .expect("serialize transaction")
+        .to_vec();
+
+    let request = SubmitTransactionRequest {
+        transaction_bytes: tx_bytes,
+    };
+
+    let response = client.submit_transaction(request).await?;
+    Ok(response.into_inner())
 }
 
 /// Happy path integration test with 6 nodes using real P2P networking.
@@ -368,31 +466,47 @@ fn test_multi_node_happy_path() {
 
         slog::info!(logger, "All nodes bootstrapped successfully");
 
-        // Phase 5: Submit transactions directly to each node's mempool
+        // Phase 5: Submit transactions via gRPC to each node
         slog::info!(
             logger,
-            "Phase 5: Submitting transactions";
+            "Phase 5: Submitting transactions via gRPC";
             "count" => num_transactions,
         );
 
-        for (i, tx) in transactions.into_iter().enumerate() {
+        for (i, tx) in transactions.iter().enumerate() {
             // Distribute transactions across nodes
             let node_idx = i % N;
-            if let Err(e) = nodes[node_idx].tx_producer.push(tx) {
-                slog::warn!(
-                    logger,
-                    "Failed to submit transaction";
-                    "tx_index" => i,
-                    "node" => node_idx,
-                    "error" => ?e,
-                );
-            } else {
-                slog::debug!(
-                    logger,
-                    "Transaction submitted";
-                    "tx_index" => i,
-                    "target_node" => node_idx,
-                );
+            let grpc_addr = nodes[node_idx].grpc_addr;
+
+            match submit_transaction_via_grpc(grpc_addr, tx).await {
+                Ok(resp) => {
+                    if resp.success {
+                        slog::debug!(
+                            logger,
+                            "Transaction submitted via gRPC";
+                            "tx_index" => i,
+                            "target_node" => node_idx,
+                            "tx_hash" => &resp.tx_hash,
+                        );
+                    } else {
+                        slog::warn!(
+                            logger,
+                            "Transaction rejected by gRPC";
+                            "tx_index" => i,
+                            "node" => node_idx,
+                            "error" => &resp.error_message,
+                        );
+                    }
+                }
+                Err(e) => {
+                    slog::warn!(
+                        logger,
+                        "Failed to submit transaction via gRPC";
+                        "tx_index" => i,
+                        "node" => node_idx,
+                        "error" => %e,
+                    );
+                }
             }
         }
 
@@ -790,7 +904,7 @@ fn test_multi_node_continuous_load() {
 
         slog::info!(
             logger,
-            "Phase 5: Running consensus with continuous transaction load";
+            "Phase 5: Running consensus with continuous transaction load via gRPC";
             "duration_secs" => test_duration.as_secs(),
             "tx_interval_ms" => tx_interval.as_millis(),
         );
@@ -802,7 +916,7 @@ fn test_multi_node_continuous_load() {
         let mut expected_tx_hashes = std::collections::HashSet::new();
 
         while start_time.elapsed() < test_duration && !all_transactions.is_empty() {
-            // Submit a batch of transactions
+            // Submit a batch of transactions via gRPC
             let batch_size = std::cmp::min(5, all_transactions.len());
 
             for _ in 0..batch_size {
@@ -812,7 +926,10 @@ fn test_multi_node_continuous_load() {
                     let node_idx = tx_index % N;
                     tx_index += 1;
 
-                    if nodes[node_idx].tx_producer.push(tx).is_ok() {
+                    let grpc_addr = nodes[node_idx].grpc_addr;
+                    if let Ok(resp) = submit_transaction_via_grpc(grpc_addr, &tx).await
+                        && resp.success
+                    {
                         tx_count += 1;
                         expected_tx_hashes.insert(tx_hash);
                     }
@@ -1057,12 +1174,15 @@ fn test_multi_node_crashed_replica() {
 
         slog::info!(logger, "Node crashed (consensus stopped)"; "node" => CRASHED_NODE_IDX);
 
-        // Phase 6: Submit transactions to HEALTHY nodes
-        slog::info!(logger, "Phase 6: Submitting transactions to healthy nodes");
+        // Phase 6: Submit transactions to healthy nodes via gRPC
+        slog::info!(
+            logger,
+            "Phase 6: Submitting transactions via gRPC to healthy nodes"
+        );
 
         let mut expected_tx_hashes = std::collections::HashSet::new();
 
-        for (i, tx) in transactions.into_iter().enumerate() {
+        for (i, tx) in transactions.iter().enumerate() {
             // Distribute transactions across HEALTHY nodes (skip crashed one)
             let mut node_idx = i % N;
             if node_idx == CRASHED_NODE_IDX {
@@ -1072,9 +1192,11 @@ fn test_multi_node_crashed_replica() {
                 node_idx = (node_idx + 1) % N;
             } // Handle N=1 case
 
-            let tx_hash = tx.tx_hash;
-            if nodes[node_idx].tx_producer.push(tx).is_ok() {
-                expected_tx_hashes.insert(tx_hash);
+            let grpc_addr = nodes[node_idx].grpc_addr;
+            if let Ok(resp) = submit_transaction_via_grpc(grpc_addr, tx).await
+                && resp.success
+            {
+                expected_tx_hashes.insert(tx.tx_hash);
             }
         }
 
@@ -1674,23 +1796,23 @@ fn test_multi_node_invalid_tx_rejection() {
         }
         slog::info!(logger, "All nodes bootstrapped");
 
-        // Phase 5: Submit Transactions
-        slog::info!(logger, "Phase 5: Submitting VALID transactions");
+        // Phase 5: Submit Transactions via gRPC
+        slog::info!(logger, "Phase 5: Submitting VALID transactions via gRPC");
 
         // Submit valid ones
         for (i, tx) in valid_transactions.iter().enumerate() {
             let node_idx = i % N;
-            nodes[node_idx].tx_producer.push(tx.clone()).unwrap();
+            let grpc_addr = nodes[node_idx].grpc_addr;
+            let _ = submit_transaction_via_grpc(grpc_addr, tx).await;
         }
 
-        slog::info!(logger, "Phase 5b: Submitting INVALID transactions");
-        // Submit invalid ones
+        slog::info!(logger, "Phase 5b: Submitting INVALID transactions via gRPC");
+        // Submit invalid ones - gRPC server should reject them
         for (i, tx) in invalid_transactions.iter().enumerate() {
             let node_idx = i % N;
-            // We ignore error here as Mempool might reject immediately?
-            // The tx_producer puts into RingBuffer. Mempool service consumes efficiently.
-            // Mempool validation happens async.
-            let _ = nodes[node_idx].tx_producer.push(tx.clone());
+            let grpc_addr = nodes[node_idx].grpc_addr;
+            // We expect these to fail validation
+            let _ = submit_transaction_via_grpc(grpc_addr, tx).await;
         }
 
         // Phase 6: Wait for Consensus

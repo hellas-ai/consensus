@@ -6,6 +6,7 @@ version = "0.1.0"
 [dependencies]
 anyhow       = { workspace = true }
 consensus    = { workspace = true }
+crossbeam    = { workspace = true }
 figment      = { workspace = true, features = [ "env", "toml" ] }
 hex          = { workspace = true }
 p2p          = { workspace = true }

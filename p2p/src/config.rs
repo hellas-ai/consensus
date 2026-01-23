@@ -55,6 +55,10 @@ pub struct P2PConfig {
     /// Interval between Ping retries during bootstrap (milliseconds).
     #[serde(default = "default_ping_interval_ms")]
     pub ping_interval_ms: u64,
+
+    /// Size of the transaction broadcast queue.
+    #[serde(default = "default_tx_broadcast_queue_size")]
+    pub tx_broadcast_queue_size: usize,
 }
 
 fn default_max_message_size() -> u32 {
@@ -85,6 +89,10 @@ fn default_ping_interval_ms() -> u64 {
     500
 }
 
+fn default_tx_broadcast_queue_size() -> usize {
+    100_000
+}
+
 impl Default for P2PConfig {
     fn default() -> Self {
         Self {
@@ -100,6 +108,7 @@ impl Default for P2PConfig {
             tx_rate_per_second: default_tx_rate(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             ping_interval_ms: default_ping_interval_ms(),
+            tx_broadcast_queue_size: default_tx_broadcast_queue_size(),
         }
     }
 }

@@ -52,6 +52,7 @@ fn create_test_config(port: u16) -> P2PConfig {
         tx_rate_per_second: 50000,
         bootstrap_timeout_ms: 5000, // 5s timeout for integration tests
         ping_interval_ms: 200,      // Ping every 200ms during bootstrap
+        tx_broadcast_queue_size: 1_000,
     }
 }
 

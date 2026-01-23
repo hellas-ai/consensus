@@ -1,15 +1,16 @@
 //! gRPC server setup and context management.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 
 use consensus::mempool::MempoolStatsReader;
+use consensus::state::transaction::Transaction;
 use consensus::storage::store::ConsensusStore;
 use consensus::validation::PendingStateReader;
+use crossbeam::queue::ArrayQueue;
 use p2p::PeerStatsReader;
-use p2p::service::P2PHandle;
 use slog::Logger;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tonic::transport::Server;
 
 use crate::config::RpcConfig;
@@ -49,15 +50,19 @@ pub struct ReadOnlyContext {
     pub logger: Logger,
 }
 
-/// Full context including P2P handle for services that submit transactions.
+/// Full context including transaction queues for services that submit transactions.
 ///
-/// Note: This struct is NOT Sync due to rtrb::Producer in P2PHandle.
-/// Used by: TransactionService (via Mutex or channel pattern)
+/// Uses lock-free ArrayQueues which are Sync, allowing concurrent access without Mutex.
+/// Used by: TransactionService
 pub struct RpcContext {
     /// Read-only context (can be cloned to services)
     pub read_only: ReadOnlyContext,
-    /// P2P handle for broadcasting transactions
-    pub p2p_handle: P2PHandle,
+    /// Lock-free queue for broadcasting transactions via P2P network.
+    pub p2p_tx_queue: Arc<ArrayQueue<Transaction>>,
+    /// Notify to wake up P2P service when transaction is queued.
+    pub p2p_tx_notify: Arc<Notify>,
+    /// Lock-free queue for adding transactions to the local mempool.
+    pub mempool_tx_queue: Arc<ArrayQueue<Transaction>>,
     /// P2P readiness flag (shared for health checks)
     pub p2p_ready: Arc<AtomicBool>,
 }
@@ -73,7 +78,9 @@ impl RpcContext {
         block_events: Option<broadcast::Sender<BlockEvent>>,
         consensus_events: Option<broadcast::Sender<ConsensusEvent>>,
         tx_events: Option<broadcast::Sender<TransactionEvent>>,
-        p2p_handle: P2PHandle,
+        p2p_tx_queue: Arc<ArrayQueue<Transaction>>,
+        p2p_tx_notify: Arc<Notify>,
+        mempool_tx_queue: Arc<ArrayQueue<Transaction>>,
         p2p_ready: Arc<AtomicBool>,
         logger: Logger,
     ) -> Self {
@@ -88,7 +95,9 @@ impl RpcContext {
                 tx_events,
                 logger,
             },
-            p2p_handle,
+            p2p_tx_queue,
+            p2p_tx_notify,
+            mempool_tx_queue,
             p2p_ready,
         }
     }
@@ -137,8 +146,12 @@ impl RpcServer {
             Arc::clone(&self.context.p2p_ready),
         );
 
-        let p2p = Arc::new(Mutex::new(self.context.p2p_handle));
-        let transaction_service = TransactionServiceImpl::new(tx_ctx.clone(), p2p);
+        let transaction_service = TransactionServiceImpl::new(
+            tx_ctx.clone(),
+            Arc::clone(&self.context.p2p_tx_queue),
+            Arc::clone(&self.context.p2p_tx_notify),
+            Arc::clone(&self.context.mempool_tx_queue),
+        );
         let subscription_service = SubscriptionServiceImpl::new(tx_ctx.clone());
         let admin_service = AdminServiceImpl::new(tx_ctx);
 

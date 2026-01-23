@@ -40,4 +40,8 @@ pub enum P2PError {
     /// Network not ready.
     #[error("Network not ready")]
     NotReady,
+
+    /// Queue is full.
+    #[error("Queue full - transaction broadcast queue at capacity")]
+    QueueFull,
 }

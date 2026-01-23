@@ -174,6 +174,11 @@ impl Transaction {
     /// This method validates the archive format before deserializing,
     /// making it safe to use with untrusted external input (e.g., from gRPC clients).
     ///
+    /// # Note
+    /// This method recomputes the tx_hash as blake3(bytes), which differs from
+    /// the original content hash. Use [`try_deserialize_preserving_hash`] for
+    /// signature verification.
+    ///
     /// # Errors
     /// Returns an error if the bytes are malformed or cannot be deserialized.
     pub fn try_from_tx_bytes(bytes: &[u8]) -> Result<Self, TransactionError> {
@@ -191,6 +196,33 @@ impl Transaction {
             .map_err(|_| TransactionError::DeserializationFailed)?;
 
         tx.tx_hash = tx_hash.into();
+        Ok(tx)
+    }
+
+    /// Safely deserialize a transaction from bytes, preserving the original tx_hash.
+    ///
+    /// Unlike [`try_from_tx_bytes`], this method preserves the serialized tx_hash
+    /// (computed from the transaction content), which is required for signature
+    /// verification to work correctly.
+    ///
+    /// Use this method for gRPC transaction submission where the original signature
+    /// must be verified.
+    ///
+    /// # Errors
+    /// Returns an error if the bytes are malformed or cannot be deserialized.
+    pub fn try_deserialize_preserving_hash(bytes: &[u8]) -> Result<Self, TransactionError> {
+        if bytes.is_empty() {
+            return Err(TransactionError::EmptyBytes);
+        }
+
+        // Use safe access with validation
+        let archived = rkyv::access::<ArchivedTransaction, Error>(bytes)
+            .map_err(|_| TransactionError::InvalidFormat)?;
+
+        let tx = deserialize::<Transaction, Error>(archived)
+            .map_err(|_| TransactionError::DeserializationFailed)?;
+
+        // Keep the original tx_hash from the serialized data
         Ok(tx)
     }
 

@@ -17,10 +17,12 @@ commonware-p2p          = "0.0.64"
 commonware-runtime      = "0.0.64"
 commonware-utils        = "0.0.64"
 consensus               = { path = "./consensus" }
+crossbeam               = "0.8.4"
 ed25519-dalek           = "2.2.0"
 figment                 = "0.10.19"
 futures                 = "0.3.31"
 governor                = "0.10.4"
+grpc-client             = { path = "./grpc-client" }
 hex                     = "0.4.3"
 metrics                 = "0.24.2"
 p2p                     = { path = "./p2p" }
