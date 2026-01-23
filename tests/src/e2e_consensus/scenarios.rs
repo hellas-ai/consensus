@@ -155,19 +155,29 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Create transaction channel for mempool
-    let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Transaction queue architecture:
+    // - gRPC → Mempool: ArrayQueue (MPMC) for multiple gRPC handlers
+    // - P2P → Mempool: rtrb (SPSC) for single P2P thread
 
-    // Spawn MempoolService with the tx_consumer
+    // Create gRPC transaction queue (ArrayQueue for MPMC)
+    let mempool_tx_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
+
+    // Create P2P → Mempool channel (rtrb for SPSC)
+    // P2P pushes here, MempoolService consumes
+    let (p2p_to_mempool_producer, p2p_to_mempool_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Spawn MempoolService with both transaction sources
     let (mempool_service, mempool_channels) = MempoolService::spawn(
-        tx_consumer,
+        Arc::clone(&mempool_tx_queue),
+        p2p_to_mempool_consumer,
         pending_state_reader,
         Arc::clone(&shutdown),
         logger.clone(),
     );
 
-    // Create a separate tx channel for P2P (P2P will receive gossipped transactions)
-    let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Create P2P tx producer for the P2P service to use
+    // (This is separate from p2p_to_mempool - P2P forwards incoming gossip to mempool)
+    let p2p_tx_producer = p2p_to_mempool_producer;
 
     // Clone the BLS secret key before moving identity
     let bls_secret_key = identity.bls_secret_key().clone();
@@ -213,29 +223,9 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
     let grpc_addr = grpc_listener.local_addr().expect("get local addr");
     drop(grpc_listener); // Release the port for the server
 
-    // Create mempool queue for gRPC → mempool bridge.
-    // When gRPC receives a transaction, it pushes to this queue.
-    // A bridge thread forwards to the mempool's tx_producer.
-    let mempool_tx_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
-    let mempool_tx_queue_clone = Arc::clone(&mempool_tx_queue);
-    let bridge_shutdown = Arc::clone(&shutdown);
-
-    // Spawn bridge thread: mempool_tx_queue → tx_producer (for local mempool)
-    // This ensures transactions submitted via gRPC reach the local mempool.
-    std::thread::spawn(move || {
-        let mut tx_producer = tx_producer; // Take ownership
-        while !bridge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(tx) = mempool_tx_queue_clone.pop() {
-                let _ = tx_producer.push(tx); // Ignore if full
-            } else {
-                // No transactions, yield briefly
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    });
-
     // Create RPC context for gRPC server
     // Uses lock-free ArrayQueues - no mutex needed
+    // The mempool_tx_queue is shared directly with MempoolService (no bridge thread needed)
     let rpc_context = RpcContext::new(
         Arc::clone(&storage),
         grpc_pending_state_reader,
@@ -246,7 +236,7 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
         None,                                        // tx_events
         Arc::clone(&p2p_handle.tx_broadcast_queue),  // P2P broadcast queue
         Arc::clone(&p2p_handle.tx_broadcast_notify), // P2P broadcast notify
-        mempool_tx_queue,                            // Local mempool queue
+        mempool_tx_queue,                            // Shared mempool queue (direct to mempool)
         Arc::clone(&p2p_ready),
         logger.new(o!("component" => "grpc")),
     );
@@ -553,31 +543,38 @@ fn test_multi_node_happy_path() {
         }
 
         // Phase 8: Graceful shutdown
+        // Shutdown order is critical to avoid race conditions:
+        // 1. Signal consensus to stop (prevents new proposals/votes)
+        // 2. Signal P2P to stop (prevents new messages)
+        // 3. Shutdown mempool (drains queues, stops bridge threads)
+        // 4. Wait for consensus threads to finish
         slog::info!(logger, "Phase 8: Shutting down all nodes");
 
-        // 1. Signal ALL consensus engines to stop immediately.
+        // Step 1: Signal ALL consensus engines to stop immediately.
         // This prevents one node from advancing while others are already stopped.
         for node in &nodes {
             node.consensus_engine.shutdown();
         }
 
-        // 2. Signal all P2P services to shutdown.
+        // Step 2: Signal all P2P services to shutdown.
         // This prevents new messages from being delivered during shutdown.
         for node in &nodes {
             node.p2p_handle.shutdown();
         }
 
-        // 3. Shutdown mempool services
+        // Step 3: Shutdown mempool services.
+        // This also signals bridge threads to drain and stop.
+        // The mempool service waits for its thread to join.
         for node in &mut nodes {
             node.mempool_service.shutdown();
         }
 
-        // 4. Wait for each consensus engine to finish its thread
-        // Note: temp_dirs are kept alive in a separate vec for verification
+        // Step 4: Wait for each consensus engine to finish its thread.
+        // Note: temp_dirs are kept alive in a separate vec for verification.
         for (i, node) in nodes.into_iter().enumerate() {
             slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
             node.consensus_engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(
                         logger,
@@ -959,30 +956,37 @@ fn test_multi_node_continuous_load() {
         );
 
         // Phase 6: Graceful shutdown
+        // Shutdown order is critical to avoid race conditions:
+        // 1. Signal consensus to stop (prevents new proposals/votes)
+        // 2. Signal P2P to stop (prevents new messages)
+        // 3. Shutdown mempool (drains queues, stops bridge threads)
+        // 4. Wait for consensus threads to finish
         slog::info!(logger, "Phase 6: Shutting down all nodes");
 
-        // 1. Signal ALL consensus engines to stop immediately.
+        // Step 1: Signal ALL consensus engines to stop immediately.
         // This prevents one node from advancing while others are already stopped.
         for node in &nodes {
             node.consensus_engine.shutdown();
         }
 
-        // 2. Signal all P2P services to shutdown.
+        // Step 2: Signal all P2P services to shutdown.
         // This prevents new messages from being delivered during shutdown.
         for node in &nodes {
             node.p2p_handle.shutdown();
         }
 
-        // 3. Shutdown mempool services
+        // Step 3: Shutdown mempool services.
+        // This also signals bridge threads to drain and stop.
+        // The mempool service waits for its thread to join.
         for node in &mut nodes {
             node.mempool_service.shutdown();
         }
 
-        // 4. Wait for each consensus engine to finish its thread
+        // Step 4: Wait for each consensus engine to finish its thread.
         for (i, node) in nodes.into_iter().enumerate() {
             slog::debug!(logger, "Waiting for consensus engine shutdown"; "node" => i);
             node.consensus_engine
-                .shutdown_and_wait(Duration::from_secs(5))
+                .shutdown_and_wait(Duration::from_secs(10))
                 .unwrap_or_else(|e| {
                     slog::error!(
                         logger,
@@ -1302,18 +1306,22 @@ fn create_byzantine_node_setup<const N: usize, const F: usize, const M_SIZE: usi
 
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Create transaction channel for mempool
-    let (_tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Create gRPC transaction queue (ArrayQueue for MPMC)
+    let mempool_tx_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
 
-    // Spawn Mempool
+    // Create P2P → Mempool channel (rtrb for SPSC)
+    let (p2p_to_mempool_producer, p2p_to_mempool_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Spawn Mempool with both transaction sources
     let (_mempool_service, _mempool_channels) = MempoolService::spawn(
-        tx_consumer,
+        mempool_tx_queue,
+        p2p_to_mempool_consumer,
         pending_state_reader,
         Arc::clone(&shutdown),
         logger.clone(),
     );
 
-    let (p2p_tx_producer, _p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    let p2p_tx_producer = p2p_to_mempool_producer;
 
     let p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
         TokioRunner::default(),

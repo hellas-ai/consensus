@@ -11,6 +11,7 @@ ark-ec        = { workspace = true }
 ark-ff        = { workspace = true }
 ark-serialize = { workspace = true }
 blake3        = { workspace = true }
+crossbeam     = { workspace = true }
 ed25519-dalek = { workspace = true, features = [ "batch", "rand_core" ] }
 figment       = { workspace = true, features = [ "env", "toml", "yaml" ] }
 hex           = { workspace = true }

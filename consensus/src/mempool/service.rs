@@ -30,6 +30,7 @@ use crate::{
     validation::PendingStateReader,
 };
 use arc_swap::ArcSwap;
+use crossbeam::queue::ArrayQueue;
 use rtrb::{Consumer, Producer, RingBuffer};
 use slog::Logger;
 use std::{
@@ -93,23 +94,29 @@ impl MempoolService {
     ///
     /// # Arguments
     ///
-    /// * tx_consumer - Consumer for incoming transactions
-    /// * pending_state_reader - Reader for M-notarized pending state
-    /// * shutdown - Shared shutdown signal
-    /// * logger - Logger for diagnostics
+    /// * `grpc_tx_queue` - Lock-free queue for transactions from gRPC clients. This is an
+    ///   `Arc<ArrayQueue>` which is `Sync`, allowing multiple gRPC handlers to push transactions
+    ///   concurrently without a Mutex.
+    /// * `p2p_tx_consumer` - SPSC consumer for transactions received via P2P gossip. Uses rtrb for
+    ///   efficient single-producer (P2P thread) to single-consumer (mempool thread) communication.
+    /// * `pending_state_reader` - Reader for M-notarized pending state
+    /// * `shutdown` - Shared shutdown signal
+    /// * `logger` - Logger for diagnostics
     ///
     /// # Returns
     ///
     /// A tuple containing the service handle and channel endpoints.
     pub fn spawn(
-        tx_consumer: Consumer<Transaction>,
+        grpc_tx_queue: Arc<ArrayQueue<Transaction>>,
+        p2p_tx_consumer: Consumer<Transaction>,
         pending_state_reader: PendingStateReader,
         shutdown: Arc<AtomicBool>,
         logger: Logger,
     ) -> (Self, MempoolChannels) {
         Self::spawn_with_capacity(
             DEFAULT_POOL_CAPACITY,
-            tx_consumer,
+            grpc_tx_queue,
+            p2p_tx_consumer,
             pending_state_reader,
             shutdown,
             logger,
@@ -119,7 +126,8 @@ impl MempoolService {
     /// Spawns the mempool service with custom pool capacity.
     pub fn spawn_with_capacity(
         pool_capacity: usize,
-        tx_consumer: Consumer<Transaction>,
+        grpc_tx_queue: Arc<ArrayQueue<Transaction>>,
+        p2p_tx_consumer: Consumer<Transaction>,
         pending_state_reader: PendingStateReader,
         shutdown: Arc<AtomicBool>,
         logger: Logger,
@@ -150,7 +158,8 @@ impl MempoolService {
                 mempool_loop(
                     pool_capacity,
                     pending_state_reader,
-                    tx_consumer,
+                    grpc_tx_queue,
+                    p2p_tx_consumer,
                     proposal_req_consumer,
                     proposal_resp_producer,
                     finalized_consumer,
@@ -197,12 +206,87 @@ impl Drop for MempoolService {
     }
 }
 
+/// Process a single incoming transaction.
+///
+/// Validates the signature and adds to the pool with proper nonce-based routing.
+/// Updates statistics counters based on the result.
+#[allow(clippy::too_many_arguments)]
+fn process_incoming_tx(
+    tx: Transaction,
+    pool: &mut TransactionPool,
+    pending_state_reader: &PendingStateReader,
+    stats_invalid_signatures: &mut u64,
+    stats_added_pending: &mut u64,
+    stats_added_queued: &mut u64,
+    stats_rejected: &mut u64,
+    logger: &Logger,
+) {
+    let tx_hash = tx.tx_hash;
+    let sender = tx.sender;
+
+    // Verify signature before adding to pool
+    if !tx.verify() {
+        *stats_invalid_signatures += 1;
+        slog::debug!(
+            logger,
+            "Transaction rejected: invalid signature";
+            "tx_hash" => hex::encode(&tx_hash[..8]),
+        );
+        return;
+    }
+
+    // Get sender's current nonce from chain state
+    let sender_base_nonce = pending_state_reader
+        .get_account(&sender)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+
+    // Add to pool with nonce-based routing
+    let result = pool.try_add(Arc::new(tx), sender_base_nonce);
+
+    match result {
+        AddResult::AddedPending => {
+            *stats_added_pending += 1;
+            slog::trace!(
+                logger,
+                "Transaction added to pending pool";
+                "tx_hash" => hex::encode(&tx_hash[..8]),
+                "sender" => hex::encode(&sender.as_bytes()[..8]),
+                "pool_size" => pool.len(),
+            );
+        }
+        AddResult::AddedQueued => {
+            *stats_added_queued += 1;
+            slog::trace!(
+                logger,
+                "Transaction added to queued pool (nonce gap)";
+                "tx_hash" => hex::encode(&tx_hash[..8]),
+                "sender" => hex::encode(&sender.as_bytes()[..8]),
+                "pool_size" => pool.len(),
+            );
+        }
+        AddResult::Rejected => {
+            *stats_rejected += 1;
+            slog::debug!(
+                logger,
+                "Transaction rejected (duplicate/stale/full)";
+                "tx_hash" => hex::encode(&tx_hash[..8]),
+            );
+        }
+    }
+}
+
 /// Main mempool event loop.
+///
+/// Receives transactions from two sources:
+/// - `grpc_tx_queue`: Lock-free ArrayQueue for gRPC-submitted transactions (MPSC)
+/// - `p2p_tx_consumer`: rtrb Consumer for P2P-gossipped transactions (SPSC)
 #[allow(clippy::too_many_arguments)]
 pub fn mempool_loop(
     pool_capacity: usize,
     pending_state_reader: PendingStateReader,
-    mut tx_consumer: Consumer<Transaction>,
+    grpc_tx_queue: Arc<ArrayQueue<Transaction>>,
+    mut p2p_tx_consumer: Consumer<Transaction>,
     mut proposal_req_consumer: Consumer<ProposalRequest>,
     mut proposal_resp_producer: Producer<ProposalResponse>,
     mut finalized_consumer: Consumer<FinalizedNotification>,
@@ -248,70 +332,49 @@ pub fn mempool_loop(
             );
         }
 
-        // Priority 2: Process incoming transactions
-        let available_slots = tx_consumer.slots();
-        if available_slots > 0 {
-            let num_to_read = available_slots.min(TX_BATCH_SIZE);
+        // Priority 2: Process incoming transactions from BOTH sources
+        // - grpc_tx_queue: ArrayQueue from gRPC clients (MPSC)
+        // - p2p_tx_consumer: rtrb from P2P gossip (SPSC)
+        // Pop up to TX_BATCH_SIZE transactions per iteration total
+        let mut tx_count = 0;
 
-            if let Ok(chunk) = tx_consumer.read_chunk(num_to_read) {
+        // Process gRPC transactions first
+        while tx_count < TX_BATCH_SIZE {
+            if let Some(tx) = grpc_tx_queue.pop() {
                 did_work = true;
+                tx_count += 1;
+                process_incoming_tx(
+                    tx,
+                    &mut pool,
+                    &pending_state_reader,
+                    &mut stats_invalid_signatures,
+                    &mut stats_added_pending,
+                    &mut stats_added_queued,
+                    &mut stats_rejected,
+                    &logger,
+                );
+            } else {
+                break;
+            }
+        }
 
-                for tx in chunk.into_iter() {
-                    did_work = true;
-                    let tx_hash = tx.tx_hash;
-                    let sender = tx.sender;
-
-                    // Verify signature before adding to pool
-                    if !tx.verify() {
-                        stats_invalid_signatures += 1;
-                        slog::debug!(
-                            logger,
-                            "Transaction rejected: invalid signature";
-                            "tx_hash" => hex::encode(&tx_hash[..8]),
-                        );
-                        continue;
-                    }
-
-                    // Get sender's current nonce from chain state
-                    let sender_base_nonce = pending_state_reader
-                        .get_account(&sender)
-                        .map(|a| a.nonce)
-                        .unwrap_or(0);
-
-                    // Add to pool with nonce-based routing
-                    let result = pool.try_add(Arc::new(tx), sender_base_nonce);
-
-                    match result {
-                        AddResult::AddedPending => {
-                            stats_added_pending += 1;
-                            slog::trace!(
-                                logger,
-                                "Transaction added to pending pool";
-                                "tx_hash" => hex::encode(&tx_hash[..8]),
-                                "sender" => hex::encode(&sender.as_bytes()[..8]),
-                                "pool_size" => pool.len(),
-                            );
-                        }
-                        AddResult::AddedQueued => {
-                            stats_added_queued += 1;
-                            slog::trace!(
-                                logger,
-                                "Transaction added to queued pool (nonce gap)";
-                                "tx_hash" => hex::encode(&tx_hash[..8]),
-                                "sender" => hex::encode(&sender.as_bytes()[..8]),
-                                "pool_size" => pool.len(),
-                            );
-                        }
-                        AddResult::Rejected => {
-                            stats_rejected += 1;
-                            slog::debug!(
-                                logger,
-                                "Transaction rejected (duplicate/stale/full)";
-                                "tx_hash" => hex::encode(&tx_hash[..8]),
-                            );
-                        }
-                    }
-                }
+        // Process P2P gossipped transactions
+        while tx_count < TX_BATCH_SIZE {
+            if let Ok(tx) = p2p_tx_consumer.pop() {
+                did_work = true;
+                tx_count += 1;
+                process_incoming_tx(
+                    tx,
+                    &mut pool,
+                    &pending_state_reader,
+                    &mut stats_invalid_signatures,
+                    &mut stats_added_pending,
+                    &mut stats_added_queued,
+                    &mut stats_rejected,
+                    &logger,
+                );
+            } else {
+                break;
             }
         }
 
@@ -697,24 +760,49 @@ mod tests {
 
     const TEST_BUFFER_SIZE: usize = 1024;
 
-    /// Test helper that bundles mempool service with its tx_producer
+    /// Test helper that bundles mempool service with its transaction queues.
+    ///
+    /// Provides both the gRPC queue (ArrayQueue) and P2P producer (rtrb)
+    /// to match the production architecture.
     struct TestMempoolSetup {
         service: MempoolService,
-        tx_producer: Producer<Transaction>,
+        /// ArrayQueue for gRPC-submitted transactions (MPMC)
+        tx_queue: Arc<ArrayQueue<Transaction>>,
+        /// rtrb Producer for P2P-gossipped transactions (SPSC)
+        #[allow(dead_code)]
+        p2p_tx_producer: Producer<Transaction>,
         channels: MempoolChannels,
     }
 
-    /// Creates a mempool service for testing with a tx_producer
+    /// Creates a mempool service for testing with both transaction sources.
+    ///
+    /// The returned `TestMempoolSetup` includes:
+    /// - `tx_queue`: ArrayQueue for gRPC transactions (used in most tests)
+    /// - `p2p_tx_producer`: rtrb Producer for P2P transactions (available for P2P tests)
     fn spawn_test_mempool(
         reader: PendingStateReader,
         shutdown: Arc<AtomicBool>,
         logger: Logger,
     ) -> TestMempoolSetup {
-        let (tx_producer, tx_consumer) = RingBuffer::new(TEST_BUFFER_SIZE);
-        let (service, channels) = MempoolService::spawn(tx_consumer, reader, shutdown, logger);
+        // Create gRPC transaction queue (ArrayQueue for MPMC)
+        let tx_queue = Arc::new(ArrayQueue::new(TEST_BUFFER_SIZE));
+
+        // Create P2P transaction channel (rtrb for SPSC)
+        let (p2p_tx_producer, p2p_tx_consumer) = RingBuffer::<Transaction>::new(TEST_BUFFER_SIZE);
+
+        // Spawn mempool with both sources
+        let (service, channels) = MempoolService::spawn(
+            Arc::clone(&tx_queue),
+            p2p_tx_consumer,
+            reader,
+            shutdown,
+            logger,
+        );
+
         TestMempoolSetup {
             service,
-            tx_producer,
+            tx_queue,
+            p2p_tx_producer,
             channels,
         }
     }
@@ -786,7 +874,7 @@ mod tests {
         // Submit transactions with sequential nonces
         for nonce in 0..5 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10 + nonce);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         // Wait for processing
@@ -828,7 +916,7 @@ mod tests {
 
         // Create tx with mismatched sender/signature
         let invalid_tx = create_tx(&sk, wrong_sender, recipient, 100, 0, 10);
-        setup.tx_producer.push(invalid_tx).unwrap();
+        setup.tx_queue.push(invalid_tx).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -868,7 +956,7 @@ mod tests {
 
         // Submit transaction that exceeds balance (needs 210, has 100)
         let tx = create_tx(&sk, sender, recipient, 200, 0, 10);
-        setup.tx_producer.push(tx).unwrap();
+        setup.tx_queue.push(tx).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -911,8 +999,8 @@ mod tests {
         let tx0 = create_tx(&sk, sender, recipient, 100, 0, 20);
         let tx2 = create_tx(&sk, sender, recipient, 100, 2, 10);
 
-        setup.tx_producer.push(tx0).unwrap();
-        setup.tx_producer.push(tx2).unwrap();
+        setup.tx_queue.push(tx0).unwrap();
+        setup.tx_queue.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -958,9 +1046,9 @@ mod tests {
         let tx0 = create_tx(&sk, sender, recipient, 100, 0, 30);
         let tx1 = create_tx(&sk, sender, recipient, 100, 1, 20);
 
-        setup.tx_producer.push(tx2).unwrap(); // Goes to queued
-        setup.tx_producer.push(tx0).unwrap(); // Goes to pending
-        setup.tx_producer.push(tx1).unwrap(); // Goes to pending, promotes tx2
+        setup.tx_queue.push(tx2).unwrap(); // Goes to queued
+        setup.tx_queue.push(tx0).unwrap(); // Goes to pending
+        setup.tx_queue.push(tx1).unwrap(); // Goes to pending, promotes tx2
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1010,8 +1098,8 @@ mod tests {
         let tx1 = create_tx(&sk1, sender1, recipient, 100, 0, 50);
         let tx2 = create_tx(&sk2, sender2, recipient, 100, 0, 100);
 
-        setup.tx_producer.push(tx1).unwrap();
-        setup.tx_producer.push(tx2).unwrap();
+        setup.tx_queue.push(tx1).unwrap();
+        setup.tx_queue.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1055,7 +1143,7 @@ mod tests {
         // Submit 10 transactions
         for nonce in 0..10 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1101,7 +1189,7 @@ mod tests {
         // Submit 10 transactions
         for nonce in 0..10 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1150,7 +1238,7 @@ mod tests {
         // Submit 3 transactions, each costs 110 (100 amount + 10 fee)
         for nonce in 0..3 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1198,8 +1286,8 @@ mod tests {
         let tx0 = create_tx(&sk, sender, recipient, 500, 0, 10);
         let tx1 = create_tx(&sk, sender, recipient, 50, 1, 10);
 
-        setup.tx_producer.push(tx0).unwrap();
-        setup.tx_producer.push(tx1).unwrap();
+        setup.tx_queue.push(tx0).unwrap();
+        setup.tx_queue.push(tx1).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1245,7 +1333,7 @@ mod tests {
         for nonce in 0..5 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
             tx_hashes.push(tx.tx_hash);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1319,7 +1407,7 @@ mod tests {
         // Submit transactions with nonces 0, 1, 2
         for nonce in 0..3 {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, 10);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1398,7 +1486,7 @@ mod tests {
         // Submit transactions with fees 10, 20, 30
         for (nonce, fee) in [(0, 10), (1, 20), (2, 30)] {
             let tx = create_tx(&sk, sender, recipient, 100, nonce, fee);
-            setup.tx_producer.push(tx).unwrap();
+            setup.tx_queue.push(tx).unwrap();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1448,8 +1536,8 @@ mod tests {
         // sender2 tries to send 400 (fee 10) - needs the 500 from tx1
         let tx2 = create_tx(&sk2, sender2, sender1, 400, 0, 10);
 
-        setup.tx_producer.push(tx1).unwrap();
-        setup.tx_producer.push(tx2).unwrap();
+        setup.tx_queue.push(tx1).unwrap();
+        setup.tx_queue.push(tx2).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 

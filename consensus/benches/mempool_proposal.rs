@@ -3,7 +3,6 @@
 //! Measures the time from ProposalRequest to ProposalResponse under various conditions.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use rtrb::RingBuffer;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -32,9 +31,10 @@ fn create_test_transaction(nonce: u64) -> Transaction {
     )
 }
 
+#[allow(clippy::type_complexity)]
 fn setup_mempool() -> (
     MempoolService,
-    rtrb::Producer<Transaction>,
+    Arc<crossbeam::queue::ArrayQueue<Transaction>>,
     rtrb::Producer<ProposalRequest>,
     rtrb::Consumer<consensus::mempool::ProposalResponse>,
     Arc<AtomicBool>,
@@ -45,13 +45,18 @@ fn setup_mempool() -> (
     let (writer, _reader) = PendingStateWriter::new(storage, 0);
     let pending_state_reader = writer.reader();
 
-    let (tx_producer, tx_consumer) = RingBuffer::new(1024);
+    // Create gRPC transaction queue (ArrayQueue for MPMC - benchmarks use this)
+    let tx_queue = Arc::new(crossbeam::queue::ArrayQueue::new(1024));
+
+    // Create P2P transaction channel (rtrb for SPSC - not used in benchmarks but required by API)
+    let (_p2p_tx_producer, p2p_tx_consumer) = rtrb::RingBuffer::<Transaction>::new(1024);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let logger = slog::Logger::root(slog::Discard, slog::o!());
 
     let (service, channels) = MempoolService::spawn(
-        tx_consumer,
+        Arc::clone(&tx_queue),
+        p2p_tx_consumer,
         pending_state_reader,
         Arc::clone(&shutdown),
         logger,
@@ -59,7 +64,7 @@ fn setup_mempool() -> (
 
     (
         service,
-        tx_producer,
+        tx_queue,
         channels.proposal_req_producer,
         channels.proposal_resp_consumer,
         shutdown,
@@ -107,13 +112,13 @@ fn bench_proposal_with_transactions(c: &mut Criterion) {
             BenchmarkId::new("pool_size", tx_count),
             tx_count,
             |b, &count| {
-                let (mut service, mut tx_prod, mut req_prod, mut resp_cons, shutdown) =
+                let (mut service, tx_queue, mut req_prod, mut resp_cons, shutdown) =
                     setup_mempool();
 
                 // Pre-populate pool
                 for i in 0..count {
                     let tx = create_test_transaction(i as u64);
-                    let _ = tx_prod.push(tx);
+                    let _ = tx_queue.push(tx);
                 }
 
                 // Let mempool process transactions
@@ -153,12 +158,12 @@ fn bench_proposal_varying_max_txs(c: &mut Criterion) {
     // Pool with 10k transactions, vary max_txs selection
     for max_txs in [100, 500, 1000, 2000].iter() {
         group.bench_with_input(BenchmarkId::new("select", max_txs), max_txs, |b, &max| {
-            let (mut service, mut tx_prod, mut req_prod, mut resp_cons, shutdown) = setup_mempool();
+            let (mut service, tx_queue, mut req_prod, mut resp_cons, shutdown) = setup_mempool();
 
             // Pre-populate with 10k transactions
             for i in 0..10000 {
                 let tx = create_test_transaction(i as u64);
-                let _ = tx_prod.push(tx);
+                let _ = tx_queue.push(tx);
             }
             std::thread::sleep(Duration::from_millis(200));
 
@@ -201,13 +206,13 @@ fn bench_proposal_large_pool(c: &mut Criterion) {
             BenchmarkId::new("select_from_100k", max_txs),
             max_txs,
             |b, &max| {
-                let (mut service, mut tx_prod, mut req_prod, mut resp_cons, shutdown) =
+                let (mut service, tx_queue, mut req_prod, mut resp_cons, shutdown) =
                     setup_mempool();
 
                 // Pre-populate with 100k transactions
                 for i in 0..100_000 {
                     let tx = create_test_transaction(i as u64);
-                    let _ = tx_prod.push(tx);
+                    let _ = tx_queue.push(tx);
                 }
                 // Give mempool more time to process 100k txs
                 std::thread::sleep(Duration::from_millis(500));

@@ -125,7 +125,7 @@ fn test_e2e_consensus_happy_path() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
@@ -165,7 +165,7 @@ fn test_e2e_consensus_happy_path() {
         );
 
         engines.push(engine);
-        transaction_producers.push(setup.transaction_producer);
+        grpc_tx_queues.push(setup.grpc_tx_queue);
         mempool_services.push(setup.mempool_service);
     }
 
@@ -196,8 +196,9 @@ fn test_e2e_consensus_happy_path() {
         // Distribute transactions across replicas (simulating different clients)
         let replica_idx = i % N;
 
-        transaction_producers[replica_idx]
+        grpc_tx_queues[replica_idx]
             .push(tx)
+            .map_err(|_| "Queue full")
             .expect("Failed to submit transaction");
 
         slog::debug!(
@@ -507,7 +508,7 @@ fn test_e2e_consensus_continuous_load() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
@@ -515,7 +516,7 @@ fn test_e2e_consensus_continuous_load() {
         let replica_id = setup.replica_id;
 
         // Keep transaction producer for later
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
 
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
@@ -550,7 +551,7 @@ fn test_e2e_consensus_continuous_load() {
         );
 
         engines.push(engine);
-        transaction_producers.push(tx_producer);
+        grpc_tx_queues.push(tx_producer);
         mempool_services.push(setup.mempool_service);
     }
 
@@ -595,7 +596,7 @@ fn test_e2e_consensus_continuous_load() {
                 let replica_idx = tx_index % N;
                 tx_index += 1;
 
-                if transaction_producers[replica_idx].push(tx).is_ok() {
+                if grpc_tx_queues[replica_idx].push(tx).is_ok() {
                     tx_count += 1;
                     expected_tx_hashes.insert(tx_hash);
                 }
@@ -888,7 +889,7 @@ fn test_e2e_consensus_with_crashed_replica() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
@@ -896,7 +897,7 @@ fn test_e2e_consensus_with_crashed_replica() {
         let replica_id = setup.replica_id;
 
         // Keep transaction producer for later
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
 
         // Keep a clone of the storage for verification
         stores.push(setup.storage.clone());
@@ -931,7 +932,7 @@ fn test_e2e_consensus_with_crashed_replica() {
         );
 
         engines.push(Some(engine));
-        transaction_producers.push(tx_producer);
+        grpc_tx_queues.push(tx_producer);
         mempool_services.push(Some(setup.mempool_service));
     }
 
@@ -985,8 +986,9 @@ fn test_e2e_consensus_with_crashed_replica() {
             replica_idx = (replica_idx + 1) % N;
         }
 
-        transaction_producers[replica_idx]
+        grpc_tx_queues[replica_idx]
             .push(tx)
+            .map_err(|_| "Queue full")
             .expect("Failed to submit transaction");
 
         slog::debug!(
@@ -1354,7 +1356,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         "Phase 3: Registering replicas and starting consensus engines (excluding Byzantine leader)"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
@@ -1379,7 +1381,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
             network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
 
             engines.push(None);
-            transaction_producers.push(None);
+            grpc_tx_queues.push(None);
             mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
@@ -1392,7 +1394,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         }
 
         // Keep transaction producer for later
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
 
         // Register with network
         network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
@@ -1424,7 +1426,7 @@ fn test_e2e_consensus_with_equivocating_leader() {
         );
 
         engines.push(Some(engine));
-        transaction_producers.push(Some(tx_producer));
+        grpc_tx_queues.push(Some(tx_producer));
         mempool_services.push(Some(setup.mempool_service));
     }
 
@@ -1635,8 +1637,11 @@ fn test_e2e_consensus_with_equivocating_leader() {
             replica_idx = (replica_idx + 1) % N;
         }
 
-        if let Some(ref mut tx_producer) = transaction_producers[replica_idx] {
-            tx_producer.push(tx).expect("Failed to submit transaction");
+        if let Some(ref mut tx_producer) = grpc_tx_queues[replica_idx] {
+            tx_producer
+                .push(tx)
+                .map_err(|_| "Queue full")
+                .expect("Failed to submit transaction");
 
             slog::debug!(
                 logger,
@@ -2050,7 +2055,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         "Phase 3: Registering replicas and starting consensus engines (excluding Byzantine leader)"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
 
@@ -2071,7 +2076,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
 
             engines.push(None);
-            transaction_producers.push(None);
+            grpc_tx_queues.push(None);
             mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
@@ -2083,7 +2088,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             continue;
         }
 
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
 
         network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
 
@@ -2113,7 +2118,7 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
         );
 
         engines.push(Some(engine));
-        transaction_producers.push(Some(tx_producer));
+        grpc_tx_queues.push(Some(tx_producer));
         mempool_services.push(Some(setup.mempool_service));
     }
 
@@ -2347,8 +2352,11 @@ fn test_e2e_consensus_with_persistent_equivocating_leader() {
             replica_idx = (replica_idx + 1) % N;
         }
 
-        if let Some(ref mut tx_producer) = transaction_producers[replica_idx] {
-            tx_producer.push(tx).expect("Failed to submit transaction");
+        if let Some(ref mut tx_producer) = grpc_tx_queues[replica_idx] {
+            tx_producer
+                .push(tx)
+                .map_err(|_| "Queue full")
+                .expect("Failed to submit transaction");
         }
     }
 
@@ -2682,7 +2690,7 @@ fn test_e2e_consensus_functional_blockchain() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
     let mut pending_state_readers = Vec::with_capacity(N);
@@ -2727,7 +2735,7 @@ fn test_e2e_consensus_functional_blockchain() {
         );
 
         engines.push(engine);
-        transaction_producers.push(setup.transaction_producer);
+        grpc_tx_queues.push(setup.grpc_tx_queue);
         mempool_services.push(setup.mempool_service);
     }
 
@@ -2888,7 +2896,7 @@ fn test_e2e_consensus_functional_blockchain() {
     // Submit transactions to ALL replicas (simulates P2P gossip)
     // Each transaction must reach all replicas so that any leader can include it
     for tx in all_transactions.into_iter() {
-        for producer in &mut transaction_producers {
+        for producer in &mut grpc_tx_queues {
             // Clone the transaction and send to each replica
             // Use .ok() since the mempool will deduplicate anyway
             let _ = producer.push(tx.clone());
@@ -3231,7 +3239,7 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         "Phase 3: Registering replicas and starting consensus engines"
     );
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
     let mut pending_state_readers = Vec::with_capacity(N);
@@ -3276,7 +3284,7 @@ fn test_e2e_consensus_invalid_tx_rejection() {
         );
 
         engines.push(engine);
-        transaction_producers.push(setup.transaction_producer);
+        grpc_tx_queues.push(setup.grpc_tx_queue);
         mempool_services.push(setup.mempool_service);
     }
 
@@ -3489,7 +3497,7 @@ fn test_e2e_consensus_invalid_tx_rejection() {
     // Submit all transactions to ALL replicas (simulates P2P gossip)
     // Each transaction must reach all replicas so that any leader can include it
     for tx in all_transactions.into_iter() {
-        for producer in &mut transaction_producers {
+        for producer in &mut grpc_tx_queues {
             // Clone the transaction and send to each replica
             // Use .ok() since the mempool will deduplicate anyway
             let _ = producer.push(tx.clone());
@@ -3847,7 +3855,7 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
     );
 
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
     let mut byzantine_leader_secret_key: Option<crate::crypto::aggregated::BlsSecretKey> = None;
@@ -3862,7 +3870,7 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
             byzantine_leader_secret_key = Some(setup.secret_key.clone());
             network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
             engines.push(None);
-            transaction_producers.push(None);
+            grpc_tx_queues.push(None);
             mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
@@ -3874,7 +3882,7 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
             continue;
         }
 
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
         network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
 
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -3895,7 +3903,7 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
         .expect("Failed to create consensus engine");
 
         engines.push(Some(engine));
-        transaction_producers.push(Some(tx_producer));
+        grpc_tx_queues.push(Some(tx_producer));
         mempool_services.push(Some(setup.mempool_service));
     }
 
@@ -4001,8 +4009,11 @@ fn test_e2e_consensus_with_invalid_block_from_leader() {
         if replica_idx == BYZANTINE_LEADER_IDX {
             replica_idx = (replica_idx + 1) % N;
         }
-        if let Some(ref mut tx_producer) = transaction_producers[replica_idx] {
-            tx_producer.push(tx).expect("Failed to submit transaction");
+        if let Some(ref mut tx_producer) = grpc_tx_queues[replica_idx] {
+            tx_producer
+                .push(tx)
+                .map_err(|_| "Queue full")
+                .expect("Failed to submit transaction");
         }
     }
 
@@ -4193,7 +4204,7 @@ fn test_e2e_consensus_with_true_equivocation() {
     );
 
     let mut engines = Vec::with_capacity(N);
-    let mut transaction_producers = Vec::with_capacity(N);
+    let mut grpc_tx_queues = Vec::with_capacity(N);
     let mut mempool_services: Vec<Option<_>> = Vec::with_capacity(N);
     let mut stores = Vec::with_capacity(N);
     let mut byzantine_leader_secret_key: Option<crate::crypto::aggregated::BlsSecretKey> = None;
@@ -4208,7 +4219,7 @@ fn test_e2e_consensus_with_true_equivocation() {
             byzantine_leader_secret_key = Some(setup.secret_key.clone());
             network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
             engines.push(None);
-            transaction_producers.push(None);
+            grpc_tx_queues.push(None);
             mempool_services.push(Some(setup.mempool_service));
 
             slog::info!(
@@ -4220,7 +4231,7 @@ fn test_e2e_consensus_with_true_equivocation() {
             continue;
         }
 
-        let tx_producer = setup.transaction_producer;
+        let tx_producer = setup.grpc_tx_queue;
         network.register_replica(replica_id, setup.message_producer, setup.broadcast_consumer);
 
         let replica_logger = logger.new(o!("replica" => i, "peer_id" => replica_id));
@@ -4241,7 +4252,7 @@ fn test_e2e_consensus_with_true_equivocation() {
         .expect("Failed to create consensus engine");
 
         engines.push(Some(engine));
-        transaction_producers.push(Some(tx_producer));
+        grpc_tx_queues.push(Some(tx_producer));
         mempool_services.push(Some(setup.mempool_service));
     }
 
@@ -4403,8 +4414,11 @@ fn test_e2e_consensus_with_true_equivocation() {
         if replica_idx == BYZANTINE_LEADER_IDX {
             replica_idx = (replica_idx + 1) % N;
         }
-        if let Some(ref mut tx_producer) = transaction_producers[replica_idx] {
-            tx_producer.push(tx).expect("Failed to submit transaction");
+        if let Some(ref mut tx_producer) = grpc_tx_queues[replica_idx] {
+            tx_producer
+                .push(tx)
+                .map_err(|_| "Queue full")
+                .expect("Failed to submit transaction");
         }
     }
 

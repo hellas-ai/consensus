@@ -317,35 +317,55 @@ fn create_gossip_node(
     // Create shutdown flag
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Create transaction routing:
-    // P2P -> intermediate buffer -> forwarder -> (mempool buffer, test buffer)
-    // This allows both mempool and tests to receive gossiped transactions
+    // Create transaction routing following the two-source architecture:
+    //
+    // ## Architecture
+    // - gRPC → Mempool: ArrayQueue (MPMC) for multiple gRPC handlers
+    // - P2P → Mempool: rtrb (SPSC) for single P2P thread
+    //
+    // For testing, we also fork P2P transactions to a test buffer for verification.
+    //
+    // ```
+    // gRPC handlers ──► ArrayQueue ──────────────────────────────► MempoolService
+    //                                                                    ▲
+    // P2P ──► rtrb ──► Forwarder ──► rtrb (mempool_p2p_consumer) ────────┘
+    //                      │
+    //                      └──► rtrb (test_tx_consumer) ──► Test verification
+    // ```
 
-    // Channel from P2P to forwarder
-    let (p2p_tx_producer, p2p_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Lock-free queue for gRPC transactions (ArrayQueue for MPMC)
+    let grpc_tx_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
 
-    // Channel from forwarder to mempool
-    let (mempool_tx_producer, mempool_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+    // Channel from P2P to forwarder (P2P thread → forwarder thread)
+    let (p2p_tx_producer, p2p_from_network_consumer) = RingBuffer::new(BUFFER_SIZE);
 
-    // Channel from forwarder to test verification
+    // Channel from forwarder to MempoolService (forwarder thread → mempool thread)
+    let (mempool_p2p_producer, mempool_p2p_consumer) = RingBuffer::new(BUFFER_SIZE);
+
+    // Channel from forwarder to test verification (for observing gossiped txs)
     let (test_tx_producer, test_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
 
-    // Channel for direct mempool submission (for comparison tests)
-    let (direct_tx_producer, _direct_tx_consumer) = RingBuffer::new(BUFFER_SIZE);
-
-    // Spawn forwarder thread that routes transactions to both mempool and test consumer
+    // Test only: Forwarder thread for observing P2P gossip in tests.
+    //
+    // In production, P2P pushes directly to the mempool's rtrb channel.
+    // In tests, we need to observe which transactions arrived via P2P gossip,
+    // so we interpose a forwarder that routes to BOTH:
+    // - The mempool (for actual processing)
+    // - A test buffer (for test verification via `tx_consumer`)
+    //
+    // This forwarder does NOT exist in production code.
     let forwarder_shutdown = Arc::clone(&shutdown);
     std::thread::spawn(move || {
-        let mut p2p_consumer: Consumer<Transaction> = p2p_tx_consumer;
-        let mut mempool_producer: Producer<Transaction> = mempool_tx_producer;
+        let mut p2p_consumer: Consumer<Transaction> = p2p_from_network_consumer;
+        let mut mempool_producer: Producer<Transaction> = mempool_p2p_producer;
         let mut test_producer: Producer<Transaction> = test_tx_producer;
 
         while !forwarder_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             match p2p_consumer.pop() {
                 Ok(tx) => {
-                    // Forward to mempool
+                    // Forward to mempool (via rtrb - SPSC)
                     let _ = mempool_producer.push(tx.clone());
-                    // Forward to test consumer
+                    // Forward to test consumer (for verification)
                     let _ = test_producer.push(tx);
                 }
                 Err(_) => {
@@ -356,9 +376,12 @@ fn create_gossip_node(
         }
     });
 
-    // Spawn MempoolService - reads from the forwarded tx channel
+    // Spawn MempoolService with both transaction sources:
+    // - grpc_tx_queue: ArrayQueue for gRPC-submitted transactions
+    // - mempool_p2p_consumer: rtrb Consumer for P2P-gossipped transactions (via forwarder)
     let (mempool_service, mempool_channels) = MempoolService::spawn(
-        mempool_tx_consumer,
+        Arc::clone(&grpc_tx_queue),
+        mempool_p2p_consumer,
         pending_state_reader.clone(),
         Arc::clone(&shutdown),
         logger.clone(),
@@ -413,27 +436,9 @@ fn create_gossip_node(
     let grpc_addr = grpc_listener.local_addr().expect("get local addr");
     drop(grpc_listener); // Release the port for the server
 
-    // Create mempool queue for gRPC → mempool bridge.
-    // When gRPC receives a transaction, it pushes to this queue.
-    // A bridge thread forwards to the mempool's direct_tx_producer.
-    let grpc_mempool_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
-    let grpc_mempool_queue_clone = Arc::clone(&grpc_mempool_queue);
-    let grpc_bridge_shutdown = Arc::clone(&shutdown);
-
-    // Spawn bridge thread: grpc_mempool_queue → direct_tx_producer (for local mempool)
-    std::thread::spawn(move || {
-        let mut tx_producer = direct_tx_producer; // Take ownership
-        while !grpc_bridge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(tx) = grpc_mempool_queue_clone.pop() {
-                let _ = tx_producer.push(tx);
-            } else {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    });
-
     // Create RPC context for gRPC server
-    // Uses lock-free ArrayQueues - no mutex needed
+    // Uses lock-free ArrayQueues - no mutex or bridge thread needed
+    // gRPC pushes directly to grpc_tx_queue (shared with MempoolService)
     let rpc_context = RpcContext::new(
         Arc::clone(&storage),
         pending_state_reader,
@@ -442,9 +447,9 @@ fn create_gossip_node(
         None,                                        // block_events
         None,                                        // consensus_events
         None,                                        // tx_events
-        Arc::clone(&p2p_handle.tx_broadcast_queue),  // P2P broadcast queue
+        Arc::clone(&p2p_handle.tx_broadcast_queue),  // P2P broadcast queue (gRPC → P2P)
         Arc::clone(&p2p_handle.tx_broadcast_notify), // P2P broadcast notify
-        grpc_mempool_queue,                          // Local mempool queue
+        grpc_tx_queue,                               // Mempool queue (gRPC → Mempool)
         Arc::clone(&p2p_ready),
         logger.new(o!("component" => "grpc")),
     );
@@ -498,28 +503,34 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> GossipTestNetwork<N, F
     }
 
     /// Shutdown all nodes gracefully.
+    ///
+    /// Shutdown order is critical to avoid race conditions:
+    /// 1. Signal consensus to stop (prevents new proposals/votes)
+    /// 2. Signal P2P to stop (prevents new messages)
+    /// 3. Shutdown mempool (drains queues, stops bridge threads)
+    /// 4. Wait for consensus threads to finish
     pub fn shutdown(mut self) {
-        // Shutdown consensus engines first
+        // Step 1: Signal consensus engines to stop
         for node in &self.nodes {
             if let Some(ref engine) = node.consensus_engine {
                 engine.shutdown();
             }
         }
 
-        // Shutdown P2P services
+        // Step 2: Signal P2P services to stop
         for node in &self.nodes {
             node.p2p_handle.shutdown();
         }
 
-        // Shutdown mempool services
+        // Step 3: Shutdown mempool services (also stops bridge threads)
         for node in &mut self.nodes {
             node.mempool_service.shutdown();
         }
 
-        // Wait for consensus engines to finish
+        // Step 4: Wait for consensus engines to finish
         for (i, node) in self.nodes.into_iter().enumerate() {
             if let Some(engine) = node.consensus_engine {
-                let _ = engine.shutdown_and_wait(Duration::from_secs(5));
+                let _ = engine.shutdown_and_wait(Duration::from_secs(10));
             }
             slog::debug!(self.logger, "Node shutdown complete"; "node" => i);
         }
