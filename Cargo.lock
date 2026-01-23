@@ -740,6 +740,7 @@ dependencies = [
  "ark-serialize",
  "blake3",
  "criterion 0.5.1",
+ "crossbeam",
  "ed25519-dalek",
  "figment",
  "hex",

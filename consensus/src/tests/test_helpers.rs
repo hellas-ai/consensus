@@ -97,8 +97,14 @@ pub struct ReplicaSetup<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Producer for notifying mempool of finalized blocks (Consensus → Mempool)
     pub finalized_producer: Producer<FinalizedNotification>,
 
-    /// Producer for submitting transactions to mempool (P2P/RPC → Mempool)
-    pub transaction_producer: Producer<Transaction>,
+    /// Lock-free queue for submitting gRPC transactions to mempool (gRPC → Mempool)
+    /// Uses ArrayQueue (MPMC) since multiple gRPC handlers may push concurrently.
+    pub grpc_tx_queue: Arc<crossbeam::queue::ArrayQueue<Transaction>>,
+
+    /// Producer for submitting P2P-gossipped transactions to mempool (P2P → Mempool)
+    /// Uses rtrb (SPSC) since a single P2P thread pushes to a single mempool thread.
+    #[allow(dead_code)]
+    pub p2p_tx_producer: Producer<Transaction>,
 
     /// Persistence writer for consensus state
     pub persistence_writer: PendingStateWriter,
@@ -119,6 +125,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
     ///
     /// Block validation is now done synchronously in ViewProgressManager,
     /// so no separate BlockValidationService is needed.
+    ///
+    /// ## Transaction Queue Architecture
+    ///
+    /// - `grpc_tx_queue`: ArrayQueue (MPMC) for gRPC handlers to push transactions
+    /// - `p2p_tx_producer`/`p2p_tx_consumer`: rtrb (SPSC) for P2P thread to push gossipped
+    ///   transactions
+    ///
+    /// The MempoolService polls from BOTH sources in its main loop.
     pub fn new(replica_id: PeerId, secret_key: BlsSecretKey, logger: slog::Logger) -> Self {
         // Create ring buffers for consensus messages
         let (message_producer, message_consumer) = RingBuffer::new(BUFFER_SIZE);
@@ -139,12 +153,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
         let (persistence_writer, pending_state_reader) =
             PendingStateWriter::new(Arc::clone(&storage), 0);
 
-        // Create transaction channel (external to mempool)
-        let (tx_producer, tx_consumer) = RingBuffer::new(BUFFER_SIZE);
+        // Create gRPC transaction queue (ArrayQueue for MPMC - multiple gRPC handlers)
+        let grpc_tx_queue = Arc::new(crossbeam::queue::ArrayQueue::new(BUFFER_SIZE));
 
-        // Spawn MempoolService with externally-provided tx_consumer
+        // Create P2P transaction channel (rtrb for SPSC - single P2P thread to single mempool
+        // thread)
+        let (p2p_tx_producer, p2p_tx_consumer) = RingBuffer::<Transaction>::new(BUFFER_SIZE);
+
+        // Spawn MempoolService with both transaction sources:
+        // - grpc_tx_queue: ArrayQueue for gRPC-submitted transactions
+        // - p2p_tx_consumer: rtrb Consumer for P2P-gossipped transactions
         let (mempool_service, mempool_channels) = MempoolService::spawn(
-            tx_consumer,
+            Arc::clone(&grpc_tx_queue),
+            p2p_tx_consumer,
             pending_state_reader,
             Arc::clone(&shutdown),
             logger,
@@ -163,7 +184,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ReplicaSetup<N, F, M_S
             proposal_req_producer: mempool_channels.proposal_req_producer,
             proposal_resp_consumer: mempool_channels.proposal_resp_consumer,
             finalized_producer: mempool_channels.finalized_producer,
-            transaction_producer: tx_producer,
+            grpc_tx_queue,
+            p2p_tx_producer,
             persistence_writer,
             shutdown,
             _temp_dir: temp_dir,
