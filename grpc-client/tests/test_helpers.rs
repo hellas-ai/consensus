@@ -15,8 +15,7 @@ use consensus::state::block::Block;
 use consensus::state::transaction::Transaction;
 use consensus::storage::store::ConsensusStore;
 use consensus::validation::pending_state::PendingStateWriter;
-use p2p::service::P2PHandle;
-use rtrb::RingBuffer;
+use crossbeam::queue::ArrayQueue;
 use slog::Logger;
 use tokio::sync::Notify;
 use tonic::transport::Channel;
@@ -106,19 +105,25 @@ impl Drop for TestServerHandle {
     }
 }
 
-/// Create a mock P2P handle for tests.
-pub fn create_mock_p2p_handle() -> P2PHandle {
-    let (tx_broadcast_producer, _tx_broadcast_consumer) = RingBuffer::<Transaction>::new(1000);
+/// Test queues for gRPC services.
+pub struct TestQueues {
+    /// P2P transaction broadcast queue
+    pub p2p_tx_queue: Arc<ArrayQueue<Transaction>>,
+    /// P2P transaction broadcast notify
+    pub p2p_tx_notify: Arc<Notify>,
+    /// Mempool transaction queue
+    pub mempool_tx_queue: Arc<ArrayQueue<Transaction>>,
+    /// P2P ready flag
+    pub p2p_ready: Arc<AtomicBool>,
+}
 
-    P2PHandle {
-        thread_handle: std::thread::spawn(|| {}),
-        shutdown: Arc::new(AtomicBool::new(false)),
-        shutdown_notify: Arc::new(Notify::new()),
-        broadcast_notify: Arc::new(Notify::new()),
-        tx_broadcast_producer,
-        tx_broadcast_notify: Arc::new(Notify::new()),
-        ready_notify: Arc::new(Notify::new()),
-        is_ready: Arc::new(AtomicBool::new(true)),
+/// Create mock queues for gRPC tests.
+pub fn create_mock_queues() -> TestQueues {
+    TestQueues {
+        p2p_tx_queue: Arc::new(ArrayQueue::new(1000)),
+        p2p_tx_notify: Arc::new(Notify::new()),
+        mempool_tx_queue: Arc::new(ArrayQueue::new(1000)),
+        p2p_ready: Arc::new(AtomicBool::new(true)),
     }
 }
 
@@ -149,9 +154,8 @@ pub async fn spawn_test_server() -> TestServerHandle {
     let (pending_state_writer, pending_state_reader) =
         PendingStateWriter::new(Arc::clone(&store), 0);
 
-    // Create P2P handle
-    let p2p_handle = create_mock_p2p_handle();
-    let p2p_ready = Arc::new(AtomicBool::new(true));
+    // Create mock queues for gRPC services
+    let queues = create_mock_queues();
 
     // Find an available port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to random port");
@@ -169,8 +173,10 @@ pub async fn spawn_test_server() -> TestServerHandle {
         None, // block_events
         None, // consensus_events
         None, // tx_events
-        p2p_handle,
-        Arc::clone(&p2p_ready),
+        queues.p2p_tx_queue,
+        queues.p2p_tx_notify,
+        queues.mempool_tx_queue,
+        queues.p2p_ready,
         logger,
     );
 

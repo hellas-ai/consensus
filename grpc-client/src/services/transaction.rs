@@ -1,9 +1,10 @@
 //! Transaction service implementation.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use consensus::state::transaction::{Transaction, TransactionError, TransactionInstruction};
-use p2p::service::P2PHandle;
+use crossbeam::queue::ArrayQueue;
+use tokio::sync::Notify;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::transaction_service_server::TransactionService;
@@ -20,16 +21,36 @@ use super::utils::{parse_address, parse_hash};
 /// Implementation of the TransactionService gRPC service.
 pub struct TransactionServiceImpl {
     context: ReadOnlyContext,
-    /// P2P handle for broadcasting transactions (wrapped in Mutex for thread safety)
-    p2p_handle: Arc<Mutex<P2PHandle>>,
+    /// Lock-free queue for broadcasting transactions via P2P network.
+    /// This is shared with the P2P service which consumes from it.
+    p2p_tx_queue: Arc<ArrayQueue<Transaction>>,
+    /// Notify to wake up P2P service when transaction is queued.
+    p2p_tx_notify: Arc<Notify>,
+    /// Lock-free queue for adding transactions to the local mempool.
+    /// This ensures the submitting node also has the transaction in its own mempool.
+    mempool_tx_queue: Arc<ArrayQueue<Transaction>>,
 }
 
 impl TransactionServiceImpl {
     /// Create a new TransactionService implementation.
-    pub fn new(context: ReadOnlyContext, p2p_handle: Arc<Mutex<P2PHandle>>) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - Read-only context for accessing storage and state
+    /// * `p2p_tx_queue` - Queue for broadcasting transactions to P2P network
+    /// * `p2p_tx_notify` - Notify handle to wake P2P service after queueing
+    /// * `mempool_tx_queue` - Queue for adding transactions to the local mempool
+    pub fn new(
+        context: ReadOnlyContext,
+        p2p_tx_queue: Arc<ArrayQueue<Transaction>>,
+        p2p_tx_notify: Arc<Notify>,
+        mempool_tx_queue: Arc<ArrayQueue<Transaction>>,
+    ) -> Self {
         Self {
             context,
-            p2p_handle,
+            p2p_tx_queue,
+            p2p_tx_notify,
+            mempool_tx_queue,
         }
     }
 
@@ -94,35 +115,31 @@ impl TransactionServiceImpl {
 
         let tx_hash = hex::encode(tx.tx_hash);
 
-        // 3. Broadcast via P2P
-        {
-            let mut handle = match self.p2p_handle.lock() {
-                Ok(h) => h,
-                Err(_) => {
-                    return SubmitTransactionResponse {
-                        success: false,
-                        tx_hash,
-                        error_message: "Failed to acquire P2P handle lock".to_string(),
-                        error_code: ErrorCode::Internal as i32,
-                    };
-                }
-            };
-
-            if let Err(e) = handle.broadcast_transaction(tx.clone()) {
-                slog::warn!(
-                    self.context.logger,
-                    "Failed to broadcast transaction";
-                    "tx_hash" => &tx_hash,
-                    "error" => %e
-                );
-                return SubmitTransactionResponse {
-                    success: false,
-                    tx_hash,
-                    error_message: format!("Failed to broadcast transaction: {}", e),
-                    error_code: ErrorCode::BroadcastFailed as i32,
-                };
-            }
+        // 3. Add to local mempool first (so this node can include it in proposals)
+        if self.mempool_tx_queue.push(tx.clone()).is_err() {
+            slog::warn!(
+                self.context.logger,
+                "Mempool queue full, transaction not added locally";
+                "tx_hash" => &tx_hash,
+            );
+            // Continue anyway - we still want to broadcast to peers
         }
+
+        // 4. Broadcast via P2P to other nodes
+        if self.p2p_tx_queue.push(tx).is_err() {
+            slog::warn!(
+                self.context.logger,
+                "P2P broadcast queue full";
+                "tx_hash" => &tx_hash,
+            );
+            return SubmitTransactionResponse {
+                success: false,
+                tx_hash,
+                error_message: "P2P broadcast queue full".to_string(),
+                error_code: ErrorCode::BroadcastFailed as i32,
+            };
+        }
+        self.p2p_tx_notify.notify_one();
 
         slog::info!(
             self.context.logger,
@@ -481,7 +498,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use consensus::crypto::aggregated::BlsSecretKey;
     use consensus::crypto::transaction_crypto::TxSecretKey;
@@ -489,9 +505,7 @@ mod tests {
     use consensus::state::block::Block;
     use consensus::storage::store::ConsensusStore;
     use consensus::validation::pending_state::PendingStateWriter;
-    use rtrb::RingBuffer;
     use slog::Logger;
-    use tokio::sync::Notify;
 
     fn temp_db_path() -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -506,19 +520,18 @@ mod tests {
         Logger::root(slog::Discard, slog::o!())
     }
 
-    fn create_test_p2p_handle() -> P2PHandle {
-        let (tx_broadcast_producer, _tx_broadcast_consumer) = RingBuffer::<Transaction>::new(1000);
-
-        P2PHandle {
-            thread_handle: std::thread::spawn(|| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            broadcast_notify: Arc::new(Notify::new()),
-            tx_broadcast_producer,
-            tx_broadcast_notify: Arc::new(Notify::new()),
-            ready_notify: Arc::new(Notify::new()),
-            is_ready: Arc::new(AtomicBool::new(true)),
-        }
+    /// Creates test queues for transaction service.
+    /// Returns (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue).
+    fn create_test_queues() -> (
+        Arc<ArrayQueue<Transaction>>,
+        Arc<Notify>,
+        Arc<ArrayQueue<Transaction>>,
+    ) {
+        (
+            Arc::new(ArrayQueue::new(1000)),
+            Arc::new(Notify::new()),
+            Arc::new(ArrayQueue::new(1000)),
+        )
     }
 
     fn create_test_context() -> (ReadOnlyContext, Arc<ConsensusStore>, PendingStateWriter) {
@@ -622,8 +635,9 @@ mod tests {
     #[tokio::test]
     async fn submit_transaction_empty_bytes() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(SubmitTransactionRequest {
             transaction_bytes: vec![],
@@ -640,8 +654,9 @@ mod tests {
     #[tokio::test]
     async fn submit_transaction_invalid_bytes() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(SubmitTransactionRequest {
             transaction_bytes: vec![1, 2, 3, 4, 5],
@@ -657,8 +672,9 @@ mod tests {
     #[tokio::test]
     async fn get_transaction_not_found() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -672,8 +688,9 @@ mod tests {
     #[tokio::test]
     async fn get_transaction_invalid_hash() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: "invalid_hash".to_string(),
@@ -694,8 +711,9 @@ mod tests {
         let block = create_test_block(1, 1, [0u8; 32], vec![tx.clone()]);
         store.put_finalized_block(&block).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: hex::encode(tx_hash),
@@ -719,8 +737,9 @@ mod tests {
         let tx_hash = tx.tx_hash;
         store.put_transaction(&tx).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: hex::encode(tx_hash),
@@ -737,8 +756,9 @@ mod tests {
     #[tokio::test]
     async fn get_transaction_status_not_found() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -760,8 +780,9 @@ mod tests {
         let block = create_test_block(1, 1, [0u8; 32], vec![tx.clone()]);
         store.put_finalized_block(&block).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: hex::encode(tx_hash),
@@ -784,8 +805,9 @@ mod tests {
         let tx_hash = tx.tx_hash;
         store.put_transaction(&tx).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionRequest {
             tx_hash: hex::encode(tx_hash),
@@ -802,8 +824,9 @@ mod tests {
     #[tokio::test]
     async fn get_transactions_by_address_empty() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionsByAddressRequest {
             address: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -837,8 +860,9 @@ mod tests {
         let block = create_test_block(1, 1, [0u8; 32], vec![tx.clone()]);
         store.put_finalized_block(&block).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionsByAddressRequest {
             address: hex::encode(sender.as_bytes()),
@@ -872,8 +896,9 @@ mod tests {
         let block = create_test_block(1, 1, [0u8; 32], vec![tx.clone()]);
         store.put_finalized_block(&block).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionsByAddressRequest {
             address: hex::encode(recipient.as_bytes()),
@@ -911,8 +936,9 @@ mod tests {
         let block = create_test_block(1, 1, [0u8; 32], txs);
         store.put_finalized_block(&block).unwrap();
 
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionsByAddressRequest {
             address: hex::encode(sender.as_bytes()),
@@ -934,8 +960,9 @@ mod tests {
     #[tokio::test]
     async fn get_transactions_by_address_invalid_address() {
         let (context, _store, _writer) = create_test_context();
-        let p2p = Arc::new(Mutex::new(create_test_p2p_handle()));
-        let service = TransactionServiceImpl::new(context, p2p);
+        let (p2p_tx_queue, p2p_tx_notify, mempool_tx_queue) = create_test_queues();
+        let service =
+            TransactionServiceImpl::new(context, p2p_tx_queue, p2p_tx_notify, mempool_tx_queue);
 
         let request = Request::new(GetTransactionsByAddressRequest {
             address: "invalid_address".to_string(),

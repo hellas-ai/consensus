@@ -22,6 +22,7 @@ use consensus::{
     storage::store::ConsensusStore,
     validation::PendingStateWriter,
 };
+use crossbeam::queue::ArrayQueue;
 use p2p::{
     config::P2PConfig, config::ValidatorPeerInfo, identity::ValidatorIdentity,
     service::spawn as spawn_p2p,
@@ -83,9 +84,6 @@ pub struct GossipTestNode<const N: usize, const F: usize, const M_SIZE: usize> {
     /// Transaction consumer - receives transactions from P2P gossip
     /// This is where transactions arrive after being received via P2P
     pub tx_consumer: Consumer<Transaction>,
-
-    /// Transaction producer - for direct mempool submission (for comparison tests)
-    pub mempool_tx_producer: Producer<Transaction>,
 
     /// Mempool service
     pub mempool_service: MempoolService,
@@ -371,7 +369,7 @@ fn create_gossip_node(
     let bls_secret_key = identity.bls_secret_key().clone();
 
     // Spawn P2P service (consumes identity)
-    let mut p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
+    let p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
         TokioRunner::default(),
         p2p_config,
         identity, // identity is consumed here
@@ -415,36 +413,38 @@ fn create_gossip_node(
     let grpc_addr = grpc_listener.local_addr().expect("get local addr");
     drop(grpc_listener); // Release the port for the server
 
-    // Take the real tx_broadcast_producer from the P2P handle and give it to the gRPC handle.
-    // This way, when the gRPC TransactionService broadcasts a transaction, it goes directly
-    // into the P2P network's ring buffer that the P2P service is consuming from.
-    // We replace the original with a dummy producer (the node struct won't use it directly
-    // for gRPC tests - all tx submissions go through gRPC).
-    let (dummy_producer, _dummy_consumer) = RingBuffer::<Transaction>::new(1);
-    let real_tx_producer = std::mem::replace(&mut p2p_handle.tx_broadcast_producer, dummy_producer);
+    // Create mempool queue for gRPC → mempool bridge.
+    // When gRPC receives a transaction, it pushes to this queue.
+    // A bridge thread forwards to the mempool's direct_tx_producer.
+    let grpc_mempool_queue = Arc::new(ArrayQueue::<Transaction>::new(BUFFER_SIZE));
+    let grpc_mempool_queue_clone = Arc::clone(&grpc_mempool_queue);
+    let grpc_bridge_shutdown = Arc::clone(&shutdown);
 
-    // Create a P2P handle for gRPC that uses the REAL tx_broadcast_producer
-    let grpc_p2p_handle = p2p::service::P2PHandle {
-        thread_handle: std::thread::spawn(|| {}),
-        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-        broadcast_notify: Arc::clone(&p2p_handle.broadcast_notify),
-        tx_broadcast_producer: real_tx_producer, // Use the REAL producer
-        tx_broadcast_notify: Arc::clone(&p2p_handle.tx_broadcast_notify),
-        ready_notify: Arc::clone(&p2p_handle.ready_notify),
-        is_ready: Arc::clone(&p2p_ready),
-    };
+    // Spawn bridge thread: grpc_mempool_queue → direct_tx_producer (for local mempool)
+    std::thread::spawn(move || {
+        let mut tx_producer = direct_tx_producer; // Take ownership
+        while !grpc_bridge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(tx) = grpc_mempool_queue_clone.pop() {
+                let _ = tx_producer.push(tx);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
 
     // Create RPC context for gRPC server
+    // Uses lock-free ArrayQueues - no mutex needed
     let rpc_context = RpcContext::new(
         Arc::clone(&storage),
         pending_state_reader,
-        None, // mempool_stats
-        None, // peer_stats
-        None, // block_events
-        None, // consensus_events
-        None, // tx_events
-        grpc_p2p_handle,
+        None,                                        // mempool_stats
+        None,                                        // peer_stats
+        None,                                        // block_events
+        None,                                        // consensus_events
+        None,                                        // tx_events
+        Arc::clone(&p2p_handle.tx_broadcast_queue),  // P2P broadcast queue
+        Arc::clone(&p2p_handle.tx_broadcast_notify), // P2P broadcast notify
+        grpc_mempool_queue,                          // Local mempool queue
         Arc::clone(&p2p_ready),
         logger.new(o!("component" => "grpc")),
     );
@@ -475,7 +475,6 @@ fn create_gossip_node(
         p2p_handle,
         consensus_engine,
         tx_consumer: test_tx_consumer,
-        mempool_tx_producer: direct_tx_producer,
         mempool_service,
         peer_id,
         node_idx,

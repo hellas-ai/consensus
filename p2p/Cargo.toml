@@ -17,6 +17,7 @@ commonware-p2p          = { workspace = true }
 commonware-runtime      = { workspace = true }
 commonware-utils        = { workspace = true }
 consensus               = { workspace = true }
+crossbeam               = { workspace = true }
 figment                 = { workspace = true, features = [ "toml" ] }
 futures                 = { workspace = true }
 governor                = { workspace = true }

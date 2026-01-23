@@ -14,6 +14,7 @@ use commonware_runtime::{Clock, Metrics, Network, Resolver, Runner, Spawner};
 use consensus::consensus::ConsensusMessage;
 use consensus::crypto::aggregated::PeerId;
 use consensus::state::transaction::Transaction;
+use crossbeam::queue::ArrayQueue;
 use rand::{CryptoRng, RngCore};
 use rtrb::{Consumer, Producer};
 use slog::Logger;
@@ -37,8 +38,10 @@ pub struct P2PHandle {
     /// Notify to wake up the service when consensus broadcast queue has data.
     /// Producer should call `broadcast_notify.notify_one()` after pushing.
     pub broadcast_notify: Arc<Notify>,
-    /// Producer for outgoing transaction broadcasts.
-    pub tx_broadcast_producer: Producer<Transaction>,
+    /// Lock-free queue for outgoing transaction broadcasts (MPSC: multiple producers, single
+    /// consumer). Uses crossbeam ArrayQueue which is Sync, allowing multiple gRPC handlers to
+    /// push without a Mutex.
+    pub tx_broadcast_queue: Arc<ArrayQueue<Transaction>>,
     /// Notify to wake up the service when transaction broadcast queue has data.
     pub tx_broadcast_notify: Arc<Notify>,
     /// Notify signaled when P2P is ready (bootstrap phase completed).
@@ -77,11 +80,14 @@ impl P2PHandle {
     ///
     /// This queues the transaction for broadcast via the P2P network.
     /// The transaction will be sent to all connected peers.
-    pub fn broadcast_transaction(
-        &mut self,
-        tx: Transaction,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.tx_broadcast_producer.push(tx).map_err(Box::new)?;
+    ///
+    /// Note: This method takes `&self` (not `&mut self`) because the underlying
+    /// ArrayQueue is lock-free and Sync, allowing concurrent pushes from multiple
+    /// gRPC handlers without requiring a Mutex.
+    pub fn broadcast_transaction(&self, tx: Transaction) -> Result<(), P2PError> {
+        self.tx_broadcast_queue
+            .push(tx)
+            .map_err(|_| P2PError::QueueFull)?;
         self.tx_broadcast_notify.notify_one();
         Ok(())
     }
@@ -115,8 +121,9 @@ where
     let is_ready = Arc::new(AtomicBool::new(false));
     let is_ready_clone = Arc::clone(&is_ready);
 
-    // Create transaction broadcast channel
-    let (tx_broadcast_producer, tx_broadcast_consumer) = rtrb::RingBuffer::new(10_000);
+    // Create transaction broadcast queue (lock-free MPSC)
+    let tx_broadcast_queue = Arc::new(ArrayQueue::new(config.tx_broadcast_queue_size));
+    let tx_broadcast_queue_clone = Arc::clone(&tx_broadcast_queue);
 
     // Extract the ed25519 key for network transport
     let signer = identity.clone_ed25519_private_key();
@@ -135,7 +142,7 @@ where
                     consensus_producer,
                     tx_producer,
                     broadcast_consumer,
-                    tx_broadcast_consumer,
+                    tx_broadcast_queue_clone,
                     shutdown_clone,
                     shutdown_notify_clone,
                     broadcast_notify_clone,
@@ -154,7 +161,7 @@ where
         shutdown,
         shutdown_notify,
         broadcast_notify,
-        tx_broadcast_producer,
+        tx_broadcast_queue,
         tx_broadcast_notify,
         ready_notify,
         is_ready,
@@ -171,7 +178,7 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     mut consensus_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
     mut tx_producer: Producer<Transaction>,
     mut broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
-    mut tx_broadcast_consumer: Consumer<Transaction>,
+    tx_broadcast_queue: Arc<ArrayQueue<Transaction>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     broadcast_notify: Arc<Notify>,
@@ -305,7 +312,7 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
 
             // 4. Outgoing Transaction Broadcasts
             _ = tx_broadcast_notify.notified() => {
-                while let Ok(tx) = tx_broadcast_consumer.pop() {
+                while let Some(tx) = tx_broadcast_queue.pop() {
                     match crate::message::serialize_message(&P2PMessage::<N, F, M_SIZE>::Transaction(tx)) {
                         Ok(bytes) => {
                             network.broadcast_transaction(bytes, vec![]).await;
@@ -317,8 +324,8 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
                 }
             }
 
-             // 5. Incoming Sync Messages (lowest priority)
-             res = receivers.sync.recv() => {
+            // 5. Incoming Sync Messages (lowest priority)
+            res = receivers.sync.recv() => {
                 match res {
                     Ok((sender, msg)) => {
                         let msg: Bytes = msg;
@@ -526,13 +533,12 @@ mod tests {
         is_ready: Arc<AtomicBool>,
         ready_notify: Arc<Notify>,
     ) -> P2PHandle {
-        let (tx_broadcast_producer, _tx_broadcast_consumer) = RingBuffer::<Transaction>::new(100);
         P2PHandle {
             thread_handle: std::thread::spawn(|| {}),
             shutdown,
             shutdown_notify,
             broadcast_notify: Arc::new(Notify::new()),
-            tx_broadcast_producer,
+            tx_broadcast_queue: Arc::new(ArrayQueue::new(100)),
             tx_broadcast_notify: Arc::new(Notify::new()),
             ready_notify,
             is_ready,
