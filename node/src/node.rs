@@ -5,7 +5,7 @@
 //!
 //! - Storage (ConsensusStore)
 //! - Block Validation Service
-//! - Mempool Service  
+//! - Mempool Service
 //! - Consensus Engine
 //! - P2P Service
 //! - gRPC Server
