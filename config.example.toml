@@ -52,12 +52,12 @@ peers = [
 # Genesis accounts with initial token balances.
 # These accounts are created at network genesis with the specified balances.
 [[consensus.genesis_accounts]]
-public_key = "0xaabbccdd..."  # Ed25519 public key (hex)
-balance = 1000000000          # Initial balance in base units
+balance    = 1000000000      # Initial balance in base units
+public_key = "0xaabbccdd..." # Ed25519 public key (hex)
 
 [[consensus.genesis_accounts]]
+balance    = 500000000
 public_key = "0xeeff0011..."
-balance = 500000000
 
 # -----------------------------------------------------------------------------
 # STORAGE CONFIGURATION
@@ -135,29 +135,29 @@ bls_peer_id = 0
 address = "192.168.1.1:9000"
 
 [[p2p.validators]]
+address            = "192.168.1.2:9000"
+bls_peer_id        = 1
 ed25519_public_key = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
-bls_peer_id = 1
-address = "192.168.1.2:9000"
 
 [[p2p.validators]]
+address            = "192.168.1.3:9000"
+bls_peer_id        = 2
 ed25519_public_key = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
-bls_peer_id = 2
-address = "192.168.1.3:9000"
 
 [[p2p.validators]]
+address            = "192.168.1.4:9000"
+bls_peer_id        = 3
 ed25519_public_key = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
-bls_peer_id = 3
-address = "192.168.1.4:9000"
 
 [[p2p.validators]]
+address            = "192.168.1.5:9000"
+bls_peer_id        = 4
 ed25519_public_key = "456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123"
-bls_peer_id = 4
-address = "192.168.1.5:9000"
 
 [[p2p.validators]]
+address            = "192.168.1.6:9000"
+bls_peer_id        = 5
 ed25519_public_key = "56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234"
-bls_peer_id = 5
-address = "192.168.1.6:9000"
 
 # -----------------------------------------------------------------------------
 # RPC (gRPC) CONFIGURATION
