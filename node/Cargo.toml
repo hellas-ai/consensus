@@ -10,14 +10,22 @@ grpc-client = { workspace = true }
 p2p         = { workspace = true }
 
 # Core dependencies
-anyhow    = { workspace = true }
-arc-swap  = { workspace = true }
-crossbeam = { workspace = true }
-figment   = { workspace = true, features = [ "env", "toml", "yaml" ] }
-rtrb      = { workspace = true }
-serde     = { workspace = true, features = [ "derive" ] }
-slog      = { workspace = true }
-tokio     = { workspace = true }
+anyhow        = { workspace = true }
+arc-swap      = { workspace = true }
+ark-serialize = { workspace = true }
+clap          = { workspace = true }
+crossbeam     = { workspace = true }
+ed25519-dalek = { workspace = true }
+figment       = { workspace = true, features = [ "env", "toml", "yaml" ] }
+hex           = { workspace = true }
+rand          = { workspace = true }
+rtrb          = { workspace = true }
+serde         = { workspace = true, features = [ "derive" ] }
+slog          = { workspace = true }
+slog-async    = { workspace = true }
+slog-term     = { workspace = true }
+tempfile      = { workspace = true }
+tokio         = { workspace = true }
 
 # Async runtime for P2P
 commonware-runtime = { workspace = true }

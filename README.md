@@ -268,39 +268,61 @@ node.shutdown(Duration::from_secs(10))?;
 
 ## Configuration
 
-Configuration can be provided via TOML, YAML, or environment variables.
+Configuration can be provided via TOML, YAML, or environment variables. See [`config.example.toml`](config.example.toml) for a complete reference with all available options.
 
-### Example TOML Configuration
+### Quick Start Configuration
+
+Copy the example configuration and modify for your environment:
+
+```bash
+cp config.example.toml config.toml
+# Edit config.toml with your settings
+```
+
+### Minimal Configuration
 
 ```toml
 [consensus]
-view_timeout = { secs = 5, nanos = 0 }
+n = 6                                    # Total validators (must be >= 5f + 1)
+f = 1                                    # Max Byzantine faults
+view_timeout = { secs = 5, nanos = 0 }   # Block proposal timeout
 leader_manager = "RoundRobin"
-network = "mainnet"
+network = "local"
+peers = []                               # BLS public keys of all validators
+genesis_accounts = []
 
 [storage]
 path = "/var/lib/hellas/data"
 
 [p2p]
 listen_addr = "0.0.0.0:9000"
-external_addr = "1.2.3.4:9000"
-bootstrap_timeout_ms = 30000
+external_addr = "1.2.3.4:9000"           # Your public IP
+total_number_peers = 6
+maximum_number_faulty_peers = 1
+validators = []                          # Bootstrap peer info
 
 [rpc]
 listen_addr = "0.0.0.0:50051"
+peer_id = 0                              # This validator's index
+network = "local"
+total_validators = 6
+f = 1
 
 [identity]
-bls_secret_key_path = "/etc/hellas/bls.key"
-ed25519_secret_key_path = "/etc/hellas/ed25519.key"
+bls_secret_key_path = "/etc/hellas/keys/bls.key"
+ed25519_secret_key_path = "/etc/hellas/keys/ed25519.key"
 ```
 
 ### Environment Variables
 
-Configuration can be overridden via environment variables with the `NODE_` prefix:
+Configuration can be overridden via environment variables with the `NODE_` prefix. Nested fields use double underscore:
 
 ```bash
+NODE_CONSENSUS__N=6
+NODE_CONSENSUS__F=1
 NODE_CONSENSUS__VIEW_TIMEOUT__SECS=10
 NODE_STORAGE__PATH=/data/hellas
+NODE_P2P__LISTEN_ADDR=0.0.0.0:9000
 NODE_RPC__LISTEN_ADDR=0.0.0.0:8080
 ```
 

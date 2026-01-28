@@ -24,10 +24,6 @@ service TransactionService {
     rpc GetTransactionsByAddress(GetTransactionsByAddressRequest) returns (GetTransactionsByAddressResponse);
 }
 
-// ============================================================================
-// Submit Transaction
-// ============================================================================
-
 message SubmitTransactionRequest {
     // Serialized Transaction (rkyv format)
     bytes transaction_bytes = 1;
@@ -42,10 +38,6 @@ message SubmitTransactionResponse {
     // Structured error code
     ErrorCode error_code = 4;
 }
-
-// ============================================================================
-// Query Transactions
-// ============================================================================
 
 message GetTransactionRequest {
     // Transaction hash (hex-encoded, 32 bytes)
@@ -74,8 +66,6 @@ enum TransactionStatus {
     TRANSACTION_STATUS_PENDING_BLOCK = 3;
     // In a finalized (L-notarized) block
     TRANSACTION_STATUS_FINALIZED = 4;
-    // In a nullified block
-    TRANSACTION_STATUS_NULLIFIED = 5;
 }
 
 message TransactionStatusResponse {

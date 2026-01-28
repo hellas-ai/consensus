@@ -148,6 +148,47 @@ impl P2PConfig {
     }
 }
 
+/// Serde module for serializing as string, but deserializing from string OR integer.
+/// This handles u64 values that exceed i64::MAX in TOML files.
+mod string_or_int {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+    use std::fmt::Display;
+    use std::str::FromStr;
+
+    pub fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Display,
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: FromStr + TryFrom<u64> + TryFrom<i64>,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrInt {
+            String(String),
+            Int(i64),
+            UInt(u64),
+        }
+
+        match StringOrInt::deserialize(deserializer)? {
+            StringOrInt::String(s) => T::from_str(&s).map_err(de::Error::custom),
+            StringOrInt::Int(i) => {
+                T::try_from(i as u64).map_err(|_| de::Error::custom("integer out of range"))
+            }
+            StringOrInt::UInt(u) => {
+                T::try_from(u).map_err(|_| de::Error::custom("integer out of range"))
+            }
+        }
+    }
+}
+
 /// Information about a validator peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorPeerInfo {
@@ -155,6 +196,7 @@ pub struct ValidatorPeerInfo {
     pub ed25519_public_key: String,
 
     /// BLS peer ID for consensus.
+    #[serde(with = "string_or_int")]
     pub bls_peer_id: PeerId,
 
     /// Direct socket address (if known).

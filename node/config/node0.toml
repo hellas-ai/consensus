@@ -1,0 +1,73 @@
+# Hellas Local Network - Node 0
+# Generated with seed 42. Do not edit peer keys manually.
+
+[consensus]
+n = 6
+f = 1
+view_timeout = { secs = 5, nanos = 0 }
+leader_manager = "round_robin"
+network = "local"
+peers = [
+    "85e6114fa95fe428edde374dff0c1cc879d59ec48ab7bda0c2fefc73b59a0b112a57b56ca2bb79e6278b61362f36158102cbd2c4097144eb9eefd65425e1f969c9f29d32f8b1a29320b37d24642cc5f55c1834bb0471265a316adbfef95b6282",
+    "8a3d0a78a548a4fb4876dadf47d6f6f0e68bea03ace77b33137a3a3f78ea7b2df1ded6add85899a1aae9ee7c08f0f678124b5abd93501cb520ea7db02a92007a771a45f579ac12fdb52a656d11ca5fa1c7bea0db82565def8ee141df172a181e",
+    "a87b2437da786106e26949b2bcbabe9e453587b0340cd0b466bc83bf61d61d0c6240f8b6e0a63d25bf2d34fa5d9ffd4914fbddf11e347d6553c09dc1430e3be614bd685e374435880cf2ebef0408885a3515e3e5d9e9aae84fe3d12c13b97d96",
+    "99cc527ab2fdde759eaa0d80f41be2a239115896bd974ce6a2f2ebf88338185e026b79be721de193664c180d01a43a8d01864274430841546be07d1676cefdcd94254fb0b415bf5d3583e78e09ac2f94c2b03690d79a16bdacccaee91bb51a72",
+    "a12b306597f491c886c418e06f9d4b6816948788e983e48d57262d154fc3560d294197ddc5f81ecdea1ec9b720a830d80c58efaffbcd711523864c07adbf56eb3eec4199d416e7b8e37f08152a5432bc325fe6932a9ae856cb8eee72a658a69f",
+    "807f9f8d2719aadcb49ea61c3adb335b1ac6bddab67c324aa7805a67f5a51790abe2907d974925df9627698a6ad27d220681be9b888fdd89069b4870a9adea53e9e1211dafb9c83087cdbd87b88bb961a17aacf39de54af62605dd83e12fafce",
+]
+
+[[consensus.genesis_accounts]]
+public_key = "9af8324634d5858251ace90e8a10a1d7fd96c4264bfd3108e74ec88c01f2de0c"
+balance = 1000000000
+
+[[consensus.genesis_accounts]]
+public_key = "db5f654c0b6515a9cf83ec3d424ada47dac72e6b16d43fe296b034e29d156cc0"
+balance = 500000000
+
+[storage]
+path = "./data/node0.redb"
+
+[p2p]
+listen_addr = "127.0.0.1:9000"
+external_addr = "127.0.0.1:9000"
+total_number_peers = 6
+maximum_number_faulty_peers = 1
+bootstrap_timeout_ms = 30000
+ping_interval_ms = 200
+cluster_id = "hellas-local"
+
+[[p2p.validators]]
+ed25519_public_key = "251223479c83e39114e8225f11874a18fbaa51b88b91e74f59928171ef83c9dd"
+bls_peer_id = "8566178328297073077"
+address = "127.0.0.1:9100"
+
+[[p2p.validators]]
+ed25519_public_key = "0238e36b8bff83871b0b52c8956bbdb3f5679005ab19980c6aa81fad665b037c"
+bls_peer_id = "6893510571635356328"
+address = "127.0.0.1:9200"
+
+[[p2p.validators]]
+ed25519_public_key = "cec06f745150a7a4660cccad11e5bf019289e3b5538326a6bcfc86e1ab3ca33f"
+bls_peer_id = "14406473332580887402"
+address = "127.0.0.1:9300"
+
+[[p2p.validators]]
+ed25519_public_key = "1aa80947d5578d71fcd47e3dd21d5c2458d2350d6bbf53ddafb0125da91731d4"
+bls_peer_id = "16213938081789197677"
+address = "127.0.0.1:9400"
+
+[[p2p.validators]]
+ed25519_public_key = "bfdc32535af586581e705b8cdf7f3ad4fb20868d4088cb06712e60f8977afe38"
+bls_peer_id = "16869145123136736616"
+address = "127.0.0.1:9500"
+
+[rpc]
+listen_addr = "127.0.0.1:50051"
+max_concurrent_streams = 100
+request_timeout_secs = 30
+peer_id = 0
+network = "local"
+total_validators = 6
+f = 1
+
+[identity]

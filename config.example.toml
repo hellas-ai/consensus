@@ -1,0 +1,212 @@
+# =============================================================================
+# Hellas Validator Node Configuration
+# =============================================================================
+#
+# This file contains all configuration options for running a Hellas validator.
+# Copy this file to `config.toml` and modify values as needed.
+#
+# Environment variables can override any value using the NODE_ prefix.
+# Nested fields use double underscore: NODE_CONSENSUS__N=6
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CONSENSUS CONFIGURATION
+# -----------------------------------------------------------------------------
+# Settings for the Minimmit BFT consensus protocol.
+
+[consensus]
+# Total number of validators in the network.
+# Must satisfy: n >= 5f + 1 (e.g., n=6 for f=1, n=11 for f=2)
+n = 6
+
+# Maximum number of Byzantine (faulty) validators tolerated.
+# The network can tolerate up to f Byzantine validators.
+f = 1
+
+# Maximum time to wait for a block proposal before sending a nullify message.
+# If the leader doesn't propose within this timeout, validators will nullify the view.
+# Format: { secs = <seconds>, nanos = <nanoseconds> }
+view_timeout = { secs = 5, nanos = 0 }
+
+# Leader selection strategy for determining which validator proposes each block.
+# Options: "RoundRobin" (rotate through validators in order)
+leader_manager = "RoundRobin"
+
+# Network environment. Affects protocol parameters and peer discovery.
+# Options: "local", "devnet", "testnet", "mainnet"
+network = "local"
+
+# List of validator BLS public keys (hex-encoded).
+# These are the BLS keys used for consensus voting and aggregation.
+# In production, this should list all validators in the network.
+peers = [
+    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    "0x234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef0",
+    "0x34567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef01",
+    "0x4567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef012",
+    "0x567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef0123",
+    "0x67890abcdef1234567890abcdef1234567890abcdef1234567890abcdef01234",
+]
+
+# Genesis accounts with initial token balances.
+# These accounts are created at network genesis with the specified balances.
+[[consensus.genesis_accounts]]
+public_key = "0xaabbccdd..."  # Ed25519 public key (hex)
+balance = 1000000000          # Initial balance in base units
+
+[[consensus.genesis_accounts]]
+public_key = "0xeeff0011..."
+balance = 500000000
+
+# -----------------------------------------------------------------------------
+# STORAGE CONFIGURATION
+# -----------------------------------------------------------------------------
+# Persistent storage settings for blocks, state, and consensus data.
+
+[storage]
+# Path to the data directory for RocksDB storage.
+# This directory will be created if it doesn't exist.
+# Should have sufficient disk space for blockchain data.
+path = "/var/lib/hellas/data"
+
+# -----------------------------------------------------------------------------
+# P2P CONFIGURATION
+# -----------------------------------------------------------------------------
+# Peer-to-peer networking settings for validator communication.
+
+[p2p]
+# Local address to bind for incoming P2P connections.
+# Use 0.0.0.0 to listen on all interfaces.
+listen_addr = "0.0.0.0:9000"
+
+# External address that other validators should use to connect.
+# This should be your public IP if behind NAT, or same as listen_addr otherwise.
+external_addr = "1.2.3.4:9000"
+
+# Total number of peers in the consensus network.
+# Should match consensus.n
+total_number_peers = 6
+
+# Maximum faulty peers in the network.
+# Should match consensus.f
+maximum_number_faulty_peers = 1
+
+# Cluster ID for network namespace (prevents cross-network message replay).
+# All validators in the same network must use the same cluster_id.
+cluster_id = "hellas-mainnet"
+
+# Maximum size of a single P2P message in bytes.
+# Default: 1MB (1048576 bytes)
+max_message_size = 1048576
+
+# Maximum number of pending messages in the receive buffer.
+# Increase if experiencing message drops under high load.
+message_backlog = 1024
+
+# Rate limit for consensus protocol messages (votes, proposals) per second.
+# Protects against DoS attacks from malicious peers.
+consensus_rate_per_second = 10000
+
+# Rate limit for transaction gossip messages per second.
+# Should be set based on expected transaction throughput.
+tx_rate_per_second = 50000
+
+# Timeout for P2P bootstrap phase in milliseconds.
+# How long to wait for initial peer connections before proceeding.
+bootstrap_timeout_ms = 30000
+
+# Interval between ping messages during bootstrap (milliseconds).
+# Lower values speed up peer discovery but increase network overhead.
+ping_interval_ms = 500
+
+# Size of the transaction broadcast queue.
+# Transactions waiting to be gossiped to peers.
+tx_broadcast_queue_size = 100000
+
+# List of known validators (bootstrap peers).
+# At least one validator should be reachable for initial network discovery.
+[[p2p.validators]]
+# Ed25519 public key for P2P identity (hex-encoded, 32 bytes)
+ed25519_public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# BLS peer ID for consensus (matches index in consensus.peers)
+bls_peer_id = 0
+# Direct socket address (optional, for bootstrap)
+address = "192.168.1.1:9000"
+
+[[p2p.validators]]
+ed25519_public_key = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+bls_peer_id = 1
+address = "192.168.1.2:9000"
+
+[[p2p.validators]]
+ed25519_public_key = "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
+bls_peer_id = 2
+address = "192.168.1.3:9000"
+
+[[p2p.validators]]
+ed25519_public_key = "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
+bls_peer_id = 3
+address = "192.168.1.4:9000"
+
+[[p2p.validators]]
+ed25519_public_key = "456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123"
+bls_peer_id = 4
+address = "192.168.1.5:9000"
+
+[[p2p.validators]]
+ed25519_public_key = "56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234"
+bls_peer_id = 5
+address = "192.168.1.6:9000"
+
+# -----------------------------------------------------------------------------
+# RPC (gRPC) CONFIGURATION
+# -----------------------------------------------------------------------------
+# External gRPC API server settings for client interactions.
+
+[rpc]
+# Address to listen for gRPC client connections.
+# Use 0.0.0.0 to accept connections from any interface.
+listen_addr = "0.0.0.0:50051"
+
+# Maximum concurrent gRPC streams per connection.
+# Higher values allow more parallel requests but use more memory.
+max_concurrent_streams = 100
+
+# Request timeout in seconds.
+# Requests taking longer than this will be cancelled.
+request_timeout_secs = 30
+
+# This validator's peer ID (must match position in consensus.peers).
+# Used for identifying this node in API responses.
+peer_id = 0
+
+# Network environment for API responses.
+# Options: "mainnet", "testnet", "local"
+network = "local"
+
+# Total number of validators (for API info endpoints).
+# Should match consensus.n
+total_validators = 6
+
+# Fault tolerance parameter (for API info endpoints).
+# Should match consensus.f
+f = 1
+
+# -----------------------------------------------------------------------------
+# IDENTITY CONFIGURATION
+# -----------------------------------------------------------------------------
+# Validator key management settings.
+
+[identity]
+# Path to the BLS secret key file (hex-encoded).
+# This key is used for consensus voting and block signing.
+# If not provided or file doesn't exist, a new key will be generated.
+# SECURITY: This file must be kept secure and backed up.
+bls_secret_key_path = "/etc/hellas/keys/bls.key"
+
+# Path to the Ed25519 secret key file for P2P identity.
+# This key is used for authenticating P2P connections.
+# If not provided or file doesn't exist, a new key will be generated.
+# SECURITY: This file must be kept secure and backed up.
+ed25519_secret_key_path = "/etc/hellas/keys/ed25519.key"

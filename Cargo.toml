@@ -11,6 +11,7 @@ ark-ff                  = "0.5.0"
 ark-serialize           = "0.5.0"
 blake3                  = "1.8.2"
 bytes                   = "1.11.0"
+clap                    = { version = "4.5.54", features = [ "derive" ] }
 commonware-codec        = "0.0.64"
 commonware-cryptography = "0.0.64"
 commonware-p2p          = "0.0.64"
