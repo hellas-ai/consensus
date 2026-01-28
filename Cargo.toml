@@ -1,5 +1,15 @@
 [workspace]
-members  = [ "consensus", "crypto", "grpc-client", "node", "p2p", "storage", "tests", "utils" ]
+members = [
+    "consensus",
+    "crypto",
+    "grpc-client",
+    "node",
+    "p2p",
+    "sdk",
+    "storage",
+    "tests",
+    "utils",
+]
 resolver = "3"
 
 [workspace.dependencies]
