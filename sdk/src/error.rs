@@ -40,6 +40,10 @@ pub enum Error {
     /// Serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    /// Max retries exceeded.
+    #[error("Max retries exceeded")]
+    MaxRetriesExceeded { num_retries: u32 },
 }
 
 /// Result type alias for SDK operations.

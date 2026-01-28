@@ -122,6 +122,8 @@ impl HellasClient {
     /// Submit a transaction and wait for it to be finalized.
     ///
     /// Polls the transaction status until it's finalized or times out.
+    /// Note: Transaction may briefly show as NotFound between mempool removal
+    /// and block persistence - this is handled by retrying.
     pub async fn submit_and_wait(
         &self,
         tx: SignedTransaction,
@@ -132,9 +134,17 @@ impl HellasClient {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
 
+        let mut max_retries = self.config.max_retries;
+
         loop {
             if start.elapsed() > timeout {
                 return Err(Error::Timeout);
+            }
+
+            if max_retries == 0 {
+                return Err(Error::MaxRetriesExceeded {
+                    num_retries: self.config.max_retries,
+                });
             }
 
             match self.get_transaction_status(&tx_hash).await? {
@@ -149,10 +159,11 @@ impl HellasClient {
                         tx_index: 0, // TODO: Get actual index from response
                     });
                 }
-                TxStatus::NotFound => {
-                    return Err(Error::NotFound(format!("Transaction {}", tx_hash)));
-                }
-                TxStatus::Pending | TxStatus::MNotarized { .. } => {
+                // NotFound is treated as transient: there's a brief window between
+                // when the mempool removes a tx (after finalization) and when the
+                // block is persisted to storage. We retry instead of failing.
+                TxStatus::NotFound | TxStatus::Pending | TxStatus::MNotarized { .. } => {
+                    max_retries -= 1;
                     tokio::time::sleep(poll_interval).await;
                 }
             }
