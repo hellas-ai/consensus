@@ -242,6 +242,7 @@ fn process_incoming_tx(
 ) {
     let tx_hash = tx.tx_hash;
     let sender = tx.sender;
+    let tx_nonce = tx.nonce;
 
     // Verify signature before adding to pool
     if !tx.verify() {
@@ -266,21 +267,24 @@ fn process_incoming_tx(
     match result {
         AddResult::AddedPending => {
             *stats_added_pending += 1;
-            slog::trace!(
+            slog::debug!(
                 logger,
-                "Transaction added to pending pool";
+                "Transaction added to PENDING pool";
                 "tx_hash" => hex::encode(&tx_hash[..8]),
                 "sender" => hex::encode(&sender.as_bytes()[..8]),
+                "sender_base_nonce" => sender_base_nonce,
                 "pool_size" => pool.len(),
             );
         }
         AddResult::AddedQueued => {
             *stats_added_queued += 1;
-            slog::trace!(
+            slog::debug!(
                 logger,
-                "Transaction added to queued pool (nonce gap)";
+                "Transaction added to QUEUED pool (nonce gap)";
                 "tx_hash" => hex::encode(&tx_hash[..8]),
                 "sender" => hex::encode(&sender.as_bytes()[..8]),
+                "sender_base_nonce" => sender_base_nonce,
+                "tx_nonce" => tx_nonce,
                 "pool_size" => pool.len(),
             );
         }
@@ -426,6 +430,14 @@ pub fn mempool_loop(
             // Remove finalized transactions from pool
             pool.remove_finalized(&notif);
 
+            slog::debug!(
+                logger,
+                "Processing finalization";
+                "view" => notif.view,
+                "finalized_tx_count" => removed_count,
+                "senders_to_update" => senders_to_update.len(),
+            );
+
             // Update sender nonces based on finalized state
             // This promotes queued transactions that are now executable
             for sender in senders_to_update {
@@ -433,6 +445,12 @@ pub fn mempool_loop(
                     .get_account(&sender)
                     .map(|a| a.nonce)
                     .unwrap_or(0);
+                slog::debug!(
+                    logger,
+                    "Updating sender nonce after finalization";
+                    "sender" => hex::encode(&sender.as_bytes()[..8]),
+                    "new_nonce" => new_nonce,
+                );
                 pool.update_sender_nonce(&sender, new_nonce);
             }
 

@@ -1,0 +1,24 @@
+[package]
+description = "Rust SDK for Hellas blockchain"
+edition     = "2024"
+license     = "Apache-2.0"
+name        = "hellas-sdk"
+version     = "0.1.0"
+
+[dependencies]
+anyhow        = { workspace = true }
+bytes         = { workspace = true }
+consensus     = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures       = { workspace = true }
+grpc-client   = { workspace = true }
+hex           = { workspace = true }
+rand          = { workspace = true }
+rkyv          = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tokio-stream  = { workspace = true }
+tonic         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

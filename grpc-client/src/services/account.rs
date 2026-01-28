@@ -95,7 +95,9 @@ impl AccountService for AccountServiceImpl {
         // Get nonce from pending state (most up-to-date view)
         let account_state = self.context.pending_state.get_account(&address);
 
-        let next_nonce = account_state.map(|state| state.nonce + 1).unwrap_or(0);
+        // Note: state.nonce already represents "next expected nonce" (i.e., how many txs executed)
+        // For a genesis account with nonce=0, the first tx should use nonce 0
+        let next_nonce = account_state.map(|state| state.nonce).unwrap_or(0);
 
         Ok(Response::new(GetNonceResponse {
             next_nonce,
@@ -292,7 +294,7 @@ mod tests {
     async fn get_nonce_existing_returns_next() {
         let (context, store, _writer) = create_test_context();
 
-        // Create account with nonce 5
+        // Create account with nonce 5 (meaning the account should use nonce 5 for next tx)
         let sk = TxSecretKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.public_key();
         let account = Account::new(pk.clone(), 1000, 5);
@@ -308,7 +310,8 @@ mod tests {
         let response = service.get_nonce(request).await.unwrap();
         let resp = response.into_inner();
 
-        assert_eq!(resp.next_nonce, 6); // nonce + 1
+        // Account's nonce field already represents "next expected nonce"
+        assert_eq!(resp.next_nonce, 5);
     }
 
     #[tokio::test]
@@ -337,6 +340,7 @@ mod tests {
         let response = service.get_nonce(request).await.unwrap();
         let resp = response.into_inner();
 
-        assert_eq!(resp.next_nonce, 7); // pending nonce 6 + 1
+        // Pending state shows nonce 6, which is the next expected nonce
+        assert_eq!(resp.next_nonce, 6);
     }
 }
