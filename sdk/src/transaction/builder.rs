@@ -1,6 +1,6 @@
 //! Transaction builder with fluent API
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::transaction::types::SignedTransaction;
 use crate::types::{Address, Hash};
 use crate::wallet::Wallet;
@@ -139,7 +139,7 @@ impl TxBuilder {
 
         // Serialize the transaction using rkyv
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&tx)
-            .map_err(|e| crate::error::Error::Serialization(e.to_string()))?
+            .map_err(Error::Serialization)?
             .to_vec();
         let tx_hash = Hash::from_bytes(tx.tx_hash);
 

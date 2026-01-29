@@ -44,7 +44,7 @@ impl Wallet {
     /// # Arguments
     /// * `hex` - 64-character hex string
     pub fn from_hex(hex: &str) -> Result<Self> {
-        let bytes = hex::decode(hex).map_err(|e| Error::Parse(e.to_string()))?;
+        let bytes = hex::decode(hex)?;
         if bytes.len() != 32 {
             return Err(Error::InvalidArgument(format!(
                 "Secret key must be 32 bytes, got {}",

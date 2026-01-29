@@ -75,12 +75,11 @@ impl HellasClient {
 
     /// Connect with custom configuration.
     pub async fn connect_with_config(config: ClientConfig) -> Result<Self> {
-        let channel = Channel::from_shared(config.endpoint.clone())
-            .map_err(|e| Error::ConnectionFailed(e.to_string()))?
+        let channel = Channel::from_shared(config.endpoint.clone())?
             .timeout(config.timeout)
             .connect()
             .await
-            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
+            .map_err(Error::ConnectionFailed)?;
 
         Ok(Self { channel, config })
     }
@@ -133,15 +132,14 @@ impl HellasClient {
 
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(500);
-
-        let mut max_retries = self.config.max_retries;
+        let mut retries_remaining = self.config.max_retries;
 
         loop {
             if start.elapsed() > timeout {
                 return Err(Error::Timeout);
             }
 
-            if max_retries == 0 {
+            if retries_remaining == 0 {
                 return Err(Error::MaxRetriesExceeded {
                     num_retries: self.config.max_retries,
                 });
@@ -163,7 +161,7 @@ impl HellasClient {
                 // when the mempool removes a tx (after finalization) and when the
                 // block is persisted to storage. We retry instead of failing.
                 TxStatus::NotFound | TxStatus::Pending | TxStatus::MNotarized { .. } => {
-                    max_retries -= 1;
+                    retries_remaining -= 1;
                     tokio::time::sleep(poll_interval).await;
                 }
             }

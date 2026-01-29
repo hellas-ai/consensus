@@ -7,7 +7,11 @@ use thiserror::Error;
 pub enum Error {
     /// Failed to connect to the node.
     #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
+    ConnectionFailed(#[source] tonic::transport::Error),
+
+    /// Invalid endpoint URI.
+    #[error("Invalid endpoint: {0}")]
+    InvalidEndpoint(#[from] tonic::codegen::http::uri::InvalidUri),
 
     /// Request timed out.
     #[error("Request timeout")]
@@ -33,16 +37,16 @@ pub enum Error {
     #[error("gRPC error: {0}")]
     Grpc(#[from] tonic::Status),
 
-    /// Parse error (hex, address, etc).
-    #[error("Parse error: {0}")]
-    Parse(String),
+    /// Hex decode error.
+    #[error("Hex decode error: {0}")]
+    HexDecode(#[from] hex::FromHexError),
 
     /// Serialization error.
     #[error("Serialization error: {0}")]
-    Serialization(String),
+    Serialization(#[source] rkyv::rancor::Error),
 
     /// Max retries exceeded.
-    #[error("Max retries exceeded")]
+    #[error("Max retries exceeded after {num_retries} attempts")]
     MaxRetriesExceeded { num_retries: u32 },
 }
 
