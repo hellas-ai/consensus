@@ -17,7 +17,7 @@ impl Address {
 
     /// Create from hex string (64 characters).
     pub fn from_hex(hex: &str) -> Result<Self, Error> {
-        let bytes = hex::decode(hex).map_err(|e| Error::Parse(e.to_string()))?;
+        let bytes = hex::decode(hex)?;
         if bytes.len() != 32 {
             return Err(Error::InvalidArgument(format!(
                 "Address must be 32 bytes, got {}",
@@ -84,7 +84,7 @@ impl Hash {
 
     /// Create from hex string (64 characters).
     pub fn from_hex(hex: &str) -> Result<Self, Error> {
-        let bytes = hex::decode(hex).map_err(|e| Error::Parse(e.to_string()))?;
+        let bytes = hex::decode(hex)?;
         if bytes.len() != 32 {
             return Err(Error::InvalidArgument(format!(
                 "Hash must be 32 bytes, got {}",
