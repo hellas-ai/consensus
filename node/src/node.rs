@@ -17,8 +17,8 @@
 //! 1. **P2P Runtime** (`commonware_runtime::tokio::Runner`)
 //!    - Manages the P2P networking layer via commonware-p2p
 //!    - Runs in a dedicated OS thread spawned by `spawn_p2p()`
-//!    - The commonware `Runner::start()` pattern consumes the runner and blocks
-//!      until completion, so it cannot be shared with other services
+//!    - The commonware `Runner::start()` pattern consumes the runner and blocks until completion,
+//!      so it cannot be shared with other services
 //!
 //! 2. **gRPC Runtime** (standard `tokio::runtime::Runtime`)
 //!    - Manages the tonic gRPC server for external API
