@@ -10,6 +10,30 @@
 //! - P2P Service
 //! - gRPC Server
 //!
+//! ## Runtime Architecture
+//!
+//! This node uses **two separate tokio runtimes**:
+//!
+//! 1. **P2P Runtime** (`commonware_runtime::tokio::Runner`)
+//!    - Manages the P2P networking layer via commonware-p2p
+//!    - Runs in a dedicated OS thread spawned by `spawn_p2p()`
+//!    - The commonware `Runner::start()` pattern consumes the runner and blocks
+//!      until completion, so it cannot be shared with other services
+//!
+//! 2. **gRPC Runtime** (standard `tokio::runtime::Runtime`)
+//!    - Manages the tonic gRPC server for external API
+//!    - Runs in a dedicated OS thread for isolation
+//!
+//! ### Why Separate Runtimes?
+//!
+//! The separate runtimes provide:
+//! - **Workload isolation**: gRPC (bursty external requests) vs P2P (steady gossip)
+//! - **No contention**: Services communicate via lock-free `ArrayQueue` and `Notify`
+//! - **Independent shutdown**: Each runtime shuts down cleanly without blocking the other
+//! - **Simplicity**: No complex lifetime management across runtime boundaries
+//!
+//! The cost is minimal: one extra OS thread and ~MB of tokio runtime overhead.
+//!
 //! ## Spawn Order
 //!
 //! Services are spawned in dependency order:
