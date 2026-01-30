@@ -1,5 +1,18 @@
 //! gRPC server setup and context management.
+//!
+//! ## Runtime Architecture
+//!
+//! The gRPC server runs in its own dedicated tokio runtime, separate from the P2P
+//! service which uses `commonware_runtime::tokio::Runner`. This isolation provides:
+//!
+//! - **Workload separation**: External API requests (bursty) don't compete with P2P gossip
+//! - **Independent lifecycle**: gRPC can shut down without blocking P2P and vice versa
+//! - **Clean shutdown**: The server accepts a shutdown signal for graceful termination
+//!
+//! Communication with P2P happens via lock-free `ArrayQueue` and `Notify` primitives,
+//! which are `Send + Sync` and safe to share across runtime boundaries.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -124,6 +137,32 @@ impl RpcServer {
     ///
     /// This will block until the server is shut down.
     pub async fn serve(self) -> Result<(), tonic::transport::Error> {
+        // Use a future that never completes for backward compatibility
+        self.serve_with_shutdown(std::future::pending()).await
+    }
+
+    /// Start the gRPC server with a graceful shutdown signal.
+    ///
+    /// The server will stop accepting new connections when the `shutdown` future
+    /// completes, then wait for existing connections to finish.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let shutdown_notify = Arc::new(Notify::new());
+    /// let shutdown_clone = Arc::clone(&shutdown_notify);
+    ///
+    /// // In another task/thread:
+    /// // shutdown_notify.notify_one();
+    ///
+    /// server.serve_with_shutdown(async move {
+    ///     shutdown_clone.notified().await;
+    /// }).await?;
+    /// ```
+    pub async fn serve_with_shutdown<F>(self, shutdown: F) -> Result<(), tonic::transport::Error>
+    where
+        F: Future<Output = ()> + Send,
+    {
         let addr = self.config.listen_addr;
 
         slog::info!(
@@ -155,15 +194,21 @@ impl RpcServer {
         let subscription_service = SubscriptionServiceImpl::new(tx_ctx.clone());
         let admin_service = AdminServiceImpl::new(tx_ctx);
 
+        let logger = self.context.read_only.logger.clone();
+
         // Build routes with implemented services
-        Server::builder()
+        let result = Server::builder()
             .add_service(AccountServiceServer::new(account_service))
             .add_service(AdminServiceServer::new(admin_service))
             .add_service(BlockServiceServer::new(block_service))
             .add_service(NodeServiceServer::new(node_service))
             .add_service(TransactionServiceServer::new(transaction_service))
             .add_service(SubscriptionServiceServer::new(subscription_service))
-            .serve(addr)
-            .await
+            .serve_with_shutdown(addr, shutdown)
+            .await;
+
+        slog::info!(logger, "gRPC server stopped");
+
+        result
     }
 }
