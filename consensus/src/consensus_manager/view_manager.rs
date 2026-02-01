@@ -790,6 +790,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             .finalize_with_l_notarization(view, &self.peers)
     }
 
+    /// Returns the oldest non-finalized view eligible for finalization, if any.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        self.view_chain.oldest_finalizable_view()
+    }
+
     /// Marks that the current replica has proposed a block for a view.
     pub fn mark_proposed(&mut self, view: u64) -> Result<()> {
         if view == self.view_chain.current_view_number() {

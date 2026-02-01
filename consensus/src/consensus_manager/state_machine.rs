@@ -387,7 +387,27 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
     /// Handles periodic tick
     pub fn handle_tick(&mut self) -> Result<()> {
         let event = self.view_manager.tick()?;
-        self.handle_event(event)
+        self.handle_event(event)?;
+
+        // Retry finalization for views that have accumulated enough votes.
+        // This catches cases where the normal finalization path was missed
+        // due to message ordering or processing errors.
+        while let Some((view, block_hash)) = self.view_manager.oldest_finalizable_view() {
+            match self.finalize_view(view, block_hash) {
+                Ok(()) => {
+                    slog::info!(self.logger, "Finalized pending view {view} via retry");
+                }
+                Err(e) => {
+                    slog::debug!(
+                        self.logger,
+                        "Pending finalization retry failed for view {view}: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Handles a view progress event by taking appropriate action
