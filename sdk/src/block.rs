@@ -1,5 +1,6 @@
 //! Block-related operations
 
+use crate::client::GrpcChannel;
 use crate::error::{Error, Result};
 use crate::transaction::{TxInfo, TxType};
 use crate::types::{Address, Hash};
@@ -7,7 +8,6 @@ use grpc_client::proto::block_service_client::BlockServiceClient;
 use grpc_client::proto::{
     Empty, GetBlockByHeightRequest, GetBlockRequest, GetBlocksRequest, TransactionType,
 };
-use tonic::transport::Channel;
 
 /// Block information.
 #[derive(Debug, Clone)]
@@ -30,11 +30,11 @@ pub struct Block {
 
 /// Client for block operations.
 pub struct BlockClient {
-    client: BlockServiceClient<Channel>,
+    client: BlockServiceClient<GrpcChannel>,
 }
 
 impl BlockClient {
-    pub(crate) fn new(channel: Channel) -> Self {
+    pub(crate) fn new(channel: GrpcChannel) -> Self {
         Self {
             client: BlockServiceClient::new(channel),
         }

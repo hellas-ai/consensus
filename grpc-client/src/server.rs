@@ -196,8 +196,10 @@ impl RpcServer {
 
         let logger = self.context.read_only.logger.clone();
 
-        // Build routes with implemented services
+        // Build routes with implemented services, wrapped with grpc-web support
         let result = Server::builder()
+            .accept_http1(true)
+            .layer(tonic_web::GrpcWebLayer::new())
             .add_service(AccountServiceServer::new(account_service))
             .add_service(AdminServiceServer::new(admin_service))
             .add_service(BlockServiceServer::new(block_service))
