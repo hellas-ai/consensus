@@ -66,6 +66,7 @@
           cargo-watch
           gh
           grpcurl
+          taplo
         ];
       };
 

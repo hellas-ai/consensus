@@ -10,8 +10,8 @@ use grpc_client::proto::transaction_service_client::TransactionServiceClient;
 use grpc_client::proto::{GetTransactionRequest, SubmitTransactionRequest};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tonic::codegen::http;
 use tonic::codegen::Service;
+use tonic::codegen::http;
 use tonic::transport::{Channel, ClientTlsConfig};
 
 /// Adapter that allows [`Channel`] to accept any body type by converting
@@ -107,8 +107,7 @@ impl HellasClient {
 
     /// Connect with custom configuration.
     pub async fn connect_with_config(config: ClientConfig) -> Result<Self> {
-        let mut endpoint =
-            Channel::from_shared(config.endpoint.clone())?.timeout(config.timeout);
+        let mut endpoint = Channel::from_shared(config.endpoint.clone())?.timeout(config.timeout);
 
         if config.endpoint.starts_with("https://") {
             endpoint = endpoint

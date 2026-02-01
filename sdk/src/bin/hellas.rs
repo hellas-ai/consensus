@@ -278,7 +278,9 @@ async fn handle_tx(endpoint: &str, cmd: TxCommand) -> Result<()> {
 
     match args.wait {
         Some(secs) => {
-            let r = client.submit_and_wait(tx, Duration::from_secs(secs)).await?;
+            let r = client
+                .submit_and_wait(tx, Duration::from_secs(secs))
+                .await?;
             println!("tx_hash:      {}", r.tx_hash);
             println!("block_hash:   {}", r.block_hash);
             println!("block_height: {}", r.block_height);
