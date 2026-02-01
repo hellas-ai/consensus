@@ -1,1 +1,6 @@
+data
+node/config/*.toml
 /target
+/result
+.nixos-test-history
+.claude

@@ -21,6 +21,7 @@ hex           = { workspace = true }
 rand          = { workspace = true }
 rtrb          = { workspace = true }
 serde         = { workspace = true, features = [ "derive" ] }
+serde_json    = { workspace = true }
 slog          = { workspace = true }
 slog-async    = { workspace = true }
 slog-term     = { workspace = true }
