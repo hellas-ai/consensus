@@ -16,9 +16,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -83,11 +80,7 @@ fn main() -> Result<()> {
     let logger = create_logger(&args.log_level);
 
     match args.command {
-        Command::Run { config, node_index } => {
-            let shutdown = Arc::new(AtomicBool::new(false));
-            ctrlc_handler(Arc::clone(&shutdown));
-            run_node(config, node_index, logger, shutdown)
-        }
+        Command::Run { config, node_index } => run_node(config, node_index, logger),
         Command::GenerateConfigs { output_dir } => generate_configs(&output_dir, logger),
     }
 }
@@ -97,7 +90,6 @@ fn run_node(
     config_path: PathBuf,
     node_index_override: Option<usize>,
     logger: Logger,
-    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     slog::info!(logger, "Loading configuration"; "path" => %config_path.display());
 
@@ -135,16 +127,8 @@ fn run_node(
 
     let executor = TokioRunner::default();
     executor.start(|_ctx| async move {
-        node.wait_ready().await;
-        slog::info!(logger, "Node is ready and participating in consensus");
-
-        while !shutdown.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        slog::info!(logger, "Shutting down...");
-        if let Err(e) = node.shutdown(Duration::from_secs(10)) {
-            slog::error!(logger, "Shutdown error"; "error" => %e);
+        if let Err(e) = node.run().await {
+            slog::error!(logger, "Node error"; "error" => %e);
         }
     });
 
@@ -381,14 +365,4 @@ fn create_logger(level: &str) -> Logger {
     let drain = slog::LevelFilter::new(drain, level).fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     Logger::root(drain, o!("version" => env!("CARGO_PKG_VERSION")))
-}
-
-fn ctrlc_handler(shutdown: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            tokio::signal::ctrl_c().await.ok();
-            shutdown.store(true, Ordering::SeqCst);
-        });
-    });
 }

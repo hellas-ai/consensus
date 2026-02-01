@@ -54,14 +54,16 @@
 //!
 //! ## Shutdown Order
 //!
-//! Shutdown is dependency-aware: services that depend on others must finish first.
+//! The `run()` method waits for the consensus engine to exit (either via
+//! ctrl-c signal or unexpected thread exit), then tears down remaining
+//! services in dependency order:
 //!
 //! ```text
-//! 1. Stop gRPC       ─── No new user transactions
-//! 2. Signal P2P      ─── Stop accepting network messages  
-//! 3. Signal Consensus─── Stop after current view
-//! 4. Wait Consensus  ─── May still request proposals from mempool
-//! 5. Shutdown Mempool─── Now safe (consensus is done)
+//! 1. Wait Consensus  ─── Runs until ctrl-c or crash
+//! 2. Set shutdown flag─── Stops accepting new work
+//! 3. Stop gRPC       ─── No new user transactions
+//! 4. Signal P2P      ─── Stop accepting network messages
+//! 5. Shutdown Mempool─── Safe (consensus is done)
 //! 6. Wait P2P        ─── Finish pending broadcasts
 //! ```
 //!
@@ -111,21 +113,12 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(10);
 /// # Example
 ///
 /// ```ignore
-/// // Load config from file
 /// let config = NodeConfig::from_path("config.toml")?;
 /// let identity = ValidatorIdentity::generate();
 /// let logger = create_logger();
 ///
-/// // Spawn all services
 /// let node = ValidatorNode::<6, 1, 3>::from_config(config, identity, logger)?;
-///
-/// // Wait for P2P bootstrap
-/// node.wait_ready().await;
-///
-/// // Node is now running and participating in consensus...
-///
-/// // Graceful shutdown
-/// node.shutdown(Duration::from_secs(10))?;
+/// node.run().await?;  // Blocks until ctrl-c or consensus exit
 /// ```
 pub struct ValidatorNode<const N: usize, const F: usize, const M_SIZE: usize> {
     /// P2P service handle for network operations.
@@ -425,65 +418,67 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ValidatorNode<N, F, M_
             && self.p2p_handle.is_ready()
     }
 
-    /// Performs hierarchical shutdown of all services.
+    /// Runs the node until it stops (ctrl-c or a service crash), then shuts down.
     ///
-    /// ## Shutdown Order (dependency-aware)
-    ///
-    /// ```text
-    /// 1. Stop gRPC       ─── No new user transactions
-    /// 2. Signal P2P      ─── Stop accepting network messages
-    /// 3. Signal Consensus─── Stop after current view
-    /// 4. Wait Consensus  ─── May still request proposals from mempool
-    /// 5. Shutdown Mempool─── Now safe (consensus is done)
-    /// 6. Wait P2P        ─── Finish pending broadcasts
-    /// ```
-    ///
-    /// Key insight: **Consensus depends on Mempool** for proposal building,
-    /// so Mempool must stay alive until Consensus finishes.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for consensus shutdown
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) if all services shut down cleanly, Err otherwise.
-    pub fn shutdown(mut self, timeout: Duration) -> Result<()> {
-        slog::info!(self.logger, "Beginning hierarchical shutdown");
+    /// This waits for P2P bootstrap, then blocks until either a ctrl-c signal
+    /// is received or the consensus engine exits unexpectedly. Then performs
+    /// hierarchical shutdown of all services.
+    pub async fn run(self) -> Result<()> {
+        self.wait_ready().await;
+        slog::info!(self.logger, "Node is ready and participating in consensus");
 
-        // Step 1: Set global shutdown flag (stops accepting new work)
-        self.shutdown.store(true, Ordering::Release);
+        let Self {
+            p2p_handle,
+            consensus_engine,
+            mut mempool_service,
+            shutdown,
+            grpc_shutdown,
+            logger,
+            ..
+        } = self;
 
-        // Step 2: Stop gRPC server (no new user transactions)
-        self.grpc_shutdown.notify_one();
-        slog::debug!(self.logger, "gRPC server shutdown signaled");
+        // Wait until ctrl-c or consensus thread exit
+        let consensus_shutdown = consensus_engine.shutdown_signal();
+        let consensus_future = consensus_engine.into_future();
+        tokio::pin!(consensus_future);
 
-        // Step 3: Signal P2P to stop (no new network messages)
-        self.p2p_handle.shutdown();
-        slog::debug!(self.logger, "P2P service signaled");
+        let consensus_result = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                slog::info!(logger, "Received ctrl-c");
+                consensus_shutdown.store(true, Ordering::Relaxed);
+                consensus_future.await
+            }
+            result = &mut consensus_future => result,
+        };
 
-        // Step 4: Signal consensus engine to stop
-        // Consensus may still request proposals from mempool during wind-down
-        self.consensus_engine.shutdown();
-        slog::debug!(self.logger, "Consensus engine signaled");
+        slog::info!(logger, "Beginning hierarchical shutdown");
 
-        // Step 5: Wait for consensus engine to finish
-        // Mempool is still running to serve any final proposal requests
-        self.consensus_engine
-            .shutdown_and_wait(timeout)
-            .context("Consensus engine shutdown failed")?;
-        slog::debug!(self.logger, "Consensus engine shutdown complete");
+        if let Err(ref e) = consensus_result {
+            slog::error!(logger, "Consensus engine error"; "error" => %e);
+        }
+        slog::debug!(logger, "Consensus engine shutdown complete");
 
-        // Step 6: Shutdown mempool (now safe - consensus is done)
-        self.mempool_service.shutdown();
-        slog::debug!(self.logger, "Mempool service shutdown complete");
+        // Set global shutdown flag
+        shutdown.store(true, Ordering::Release);
 
-        // Step 7: Wait for P2P thread to finish pending broadcasts
-        let _ = self.p2p_handle.join();
-        slog::debug!(self.logger, "P2P service shutdown complete");
+        // Stop gRPC server
+        grpc_shutdown.notify_one();
+        slog::debug!(logger, "gRPC server shutdown signaled");
 
-        slog::info!(self.logger, "ValidatorNode shutdown complete");
-        Ok(())
+        // Signal P2P to stop
+        p2p_handle.shutdown();
+        slog::debug!(logger, "P2P service signaled");
+
+        // Shutdown mempool (safe — consensus is done)
+        mempool_service.shutdown();
+        slog::debug!(logger, "Mempool service shutdown complete");
+
+        // Wait for P2P thread to finish
+        let _ = p2p_handle.join();
+        slog::debug!(logger, "P2P service shutdown complete");
+
+        slog::info!(logger, "ValidatorNode shutdown complete");
+        consensus_result
     }
 }
 

@@ -167,6 +167,8 @@
 //! behavior.
 
 use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
     str::FromStr,
     sync::{
         Arc,
@@ -205,10 +207,7 @@ pub struct ConsensusEngine<const N: usize, const F: usize, const M_SIZE: usize> 
     shutdown_signal: Arc<AtomicBool>,
 
     /// Handle to the consensus state machine thread
-    thread_handle: Option<JoinHandle<Result<()>>>,
-
-    /// Logger for the consensus engine
-    logger: slog::Logger,
+    thread_handle: JoinHandle<Result<()>>,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, M_SIZE> {
@@ -334,8 +333,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
         Ok(Self {
             replica_id,
             shutdown_signal,
-            thread_handle: Some(thread_handle),
-            logger,
+            thread_handle,
         })
     }
 
@@ -345,80 +343,63 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusEngine<N, F, 
     }
 
     /// Checks if the consensus engine is still running.
-    ///
-    /// # Returns
-    /// `true` if the thread is still alive, `false` otherwise
     pub fn is_running(&self) -> bool {
-        !self.shutdown_signal.load(Ordering::Relaxed)
-            && self
-                .thread_handle
-                .as_ref()
-                .map(|h| !h.is_finished())
-                .unwrap_or(false)
+        !self.shutdown_signal.load(Ordering::Relaxed) && !self.thread_handle.is_finished()
+    }
+
+    /// Returns a handle that can signal shutdown after the engine has been moved.
+    pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_signal)
     }
 
     /// Initiates a graceful shutdown of the consensus engine.
     ///
-    /// This sets the shutdown signal but does not wait for the thread to finish.
-    /// Use [`shutdown_and_wait`](Self::shutdown_and_wait) to wait for completion.
+    /// Sets the shutdown signal but does not wait for the thread to finish.
+    /// Await the engine to wait for completion.
     pub fn shutdown(&self) {
-        slog::info!(
-            self.logger,
-            "Shutting down consensus engine for replica {}",
-            self.replica_id
-        );
         self.shutdown_signal.store(true, Ordering::Relaxed);
     }
 
-    /// Initiates a graceful shutdown and waits for the consensus thread to finish.
-    ///
-    /// # Arguments
-    /// * `timeout` - Maximum time to wait for shutdown
-    ///
-    /// # Returns
-    /// The result from the state machine thread, or an error if timeout occurs
-    pub fn shutdown_and_wait(mut self, timeout: Duration) -> Result<()> {
+    /// Signals shutdown and blocks until the consensus thread finishes.
+    pub fn shutdown_and_wait(self, timeout: Duration) -> Result<()> {
         self.shutdown();
 
-        if let Some(handle) = self.thread_handle.take() {
-            // Try to join with timeout
-            let start = std::time::Instant::now();
-
-            while !handle.is_finished() && start.elapsed() < timeout {
-                thread::sleep(Duration::from_millis(10));
-            }
-
-            if handle.is_finished() {
-                handle
-                    .join()
-                    .map_err(|e| anyhow::anyhow!("Consensus thread panicked: {:?}", e))??;
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Consensus thread did not shutdown within {:?}",
-                    timeout
-                ));
-            }
+        let start = std::time::Instant::now();
+        while !self.thread_handle.is_finished() && start.elapsed() < timeout {
+            thread::sleep(Duration::from_millis(10));
         }
 
-        slog::info!(
-            self.logger,
-            "Consensus engine shut down for replica {}",
-            self.replica_id
-        );
-
-        Ok(())
+        if self.thread_handle.is_finished() {
+            self.thread_handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("Consensus thread panicked: {:?}", e))?
+        } else {
+            Err(anyhow::anyhow!(
+                "Consensus thread did not shutdown within {:?}",
+                timeout
+            ))
+        }
     }
 }
 
-impl<const N: usize, const F: usize, const M_SIZE: usize> Drop for ConsensusEngine<N, F, M_SIZE> {
-    fn drop(&mut self) {
-        // Ensure shutdown is called
-        self.shutdown();
+/// Awaiting a `ConsensusEngine` blocks until the consensus thread exits — whether
+/// normally, on error, or on panic. This consumes the engine.
+impl<const N: usize, const F: usize, const M_SIZE: usize> IntoFuture
+    for ConsensusEngine<N, F, M_SIZE>
+{
+    type Output = Result<()>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
-        // Try to join the thread (but don't wait too long)
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                self.thread_handle
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("Consensus thread panicked: {:?}", e))?
+            })
+            .await
+            .context("Failed to join consensus thread")?
+        })
     }
 }
 
