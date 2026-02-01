@@ -417,4 +417,3 @@ fn create_logger(level: &str) -> Logger {
     let drain = slog_async::Async::new(drain).build().fuse();
     Logger::root(drain, o!("version" => env!("CARGO_PKG_VERSION")))
 }
-

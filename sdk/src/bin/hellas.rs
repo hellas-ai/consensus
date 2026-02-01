@@ -7,7 +7,13 @@ use std::time::Duration;
 #[command(name = "hellas", about = "Hellas blockchain CLI", version)]
 struct Cli {
     /// gRPC endpoint of a Hellas node
-    #[arg(long, short, global = true, default_value = "http://localhost:50051", env = "HELLAS_ENDPOINT")]
+    #[arg(
+        long,
+        short,
+        global = true,
+        default_value = "http://localhost:50051",
+        env = "HELLAS_ENDPOINT"
+    )]
     endpoint: String,
 
     #[command(subcommand)]
@@ -198,10 +204,22 @@ async fn handle_account(endpoint: &str, cmd: AccountCommand) -> Result<()> {
             println!("nonce:   {}", acc.nonce);
         }
         AccountCommand::Balance { address } => {
-            println!("{}", client.account().get_balance(&parse_address(&address)?).await?);
+            println!(
+                "{}",
+                client
+                    .account()
+                    .get_balance(&parse_address(&address)?)
+                    .await?
+            );
         }
         AccountCommand::Nonce { address } => {
-            println!("{}", client.account().get_nonce(&parse_address(&address)?).await?);
+            println!(
+                "{}",
+                client
+                    .account()
+                    .get_nonce(&parse_address(&address)?)
+                    .await?
+            );
         }
     }
     Ok(())
@@ -211,20 +229,40 @@ async fn handle_block(endpoint: &str, cmd: BlockCommand) -> Result<()> {
     let client = HellasClient::connect(endpoint).await?;
     match cmd {
         BlockCommand::Get { hash } => {
-            let block = client.blocks().get(&parse_hash(&hash)?).await?.context("block not found")?;
+            let block = client
+                .blocks()
+                .get(&parse_hash(&hash)?)
+                .await?
+                .context("block not found")?;
             print_block(&block);
         }
         BlockCommand::Height { height } => {
-            let block = client.blocks().get_by_height(height).await?.context("block not found")?;
+            let block = client
+                .blocks()
+                .get_by_height(height)
+                .await?
+                .context("block not found")?;
             print_block(&block);
         }
         BlockCommand::Latest => {
-            let block = client.blocks().get_latest().await?.context("no blocks yet")?;
+            let block = client
+                .blocks()
+                .get_latest()
+                .await?
+                .context("no blocks yet")?;
             print_block(&block);
         }
         BlockCommand::Range { from, limit } => {
-            for (i, block) in client.blocks().get_range(from, limit).await?.iter().enumerate() {
-                if i > 0 { println!(); }
+            for (i, block) in client
+                .blocks()
+                .get_range(from, limit)
+                .await?
+                .iter()
+                .enumerate()
+            {
+                if i > 0 {
+                    println!();
+                }
                 print_block(block);
             }
         }
@@ -238,12 +276,18 @@ async fn handle_tx(endpoint: &str, cmd: TxCommand) -> Result<()> {
         match client.get_transaction_status(&parse_hash(&hash)?).await? {
             TxStatus::Pending => println!("status: pending"),
             TxStatus::NotFound => println!("status: not found"),
-            TxStatus::MNotarized { block_hash, block_height } => {
+            TxStatus::MNotarized {
+                block_hash,
+                block_height,
+            } => {
                 println!("status:       m-notarized");
                 println!("block_hash:   {block_hash}");
                 println!("block_height: {block_height}");
             }
-            TxStatus::Finalized { block_hash, block_height } => {
+            TxStatus::Finalized {
+                block_hash,
+                block_height,
+            } => {
                 println!("status:       finalized");
                 println!("block_hash:   {block_hash}");
                 println!("block_height: {block_height}");
@@ -259,9 +303,11 @@ async fn handle_tx(endpoint: &str, cmd: TxCommand) -> Result<()> {
         TxCommand::Mint { to, amount, args } => {
             (args, TxBuilder::mint(parse_address(&to)?, amount))
         }
-        TxCommand::Burn { address, amount, args } => {
-            (args, TxBuilder::burn(parse_address(&address)?, amount))
-        }
+        TxCommand::Burn {
+            address,
+            amount,
+            args,
+        } => (args, TxBuilder::burn(parse_address(&address)?, amount)),
         TxCommand::CreateAccount { address, args } => {
             (args, TxBuilder::create_account(parse_address(&address)?))
         }
