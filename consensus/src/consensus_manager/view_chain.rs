@@ -859,6 +859,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
+    /// Returns the oldest non-finalized view that has enough votes for L-notarization
+    /// and has a block present, making it eligible for finalization.
+    ///
+    /// Used by the periodic finalization retry to catch views where the normal
+    /// finalization path was missed due to message ordering or processing errors.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        for (&view_num, ctx) in &self.non_finalized_views {
+            if view_num < self.current_view
+                && ctx.votes.len() >= N - F
+                && ctx.block.is_some()
+                && ctx.block_hash.is_some()
+                && ctx.m_notarization.is_some()
+            {
+                return Some((view_num, ctx.block_hash.unwrap()));
+            }
+        }
+        None
+    }
+
     /// Persists an L-notarized view to storage as a finalized block.
     ///
     /// This method commits the block to the ledger by persisting all consensus artifacts:

@@ -8,8 +8,40 @@ use crate::transaction::{SignedTransaction, TxReceipt, TxStatus};
 use crate::types::Hash;
 use grpc_client::proto::transaction_service_client::TransactionServiceClient;
 use grpc_client::proto::{GetTransactionRequest, SubmitTransactionRequest};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tonic::transport::Channel;
+use tonic::codegen::Service;
+use tonic::codegen::http;
+use tonic::transport::{Channel, ClientTlsConfig};
+
+/// Adapter that allows [`Channel`] to accept any body type by converting
+/// it to [`tonic::body::Body`] via boxing. This bridges `GrpcWebClientService`
+/// (which wraps request bodies in `GrpcWebCall<B>`) with `Channel` (which
+/// only accepts `tonic::body::Body`).
+#[derive(Clone)]
+pub(crate) struct BodyAdapter(Channel);
+
+impl<B> Service<http::Request<B>> for BodyAdapter
+where
+    B: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = tonic::transport::Error;
+    type Future = <Channel as Service<http::Request<tonic::body::Body>>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Service::poll_ready(&mut self.0, cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let req = req.map(tonic::body::Body::new);
+        Service::call(&mut self.0, req)
+    }
+}
+
+/// The gRPC service type used by all SDK clients.
+pub(crate) type GrpcChannel = tonic_web::GrpcWebClientService<BodyAdapter>;
 
 /// Configuration for connecting to a Hellas node.
 #[derive(Clone, Debug)]
@@ -58,7 +90,7 @@ impl ClientConfig {
 /// let balance = client.account().get_balance(&address).await?;
 /// ```
 pub struct HellasClient {
-    channel: Channel,
+    channel: GrpcChannel,
     #[allow(dead_code)]
     config: ClientConfig,
 }
@@ -75,11 +107,16 @@ impl HellasClient {
 
     /// Connect with custom configuration.
     pub async fn connect_with_config(config: ClientConfig) -> Result<Self> {
-        let channel = Channel::from_shared(config.endpoint.clone())?
-            .timeout(config.timeout)
-            .connect()
-            .await
-            .map_err(Error::ConnectionFailed)?;
+        let mut endpoint = Channel::from_shared(config.endpoint.clone())?.timeout(config.timeout);
+
+        if config.endpoint.starts_with("https://") {
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .map_err(Error::ConnectionFailed)?;
+        }
+
+        let channel = endpoint.connect().await.map_err(Error::ConnectionFailed)?;
+        let channel = tonic_web::GrpcWebClientService::new(BodyAdapter(channel));
 
         Ok(Self { channel, config })
     }

@@ -1,10 +1,10 @@
 //! Account-related operations
 
+use crate::client::GrpcChannel;
 use crate::error::Result;
 use crate::types::Address;
 use grpc_client::proto::account_service_client::AccountServiceClient;
 use grpc_client::proto::{GetAccountRequest, GetNonceRequest};
-use tonic::transport::Channel;
 
 /// Account information.
 #[derive(Debug, Clone)]
@@ -19,11 +19,11 @@ pub struct Account {
 
 /// Client for account operations.
 pub struct AccountClient {
-    client: AccountServiceClient<Channel>,
+    client: AccountServiceClient<GrpcChannel>,
 }
 
 impl AccountClient {
-    pub(crate) fn new(channel: Channel) -> Self {
+    pub(crate) fn new(channel: GrpcChannel) -> Self {
         Self {
             client: AccountServiceClient::new(channel),
         }

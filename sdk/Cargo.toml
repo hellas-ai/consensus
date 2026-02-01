@@ -5,9 +5,18 @@ license     = "Apache-2.0"
 name        = "hellas-sdk"
 version     = "0.1.0"
 
+[features]
+cli = [ "clap" ]
+
+[[bin]]
+name              = "hellas"
+path              = "src/bin/hellas.rs"
+required-features = [ "cli" ]
+
 [dependencies]
 anyhow        = { workspace = true }
 bytes         = { workspace = true }
+clap          = { workspace = true, optional = true }
 consensus     = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures       = { workspace = true }
@@ -19,6 +28,7 @@ thiserror     = { workspace = true }
 tokio         = { workspace = true }
 tokio-stream  = { workspace = true }
 tonic         = { workspace = true }
+tonic-web     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
