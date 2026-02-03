@@ -1,4 +1,7 @@
 //! Peer identity and registry management.
+//!
+//! Uses an **anonymous RPC model**: validators are explicitly registered,
+//! while any non-validator peer is implicitly treated as an RPC node.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,6 +13,11 @@ use consensus::crypto::aggregated::PeerId;
 ///
 /// Uses raw 32-byte public keys since commonware's ed25519::PublicKey
 /// has limited construction options from bytes.
+///
+/// # Anonymous RPC Model
+/// - Validators are explicitly registered with their BLS identities
+/// - Any connected peer not in the validator set is treated as an RPC node
+/// - Connection limits (max_rpc_connections) are enforced at the network layer
 pub struct PeerRegistry {
     /// Map from ED25519 public key bytes to BLS peer ID.
     ed25519_to_bls: HashMap<[u8; 32], PeerId>,
@@ -56,6 +64,11 @@ impl PeerRegistry {
     /// Check if a peer is a known validator.
     pub fn is_validator(&self, ed25519_key_bytes: &[u8; 32]) -> bool {
         self.ed25519_to_bls.contains_key(ed25519_key_bytes)
+    }
+
+    /// Check if a peer is an RPC node (i.e., not a consensus validator node).
+    pub fn is_rpc_node(&self, ed25519_key_bytes: &[u8; 32]) -> bool {
+        !self.is_validator(ed25519_key_bytes)
     }
 }
 

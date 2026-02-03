@@ -23,7 +23,7 @@ use crate::{
         address::Address,
         block::Block,
         leader::Leader,
-        notarizations::{MNotarization, Vote},
+        notarizations::{LNotarization, MNotarization, Vote},
         nullify::{Nullification, Nullify},
         transaction::Transaction,
         view::View,
@@ -44,17 +44,26 @@ pub struct PendingStateSnapshot {
     pending_diffs: BTreeMap<u64, Arc<StateDiff>>,
     /// The highest l-notarized (finalized) view.
     last_finalized_view: u64,
-    /// Reference to finalized state in DB.
-    store: Arc<ConsensusStore>,
+    /// Reference to finalized state in DB. None for empty snapshots (RPC nodes).
+    store: Option<Arc<ConsensusStore>>,
 }
 
 impl PendingStateSnapshot {
-    /// Creates an empty snapshot.
+    /// Creates a new snapshot with store reference.
     pub fn new(store: Arc<ConsensusStore>, last_finalized_view: u64) -> Self {
         Self {
             pending_diffs: BTreeMap::new(),
             last_finalized_view,
-            store,
+            store: Some(store),
+        }
+    }
+
+    /// Creates an empty snapshot for RPC nodes that don't track pending state.
+    pub fn empty() -> Self {
+        Self {
+            pending_diffs: BTreeMap::new(),
+            last_finalized_view: 0,
+            store: None,
         }
     }
     /// Gets the effective account state by overlaying pending diffs on finalized state.
@@ -104,8 +113,9 @@ impl PendingStateSnapshot {
     }
 
     fn fetch_from_db(&self, address: &Address) -> Option<AccountState> {
+        let store = self.store.as_ref()?;
         let public_key = address.to_public_key()?;
-        let account = self.store.get_account(&public_key).ok()??;
+        let account = store.get_account(&public_key).ok()??;
         Some(AccountState {
             balance: account.balance,
             nonce: account.nonce,
@@ -200,7 +210,7 @@ impl PendingStateWriter {
         let snapshot = PendingStateSnapshot {
             pending_diffs: self.pending_diffs.clone(),
             last_finalized_view: self.last_finalized_view,
-            store: Arc::clone(&self.store),
+            store: Some(Arc::clone(&self.store)),
         };
         // Atomic swap - readers see old or new, never partial state
         self.shared.store(Arc::new(snapshot));
@@ -265,6 +275,15 @@ impl PendingStateWriter {
         notarization: &MNotarization<N, F, M_SIZE>,
     ) -> anyhow::Result<()> {
         self.store.put_notarization(notarization)
+    }
+
+    /// Stores an L-notarization (N-F vote proof for block finalization).
+    /// This is the finality certificate that light clients can use to verify blocks.
+    pub fn put_l_notarization<const N: usize, const F: usize>(
+        &self,
+        l_notarization: &LNotarization<N, F>,
+    ) -> anyhow::Result<()> {
+        self.store.put_l_notarization(l_notarization)
     }
 
     /// Stores a nullification (2F+1 nullify proof for view progression).
@@ -357,6 +376,15 @@ impl PendingStateReader {
     #[inline]
     pub fn get_account(&self, address: &Address) -> Option<AccountState> {
         self.load().get_account(address)
+    }
+
+    /// Creates an empty reader for RPC nodes that don't track pending state.
+    ///
+    /// RPC nodes only serve finalized data and don't need M-notarized pending state.
+    /// The returned reader has empty pending diffs and no store reference.
+    pub fn empty() -> Self {
+        let shared = Arc::new(ArcSwap::new(Arc::new(PendingStateSnapshot::empty())));
+        Self { shared }
     }
 }
 

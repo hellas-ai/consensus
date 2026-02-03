@@ -53,10 +53,11 @@ use crate::{
         CollectedNullificationsResult, CollectedVotesResult, LeaderProposalResult, ShouldMNotarize,
         ViewContext,
     },
+    crypto::aggregated::BlsSignature,
     state::{
         block::Block,
         leader::Leader,
-        notarizations::{MNotarization, Vote},
+        notarizations::{LNotarization, MNotarization, Vote},
         nullify::{Nullification, Nullify},
         peer::PeerSet,
         view::View,
@@ -890,7 +891,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_writer.finalize_up_to(view_number)?;
 
         // Persist the block as finalized
-        if let Some(ref block) = ctx.block {
+        let (block_hash, height) = if let Some(ref block) = ctx.block {
             for tx in block.transactions.iter() {
                 self.persistence_writer.put_transaction(tx)?;
             }
@@ -898,11 +899,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             finalized_block.is_finalized = true;
             self.persistence_writer
                 .put_finalized_block(&finalized_block)?;
+
+            // Extract block_hash - should always be set when block exists
+            let hash = ctx
+                .block_hash
+                .ok_or_else(|| anyhow::anyhow!("View {view_number} has block but no block_hash"))?;
+            (hash, block.height)
         } else {
             return Err(anyhow::anyhow!(
                 "View number {view_number} has no block, but the view has been finalized"
             ));
-        }
+        };
 
         // Persist the M-notarization
         if let Some(ref m_notarization) = ctx.m_notarization {
@@ -927,6 +934,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         for vote in ctx.votes.iter() {
             self.persistence_writer.put_vote(vote)?;
         }
+
+        // Create and persist the L-notarization (finality certificate for light clients)
+        // Aggregate all vote signatures and collect peer IDs
+        let aggregated_signature = BlsSignature::aggregate(ctx.votes.iter().map(|v| &v.signature));
+        let peer_ids: Vec<_> = ctx.votes.iter().map(|v| v.peer_id).collect();
+
+        let l_notarization = LNotarization::<N, F>::new(
+            view_number,
+            block_hash,
+            aggregated_signature,
+            peer_ids,
+            height,
+        );
+        self.persistence_writer
+            .put_l_notarization(&l_notarization)?;
 
         Ok(())
     }

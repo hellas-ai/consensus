@@ -59,6 +59,16 @@ pub struct P2PConfig {
     /// Size of the transaction broadcast queue.
     #[serde(default = "default_tx_broadcast_queue_size")]
     pub tx_broadcast_queue_size: usize,
+
+    /// Whether this node is running in RPC-only mode.
+    /// RPC nodes don't participate in consensus but receive finalized blocks.
+    #[serde(default)]
+    pub rpc_mode: bool,
+
+    /// Maximum number of RPC node connections allowed (validators only).
+    /// Has no effect when `rpc_mode` is true.
+    #[serde(default = "default_max_rpc_connections")]
+    pub max_rpc_connections: usize,
 }
 
 fn default_max_message_size() -> u32 {
@@ -93,6 +103,10 @@ fn default_tx_broadcast_queue_size() -> usize {
     100_000
 }
 
+fn default_max_rpc_connections() -> usize {
+    100
+}
+
 impl Default for P2PConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +123,8 @@ impl Default for P2PConfig {
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             ping_interval_ms: default_ping_interval_ms(),
             tx_broadcast_queue_size: default_tx_broadcast_queue_size(),
+            rpc_mode: false,
+            max_rpc_connections: default_max_rpc_connections(),
         }
     }
 }

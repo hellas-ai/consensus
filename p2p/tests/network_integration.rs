@@ -30,6 +30,8 @@ fn create_test_config(port: u16) -> P2PConfig {
         bootstrap_timeout_ms: 100, // Short timeout for tests
         ping_interval_ms: 50,
         tx_broadcast_queue_size: 1_000,
+        rpc_mode: false,
+        max_rpc_connections: 100,
     }
 }
 

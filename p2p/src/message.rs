@@ -65,6 +65,9 @@ pub enum BlockResponse {
     Found {
         /// The block bytes (serialized).
         block_bytes: Vec<u8>,
+        /// The L-notarization proof bytes (serialized).
+        /// Optional for backward compatibility during transition.
+        l_notarization_bytes: Option<Vec<u8>>,
     },
     /// Block not found for the requested view.
     NotFound {
