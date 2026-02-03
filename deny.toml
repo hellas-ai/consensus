@@ -4,14 +4,8 @@
 [advisories]
 # The database of advisories to check against
 db-path = "~/.cargo/advisory-db"
-ignore  = [  ]
-
-[licenses]
-# We don't check licenses in this config, handled separately if needed
-allow-osi-fsf-free = "both"
-copyleft           = "allow"
-default            = "allow"
-unlicensed         = "allow"
+# paste is unmaintained but not a security issue - transitive dep from prost
+ignore = [ "RUSTSEC-2024-0436" ]
 
 [bans]
 # Lint level for when multiple versions of the same crate are detected
@@ -33,7 +27,6 @@ skip = [
     # Hash maps - different versions across ecosystem
     { name = "foldhash" },
     { name = "hashbrown" },
-    { name = "indexmap" },
 
     # Itertools - ark-* vs prost
     { name = "itertools" },
@@ -54,7 +47,6 @@ skip = [
     { name = "windows-result" },
     { name = "windows-strings" },
     { name = "windows-sys" },
-    { name = "windows-targets" },
 ]
 
 [sources]
