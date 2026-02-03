@@ -262,6 +262,44 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
         })
     }
 
+    /// Create multiple block requests for parallel fetching.
+    ///
+    /// Returns up to `batch_size` requests starting from the next needed height.
+    /// This enables faster catch-up by requesting blocks in parallel.
+    pub fn next_block_requests(&self) -> Vec<BlockRequest> {
+        let (start_height, end_height) = match &self.state {
+            SyncState::Discovering => {
+                // Just request height 1 to start discovery
+                return vec![BlockRequest {
+                    view: 1,
+                    block_hash: None,
+                }];
+            }
+            SyncState::Syncing { current, target } => {
+                if current >= target {
+                    return vec![];
+                }
+                let start = current + 1;
+                let end = std::cmp::min(start + self.config.batch_size as u64, *target + 1);
+                (start, end)
+            }
+            SyncState::Following { height } => {
+                // In following mode, just request next block
+                return vec![BlockRequest {
+                    view: height + 1,
+                    block_hash: None,
+                }];
+            }
+        };
+
+        (start_height..end_height)
+            .map(|view| BlockRequest {
+                view,
+                block_hash: None,
+            })
+            .collect()
+    }
+
     /// Set the target height when we learn it from a peer.
     pub fn set_target_height(&mut self, target: u64) {
         let current = self.local_height().unwrap_or(0);
@@ -290,6 +328,14 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
         use rand::seq::SliceRandom;
         let mut rng = rand::thread_rng();
         self.validators.choose(&mut rng).cloned()
+    }
+
+    /// Get a validator at a specific index (mod validator count) for round-robin distribution.
+    pub fn pick_validator_at(&self, index: usize) -> Option<ed25519::PublicKey> {
+        if self.validators.is_empty() {
+            return None;
+        }
+        Some(self.validators[index % self.validators.len()].clone())
     }
 }
 

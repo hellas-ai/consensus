@@ -232,18 +232,23 @@ impl<const N: usize, const F: usize> RpcNode<N, F> {
                     }
                 }
                 _ = sync_interval.tick() => {
-                    // Try to send a block request if syncer needs one
-                    if let Some(req) = syncer.next_block_request() {
-                        if let Some(target) = syncer.pick_validator() {
-                            slog::debug!(self.logger, "Requesting block";
-                                "view" => req.view,
-                                "target" => ?target
-                            );
-                            let cmd = BlockRequestCommand {
-                                target,
-                                request: req,
-                            };
-                            let _ = request_tx.send(cmd);
+                    // Try to send batch block requests for parallel fetching
+                    let requests = syncer.next_block_requests();
+                    if !requests.is_empty() {
+                        slog::debug!(self.logger, "Sending batch block requests";
+                            "count" => requests.len(),
+                            "first_view" => requests.first().map(|r| r.view),
+                            "last_view" => requests.last().map(|r| r.view)
+                        );
+                        for (i, req) in requests.into_iter().enumerate() {
+                            // Round-robin across validators for load distribution
+                            if let Some(target) = syncer.pick_validator_at(i) {
+                                let cmd = BlockRequestCommand {
+                                    target,
+                                    request: req,
+                                };
+                                let _ = request_tx.send(cmd);
+                            }
                         }
                     }
 

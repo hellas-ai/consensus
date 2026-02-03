@@ -95,6 +95,7 @@ impl P2PHandle {
 }
 
 /// Spawn the P2P service on a new thread.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn<E, const N: usize, const F: usize, const M_SIZE: usize>(
     runner: E,
     config: P2PConfig,

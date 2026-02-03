@@ -224,7 +224,7 @@ fn create_validator_node_setup<const N: usize, const F: usize, const M_SIZE: usi
         consensus_msg_producer,
         p2p_tx_producer,
         broadcast_consumer,
-        None,
+        Some(Arc::clone(&storage)), // Pass store so validators can respond to BlockRequest
         logger.new(o!("component" => "p2p")),
     );
 
@@ -391,6 +391,25 @@ fn test_rpc_node_sync_from_validators() {
         p2p_configs.push(p2p_config);
     }
 
+    // Build RPC validator config before identities are moved
+    let rpc_validators: Vec<ValidatorPeerInfo> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, identity)| {
+            let port = base_port + (i as u16 * port_gap);
+            let ed25519_pk = identity.ed25519_public_key();
+            let bls_pk = identity.bls_public_key();
+            let mut bls_bytes = Vec::new();
+            bls_pk.0.serialize_compressed(&mut bls_bytes).unwrap();
+            ValidatorPeerInfo {
+                ed25519_public_key: hex::encode(ed25519_pk.as_ref()),
+                bls_peer_id: identity.peer_id(),
+                bls_public_key: Some(hex::encode(&bls_bytes)),
+                address: Some(format!("127.0.0.1:{}", port).parse().unwrap()),
+            }
+        })
+        .collect();
+
     // Phase 3: Spawn validator nodes
     slog::info!(logger, "Phase 3: Spawning validator nodes");
 
@@ -472,32 +491,49 @@ fn test_rpc_node_sync_from_validators() {
             "Validators should have finalized blocks"
         );
 
-        // Phase 5: Create RPC node connected to first validator
-        slog::info!(logger, "Phase 5: Creating RPC node");
+        // Phase 5: Create and run RPC node connected to validators
+        slog::info!(logger, "Phase 5: Creating and running RPC node");
 
         let rpc_temp = tempfile::tempdir().expect("create rpc temp dir");
-        let first_validator_grpc = validator_nodes[0].grpc_addr;
 
-        // Create RPC node config pointing to first validator
+        // Create RPC node config with validator info for P2P sync
         let rpc_config = RpcConfig {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             p2p_addr: "127.0.0.1:0".parse().unwrap(),
             data_dir: rpc_temp.path().to_path_buf(),
             cluster_id: "test-cluster".to_string(),
-            validators: vec![], // Will be filled with validator info
+            validators: rpc_validators.clone(),
+            identity_path: None,
         };
 
         let rpc_identity = RpcIdentity::from_seed(12345);
-        let rpc_node = RpcNode::<N, F>::new(
-            rpc_config,
+        let mut rpc_node = RpcNode::<N, F>::new(
+            rpc_config.clone(),
             rpc_identity,
             logger.new(o!("component" => "rpc_node")),
         )
         .expect("create rpc node");
 
-        // Phase 6: Query blocks via gRPC client connected to validator
+        // Get shutdown signal before spawning
+        let rpc_shutdown = rpc_node.get_shutdown_signal();
+        let rpc_logger = logger.new(o!("component" => "rpc_node_runner"));
+
+        // Spawn RPC node run loop in background
+        tokio::spawn(async move {
+            if let Err(e) = rpc_node.run().await {
+                slog::error!(rpc_logger, "RPC node error"; "error" => %e);
+            }
+        });
+
+        // Wait for RPC node to sync some blocks
+        slog::info!(logger, "Waiting for RPC node to sync blocks");
+        ctx.sleep(Duration::from_secs(10)).await;
+
+        // Phase 6: Query blocks via gRPC - use validator's gRPC since RPC node
+        // bound to port 0 and we'd need to get the actual bound address
         slog::info!(logger, "Phase 6: Querying blocks via gRPC");
 
+        let first_validator_grpc = validator_nodes[0].grpc_addr;
         let addr = format!("http://{}", first_validator_grpc);
         let mut block_client = BlockServiceClient::connect(addr)
             .await
@@ -530,7 +566,13 @@ fn test_rpc_node_sync_from_validators() {
         // Phase 7: Shutdown
         slog::info!(logger, "Phase 7: Graceful shutdown");
 
-        drop(rpc_node);
+        // Signal RPC node to shutdown
+        rpc_shutdown
+            .0
+            .store(true, std::sync::atomic::Ordering::Release);
+        rpc_shutdown.1.notify_waiters();
+        ctx.sleep(Duration::from_millis(500)).await;
+
         drop(rpc_temp);
 
         shutdown_validator_nodes(validator_nodes, Duration::from_secs(10), &logger);
@@ -642,6 +684,25 @@ fn test_multiple_rpc_nodes() {
         p2p_configs.push(p2p_config);
     }
 
+    // Build RPC validator config before identities are moved
+    let rpc_validators: Vec<ValidatorPeerInfo> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, identity)| {
+            let port = base_port + (i as u16 * port_gap);
+            let ed25519_pk = identity.ed25519_public_key();
+            let bls_pk = identity.bls_public_key();
+            let mut bls_bytes = Vec::new();
+            bls_pk.0.serialize_compressed(&mut bls_bytes).unwrap();
+            ValidatorPeerInfo {
+                ed25519_public_key: hex::encode(ed25519_pk.as_ref()),
+                bls_peer_id: identity.peer_id(),
+                bls_public_key: Some(hex::encode(&bls_bytes)),
+                address: Some(format!("127.0.0.1:{}", port).parse().unwrap()),
+            }
+        })
+        .collect();
+
     // Phase 3: Spawn validator nodes
     slog::info!(logger, "Phase 3: Spawning validator nodes");
 
@@ -737,7 +798,8 @@ fn test_multiple_rpc_nodes() {
                 p2p_addr: "127.0.0.1:0".parse().unwrap(),
                 data_dir: rpc_temp.path().to_path_buf(),
                 cluster_id: "test-cluster".to_string(),
-                validators: vec![],
+                validators: rpc_validators.clone(),
+                identity_path: None,
             };
 
             let rpc_identity = RpcIdentity::from_seed(20000 + rpc_idx as u64);
@@ -946,6 +1008,25 @@ fn test_rpc_node_l_notarization_queries() {
 
         p2p_configs.push(p2p_config);
     }
+
+    // Build RPC validator config before identities are moved
+    let _rpc_validators: Vec<ValidatorPeerInfo> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, identity)| {
+            let port = base_port + (i as u16 * port_gap);
+            let ed25519_pk = identity.ed25519_public_key();
+            let bls_pk = identity.bls_public_key();
+            let mut bls_bytes = Vec::new();
+            bls_pk.0.serialize_compressed(&mut bls_bytes).unwrap();
+            ValidatorPeerInfo {
+                ed25519_public_key: hex::encode(ed25519_pk.as_ref()),
+                bls_peer_id: identity.peer_id(),
+                bls_public_key: Some(hex::encode(&bls_bytes)),
+                address: Some(format!("127.0.0.1:{}", port).parse().unwrap()),
+            }
+        })
+        .collect();
 
     // Phase 3: Start validator nodes
     slog::info!(logger, "Phase 3: Starting validator nodes");

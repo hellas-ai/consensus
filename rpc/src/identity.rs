@@ -59,6 +59,45 @@ impl RpcIdentity {
         bytes.copy_from_slice(pk.as_ref());
         bytes
     }
+
+    /// Save identity seed to a file (hex-encoded).
+    ///
+    /// # Security
+    /// The file will contain the private key material. Ensure proper file permissions.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "{:016x}", self.seed)?;
+        Ok(())
+    }
+
+    /// Load identity from a seed file (hex-encoded).
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let seed = u64::from_str_radix(contents.trim(), 16)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// Load identity from file if it exists, otherwise generate and save.
+    pub fn load_or_generate<R: RngCore + CryptoRng>(
+        path: Option<&std::path::Path>,
+        rng: &mut R,
+    ) -> std::io::Result<Self> {
+        match path {
+            Some(p) if p.exists() => Self::load_from_file(p),
+            Some(p) => {
+                let identity = Self::generate(rng);
+                identity.save_to_file(p)?;
+                Ok(identity)
+            }
+            None => Ok(Self::generate(rng)),
+        }
+    }
 }
 
 impl Drop for RpcIdentity {

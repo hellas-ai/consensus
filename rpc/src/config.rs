@@ -30,6 +30,10 @@ pub struct RpcConfig {
     /// Cluster identifier (must match validators).
     #[serde(default = "default_cluster_id")]
     pub cluster_id: String,
+
+    /// Path to identity file (Ed25519 seed). If not set, generates new identity each run.
+    #[serde(default)]
+    pub identity_path: Option<PathBuf>,
 }
 
 fn default_grpc_addr() -> SocketAddr {
@@ -56,6 +60,7 @@ impl Default for RpcConfig {
             p2p_addr: default_p2p_addr(),
             data_dir: default_data_dir(),
             cluster_id: default_cluster_id(),
+            identity_path: None,
         }
     }
 }
@@ -197,6 +202,7 @@ bls_peer_id = "999888777666555444"
             p2p_addr: "0.0.0.0:9002".parse().unwrap(),
             data_dir: PathBuf::from("/custom/path"),
             cluster_id: "my-cluster".to_string(),
+            identity_path: Some(PathBuf::from("/keys/identity.key")),
         };
 
         // Use figment's Serialized provider for roundtrip

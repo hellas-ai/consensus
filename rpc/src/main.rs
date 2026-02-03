@@ -67,10 +67,18 @@ async fn main() -> Result<()> {
     }
 
     // Generate or load identity
-    // TODO: Support loading from file
-    let identity = RpcIdentity::generate(&mut OsRng);
-    slog::info!(logger, "Generated RPC identity";
-        "public_key" => hex::encode(identity.public_key_bytes())
+    let identity = RpcIdentity::load_or_generate(config.identity_path.as_deref(), &mut OsRng)
+        .context("Failed to load or generate identity")?;
+
+    let action = if config.identity_path.as_ref().is_some_and(|p| p.exists()) {
+        "Loaded"
+    } else {
+        "Generated"
+    };
+
+    slog::info!(logger, "{} RPC identity", action;
+        "public_key" => hex::encode(identity.public_key_bytes()),
+        "path" => ?config.identity_path
     );
 
     // Create and run node (N=6 validators, F=1 faulty)

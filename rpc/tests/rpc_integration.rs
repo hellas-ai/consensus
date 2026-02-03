@@ -28,6 +28,7 @@ fn create_test_config(grpc_port: u16, p2p_port: u16, data_dir: PathBuf) -> RpcCo
         data_dir,
         cluster_id: "test-cluster".to_string(),
         validators: vec![],
+        identity_path: None,
     }
 }
 
