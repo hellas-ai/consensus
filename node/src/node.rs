@@ -248,6 +248,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ValidatorNode<N, F, M_
         let bls_secret_key = identity.bls_secret_key().clone();
 
         // 8. Spawn P2P Service (creates tx broadcast queues)
+        // Validators pass storage to handle BlockRequest from RPC nodes
         let p2p_handle = spawn_p2p::<TokioRunner, N, F, M_SIZE>(
             TokioRunner::default(),
             p2p_config,
@@ -255,6 +256,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ValidatorNode<N, F, M_
             consensus_msg_producer,
             p2p_to_mempool_producer,
             broadcast_consumer,
+            Some(Arc::clone(&storage)),
             logger.new(o!("component" => "p2p")),
         );
         slog::debug!(logger, "P2P service spawned");

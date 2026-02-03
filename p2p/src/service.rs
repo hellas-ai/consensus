@@ -14,6 +14,7 @@ use commonware_runtime::{Clock, Metrics, Network, Resolver, Runner, Spawner};
 use consensus::consensus::ConsensusMessage;
 use consensus::crypto::aggregated::PeerId;
 use consensus::state::transaction::Transaction;
+use consensus::storage::store::ConsensusStore;
 use crossbeam::queue::ArrayQueue;
 use rand::{CryptoRng, RngCore};
 use rtrb::{Consumer, Producer};
@@ -101,6 +102,7 @@ pub fn spawn<E, const N: usize, const F: usize, const M_SIZE: usize>(
     consensus_producer: Producer<ConsensusMessage<N, F, M_SIZE>>,
     tx_producer: Producer<Transaction>,
     broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
+    store: Option<Arc<ConsensusStore>>,
     logger: Logger,
 ) -> P2PHandle
 where
@@ -143,6 +145,7 @@ where
                     tx_producer,
                     broadcast_consumer,
                     tx_broadcast_queue_clone,
+                    store,
                     shutdown_clone,
                     shutdown_notify_clone,
                     broadcast_notify_clone,
@@ -179,6 +182,7 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
     mut tx_producer: Producer<Transaction>,
     mut broadcast_consumer: Consumer<ConsensusMessage<N, F, M_SIZE>>,
     tx_broadcast_queue: Arc<ArrayQueue<Transaction>>,
+    store: Option<Arc<ConsensusStore>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     broadcast_notify: Arc<Notify>,
@@ -340,6 +344,63 @@ async fn run_p2p_service<C, const N: usize, const F: usize, const M_SIZE: usize>
                                 }
                                 P2PMessage::Pong(_ts) => {
                                     // Liveness confirmed (could track for metrics)
+                                }
+                                P2PMessage::BlockRequest(req) => {
+                                    // Handle block request from RPC nodes
+                                    // Note: req.view is actually the block height in current usage
+                                    if let Some(ref st) = store {
+                                        let response = match st.get_finalized_block_by_height(req.view) {
+                                            Ok(Some(block)) => {
+                                                // Serialize block
+                                                let block_bytes = consensus::storage::conversions::serialize_for_db(&block)
+                                                    .map(|b| b.to_vec())
+                                                    .unwrap_or_default();
+
+                                                // Get L-notarization for this block (if hash is available)
+                                                let l_notarization_bytes = block.hash.as_ref()
+                                                    .and_then(|hash| {
+                                                        st.get_l_notarization::<N, F>(hash)
+                                                            .ok()
+                                                            .flatten()
+                                                    })
+                                                    .and_then(|l_not| {
+                                                        consensus::storage::conversions::serialize_for_db(&l_not)
+                                                            .map(|b| b.to_vec())
+                                                            .ok()
+                                                    });
+
+                                                slog::debug!(logger, "Responding to block request";
+                                                    "view" => req.view,
+                                                    "has_l_notarization" => l_notarization_bytes.is_some()
+                                                );
+
+                                                crate::message::BlockResponse::Found {
+                                                    block_bytes,
+                                                    l_notarization_bytes,
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                slog::debug!(logger, "Block not found for request";
+                                                    "view" => req.view
+                                                );
+                                                crate::message::BlockResponse::NotFound { view: req.view }
+                                            }
+                                            Err(e) => {
+                                                slog::warn!(logger, "Error fetching block for request";
+                                                    "view" => req.view,
+                                                    "error" => ?e
+                                                );
+                                                crate::message::BlockResponse::NotFound { view: req.view }
+                                            }
+                                        };
+
+                                        // Send response back to requester
+                                        if let Ok(response_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::BlockResponse(response)) {
+                                            network.send_sync(response_bytes, vec![sender]).await;
+                                        }
+                                    } else {
+                                        slog::debug!(logger, "Received block request but no store available"; "view" => req.view);
+                                    }
                                 }
                                 _ => {
                                     slog::debug!(logger, "Received sync message"; "peer" => ?sender, "len" => msg.len());

@@ -224,6 +224,7 @@ fn create_validator_node_setup<const N: usize, const F: usize, const M_SIZE: usi
         consensus_msg_producer,
         p2p_tx_producer,
         broadcast_consumer,
+        None,
         logger.new(o!("component" => "p2p")),
     );
 
@@ -369,6 +370,7 @@ fn test_rpc_node_sync_from_validators() {
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -619,6 +621,7 @@ fn test_multiple_rpc_nodes() {
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -925,6 +928,7 @@ fn test_rpc_node_l_notarization_queries() {
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                     ed25519_public_key: pk_hex,
                     bls_peer_id: peer_set.sorted_peer_ids[j],
+                    bls_public_key: None,
                 });
             }
         }

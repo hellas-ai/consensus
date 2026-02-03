@@ -190,6 +190,7 @@ bls_peer_id = "999888777666555444"
             validators: vec![ValidatorPeerInfo {
                 ed25519_public_key: "abcd1234".to_string(),
                 bls_peer_id: 123456789,
+                bls_public_key: None,
                 address: Some("127.0.0.1:9000".parse().unwrap()),
             }],
             grpc_addr: "0.0.0.0:50053".parse().unwrap(),

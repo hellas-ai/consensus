@@ -288,6 +288,7 @@ mod tests {
             ed25519_public_key: pk_hex.clone(),
             address: Some("127.0.0.1:8080".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         let bytes = validator.parse_public_key_bytes();
@@ -305,6 +306,7 @@ mod tests {
             ed25519_public_key: "not_valid_hex".to_string(),
             address: None,
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         let bytes = validator.parse_public_key_bytes();
@@ -326,6 +328,7 @@ mod tests {
             ed25519_public_key: pk_hex,
             address: None, // No address!
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         // Simulating the filter_map logic from NetworkService::new
@@ -354,6 +357,7 @@ mod tests {
             ed25519_public_key: pk_hex,
             address: Some(addr),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         // Simulating the filter_map logic from NetworkService::new

@@ -10,6 +10,7 @@ use slog::Logger;
 
 use consensus::state::block::Block;
 use consensus::state::notarizations::LNotarization;
+use consensus::state::peer::PeerSet;
 use consensus::storage::store::ConsensusStore;
 use p2p::config::{P2PConfig, ValidatorPeerInfo};
 use p2p::message::{BlockRequest, BlockResponse};
@@ -59,6 +60,7 @@ pub struct BlockSyncer<const N: usize, const F: usize> {
     state: SyncState,
     config: SyncConfig,
     validators: Vec<ed25519::PublicKey>,
+    peer_set: PeerSet,
     logger: Logger,
 }
 
@@ -67,6 +69,7 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
     pub fn new(
         store: ConsensusStore,
         validators: Vec<ed25519::PublicKey>,
+        peer_set: PeerSet,
         config: SyncConfig,
         logger: Logger,
     ) -> Self {
@@ -75,6 +78,7 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
             state: SyncState::Discovering,
             config,
             validators,
+            peer_set,
             logger,
         }
     }
@@ -145,24 +149,29 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
                     ) {
                         Ok(l_notarization) => {
                             // Verify the L-notarization matches this block
-                            if l_notarization.block_hash == hash {
-                                if let Err(e) = self.store.put_l_notarization(&l_notarization) {
-                                    slog::warn!(self.logger, "Failed to store L-notarization";
-                                        "height" => height,
-                                        "error" => %e,
-                                    );
-                                } else {
-                                    slog::debug!(self.logger, "Stored L-notarization";
-                                        "height" => height,
-                                        "view" => l_notarization.view,
-                                        "signers" => l_notarization.peer_ids.len(),
-                                    );
-                                }
-                            } else {
+                            if l_notarization.block_hash != hash {
                                 slog::warn!(self.logger, "L-notarization block hash mismatch";
                                     "height" => height,
                                     "expected" => hex::encode(&hash[..8]),
                                     "got" => hex::encode(&l_notarization.block_hash[..8]),
+                                );
+                            } else if !l_notarization.verify(&self.peer_set) {
+                                // Verify BLS aggregate signature before storing
+                                slog::warn!(self.logger, "L-notarization signature verification failed";
+                                    "height" => height,
+                                    "view" => l_notarization.view,
+                                    "signers" => l_notarization.peer_ids.len(),
+                                );
+                            } else if let Err(e) = self.store.put_l_notarization(&l_notarization) {
+                                slog::warn!(self.logger, "Failed to store L-notarization";
+                                    "height" => height,
+                                    "error" => %e,
+                                );
+                            } else {
+                                slog::debug!(self.logger, "Stored verified L-notarization";
+                                    "height" => height,
+                                    "view" => l_notarization.view,
+                                    "signers" => l_notarization.peer_ids.len(),
                                 );
                             }
                         }
@@ -311,11 +320,30 @@ pub fn parse_validator_keys(validators: &[ValidatorPeerInfo]) -> Vec<ed25519::Pu
         .collect()
 }
 
+/// Parse validator BLS public keys from config and construct a PeerSet.
+///
+/// Returns a PeerSet containing all validators whose BLS public keys could be parsed.
+/// Validators without bls_public_key configured will be skipped.
+pub fn parse_validator_peer_set(validators: &[ValidatorPeerInfo]) -> PeerSet {
+    use ark_serialize::CanonicalDeserialize;
+    use consensus::crypto::aggregated::BlsPublicKey;
+
+    let bls_keys: Vec<BlsPublicKey> = validators
+        .iter()
+        .filter_map(|v| {
+            let bytes = v.parse_bls_public_key_bytes()?;
+            BlsPublicKey::deserialize_compressed(&*bytes).ok()
+        })
+        .collect();
+
+    PeerSet::new(bls_keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use commonware_cryptography::Signer;
-    use consensus::crypto::aggregated::BlsSignature;
+    use consensus::crypto::aggregated::{BlsSecretKey, BlsSignature};
     use consensus::state::block::Block;
     use tempfile::tempdir;
 
@@ -340,7 +368,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
         let logger = test_logger();
-        let syncer = BlockSyncer::<6, 1>::new(store, vec![], SyncConfig::default(), logger);
+        let syncer = BlockSyncer::<6, 1>::new(
+            store,
+            vec![],
+            PeerSet::new(vec![]),
+            SyncConfig::default(),
+            logger,
+        );
         (syncer, temp)
     }
 
@@ -542,6 +576,7 @@ mod tests {
         let syncer = BlockSyncer::<6, 1>::new(
             store,
             vec![public_key.clone()],
+            PeerSet::new(vec![]),
             SyncConfig::default(),
             logger,
         );
@@ -564,8 +599,13 @@ mod tests {
             })
             .collect();
 
-        let syncer =
-            BlockSyncer::<6, 1>::new(store, validators.clone(), SyncConfig::default(), logger);
+        let syncer = BlockSyncer::<6, 1>::new(
+            store,
+            validators.clone(),
+            PeerSet::new(vec![]),
+            SyncConfig::default(),
+            logger,
+        );
 
         // Pick multiple times, should always be from the list
         for _ in 0..10 {
@@ -585,7 +625,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
         let logger = test_logger();
-        let syncer = BlockSyncer::<6, 1>::new(store, vec![], config, logger);
+        let syncer = BlockSyncer::<6, 1>::new(store, vec![], PeerSet::new(vec![]), config, logger);
 
         assert_eq!(syncer.sync_interval(), Duration::from_millis(200));
         assert_eq!(syncer.request_timeout(), Duration::from_secs(10));
@@ -631,6 +671,7 @@ mod tests {
                 ed25519_public_key:
                     "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 bls_peer_id: 1,
+                bls_public_key: None,
             }],
             ..Default::default()
         };
@@ -658,6 +699,7 @@ mod tests {
             address: Some("10.0.0.1:9000".parse().unwrap()),
             ed25519_public_key: hex_key,
             bls_peer_id: 1,
+            bls_public_key: None,
         }];
 
         let keys = parse_validator_keys(&validators);
@@ -671,6 +713,7 @@ mod tests {
             address: Some("10.0.0.1:9000".parse().unwrap()),
             ed25519_public_key: "not_valid_hex".to_string(),
             bls_peer_id: 1,
+            bls_public_key: None,
         }];
 
         // Invalid keys should be skipped
@@ -684,6 +727,7 @@ mod tests {
             address: Some("10.0.0.1:9000".parse().unwrap()),
             ed25519_public_key: "0011223344".to_string(), // Too short
             bls_peer_id: 1,
+            bls_public_key: None,
         }];
 
         let keys = parse_validator_keys(&validators);
@@ -692,20 +736,46 @@ mod tests {
 
     #[test]
     fn test_handle_block_response_with_l_notarization() {
-        let (mut syncer, _temp) = create_test_syncer();
+        // Generate BLS keys for N-F=5 validators (N=6, F=1)
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+        let mut bls_keys = Vec::new();
+        let mut public_keys = Vec::new();
+        for _ in 0..5 {
+            let sk = BlsSecretKey::generate(&mut rng);
+            public_keys.push(sk.public_key());
+            bls_keys.push(sk);
+        }
+
+        // Create PeerSet with validator public keys
+        let peer_set = PeerSet::new(public_keys.clone());
+        let peer_ids: Vec<u64> = public_keys.iter().map(|pk| pk.to_peer_id()).collect();
+
+        // Create syncer with proper PeerSet
+        let temp = tempdir().unwrap();
+        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let logger = test_logger();
+        let mut syncer =
+            BlockSyncer::<6, 1>::new(store, vec![], peer_set, SyncConfig::default(), logger);
+
         let block = create_test_block(1);
         let block_hash = block.get_hash();
         let block_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&block)
             .unwrap()
             .to_vec();
 
-        // Create a matching L-notarization
+        // Create properly signed L-notarization
+        // Sign the block hash with each validator's BLS key
+        let signatures: Vec<_> = bls_keys.iter().map(|sk| sk.sign(&block_hash)).collect();
+        let aggregated_signature =
+            consensus::crypto::aggregated::BlsSignature::aggregate(signatures.iter());
+
         let l_notarization = LNotarization::<6, 1>::new(
-            1,                                           // view (matches block)
-            block_hash,                                  // block_hash (must match)
-            BlsSignature::aggregate(std::iter::empty()), // aggregated_signature
-            vec![0, 1, 2],                               // peer_ids (3 signers)
-            1,                                           // height (matches block)
+            1,          // view (matches block)
+            block_hash, // block_hash (must match)
+            aggregated_signature,
+            peer_ids.clone(), // peer_ids (5 signers = N-F)
+            1,                // height (matches block)
         );
         let l_notarization_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&l_notarization)
             .unwrap()
@@ -736,7 +806,7 @@ mod tests {
         assert_eq!(stored_notarization.height, 1);
         assert_eq!(stored_notarization.view, 1);
         assert_eq!(stored_notarization.block_hash, block_hash);
-        assert_eq!(stored_notarization.peer_ids.len(), 3);
+        assert_eq!(stored_notarization.peer_ids.len(), 5);
     }
 
     #[test]

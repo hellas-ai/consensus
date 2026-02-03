@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
+use consensus::state::peer::PeerSet;
 use consensus::storage::store::ConsensusStore;
 use rpc::config::RpcConfig;
 use rpc::identity::RpcIdentity;
@@ -70,7 +71,13 @@ fn test_block_syncer_with_store_persistence() {
 
     // Create syncer with store
     let store = ConsensusStore::open(&store_path).unwrap();
-    let mut syncer = BlockSyncer::<6, 1>::new(store, vec![], SyncConfig::default(), logger.clone());
+    let mut syncer = BlockSyncer::<6, 1>::new(
+        store,
+        vec![],
+        PeerSet::new(vec![]),
+        SyncConfig::default(),
+        logger.clone(),
+    );
 
     // Test state transitions
     assert!(matches!(syncer.state(), SyncState::Discovering));
@@ -96,7 +103,13 @@ fn test_block_syncer_validator_round_robin() {
         })
         .collect();
 
-    let syncer = BlockSyncer::<6, 1>::new(store, validators.clone(), SyncConfig::default(), logger);
+    let syncer = BlockSyncer::<6, 1>::new(
+        store,
+        validators.clone(),
+        PeerSet::new(vec![]),
+        SyncConfig::default(),
+        logger,
+    );
 
     // Pick validators multiple times - should always be from list
     let mut picked_set = std::collections::HashSet::new();
@@ -126,7 +139,7 @@ fn test_sync_config_custom_values() {
     let temp = tempdir().unwrap();
     let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
     let logger = test_logger();
-    let syncer = BlockSyncer::<6, 1>::new(store, vec![], config, logger);
+    let syncer = BlockSyncer::<6, 1>::new(store, vec![], PeerSet::new(vec![]), config, logger);
 
     assert_eq!(syncer.sync_interval(), Duration::from_millis(500));
     assert_eq!(syncer.request_timeout(), Duration::from_secs(30));
@@ -199,7 +212,13 @@ fn test_sync_state_transitions_via_target() {
     let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
     let logger = test_logger();
 
-    let mut syncer = BlockSyncer::<6, 1>::new(store, vec![], SyncConfig::default(), logger);
+    let mut syncer = BlockSyncer::<6, 1>::new(
+        store,
+        vec![],
+        PeerSet::new(vec![]),
+        SyncConfig::default(),
+        logger,
+    );
 
     // 1. Start in Discovering
     assert!(matches!(syncer.state(), SyncState::Discovering));
@@ -219,8 +238,13 @@ fn test_sync_state_transitions_via_target() {
     // 3. If target is already reached, go directly to Following
     let temp2 = tempdir().unwrap();
     let store2 = ConsensusStore::open(temp2.path().join("test.redb")).unwrap();
-    let mut syncer2 =
-        BlockSyncer::<6, 1>::new(store2, vec![], SyncConfig::default(), test_logger());
+    let mut syncer2 = BlockSyncer::<6, 1>::new(
+        store2,
+        vec![],
+        PeerSet::new(vec![]),
+        SyncConfig::default(),
+        test_logger(),
+    );
 
     syncer2.set_target_height(0); // Target 0 when at height 0
     assert!(matches!(
@@ -235,7 +259,13 @@ fn test_block_request_generation() {
     let temp = tempdir().unwrap();
     let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
     let logger = test_logger();
-    let mut syncer = BlockSyncer::<6, 1>::new(store, vec![], SyncConfig::default(), logger);
+    let mut syncer = BlockSyncer::<6, 1>::new(
+        store,
+        vec![],
+        PeerSet::new(vec![]),
+        SyncConfig::default(),
+        logger,
+    );
 
     // Discovering: request block 1
     let req = syncer.next_block_request().unwrap();

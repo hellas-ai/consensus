@@ -9,6 +9,7 @@ use slog::Logger;
 use tokio::sync::Notify;
 
 use crate::grpc::{GrpcServerConfig, RpcGrpcServer};
+use crate::sync::parse_validator_peer_set;
 use crate::{RpcConfig, RpcIdentity};
 
 /// RPC Node state.
@@ -171,11 +172,18 @@ impl<const N: usize, const F: usize> RpcNode<N, F> {
         p2p_handle.wait_ready().await;
         slog::info!(self.logger, "P2P service ready");
 
-        // Create block syncer with same N, F as RpcNode
+        // Create block syncer with BLS public keys for L-notarization verification
+        let peer_set = parse_validator_peer_set(&self.config.validators);
+        slog::info!(self.logger, "Parsed validator BLS public keys";
+            "count" => peer_set.sorted_peer_ids.len(),
+            "validators_in_config" => self.config.validators.len(),
+        );
+
         let mut syncer = BlockSyncer::<N, F>::new(
             ConsensusStore::open(self.config.data_dir.join("consensus.redb"))
                 .context("Failed to open consensus store for syncer")?,
             validator_keys,
+            peer_set,
             SyncConfig::default(),
             self.logger.clone(),
         );
