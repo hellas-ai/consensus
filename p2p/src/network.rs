@@ -2,8 +2,6 @@
 //!
 //! Provides the network service for authenticated peer-to-peer communication.
 
-use std::sync::{Arc, Mutex};
-
 use commonware_codec::ReadExt;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Ingress, Manager, Recipients, Sender, authenticated::discovery};
@@ -39,9 +37,6 @@ pub struct NetworkService<C: Network + Spawner + Clock + RngCore + CryptoRng + R
     /// Handle to the commonware network (for shutdown/metrics).
     /// Wrapped in Option because start() consumes the network builder.
     network_handle: Option<commonware_runtime::Handle<()>>,
-
-    /// Oracle for managing authorized peers.
-    oracle: Arc<Mutex<discovery::Oracle<ed25519::PublicKey>>>,
 
     /// Public key of this node.
     public_key: ed25519::PublicKey,
@@ -142,8 +137,6 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
             }
         }
 
-        let oracle = Arc::new(Mutex::new(oracle));
-
         // 4. Register Channels
         // Consensus: High priority, moderate volume
         let (consensus_sender, consensus_recv) = network.register(
@@ -175,7 +168,6 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
 
         let service = Self {
             network_handle: Some(network_handle),
-            oracle,
             public_key,
             consensus_sender,
             tx_sender,
@@ -189,13 +181,6 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
         };
 
         (service, receivers)
-    }
-
-    /// Update the set of authorized validators.
-    pub fn update_validators(&self, _validators: Vec<ed25519::PublicKey>) {
-        if let Ok(_oracle) = self.oracle.lock() {
-            // TODO: Refine this based on exact Oracle API for peer sets.
-        }
     }
 
     /// Broadcast a consensus message (high priority).
