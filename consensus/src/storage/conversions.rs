@@ -7,7 +7,7 @@ use crate::state::{
     account::Account,
     block::Block,
     leader::Leader,
-    notarizations::{MNotarization, Vote},
+    notarizations::{LNotarization, MNotarization, Vote},
     nullify::{Nullification, Nullify},
     transaction::Transaction,
     view::View,
@@ -135,6 +135,19 @@ impl Storable for Transaction {
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> Storable for MNotarization<N, F, M_SIZE> {
+    type Key = [u8; blake3::OUT_LEN];
+    type Value = AlignedVec;
+
+    fn key(&self) -> Self::Key {
+        self.block_hash
+    }
+
+    fn value(&self) -> Result<Self::Value> {
+        serialize_for_db(self)
+    }
+}
+
+impl<const N: usize, const F: usize> Storable for LNotarization<N, F> {
     type Key = [u8; blake3::OUT_LEN];
     type Value = AlignedVec;
 

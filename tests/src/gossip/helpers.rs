@@ -234,6 +234,7 @@ pub fn create_gossip_test_network(
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -399,6 +400,7 @@ fn create_gossip_node(
         consensus_msg_producer,
         p2p_tx_producer, // P2P routes incoming txs here
         broadcast_consumer,
+        Some(Arc::clone(&storage)),
         logger.new(o!("component" => "p2p")),
     );
 

@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package minimmit.v1;
+
+import "minimmit/v1/common.proto";
+import "minimmit/v1/admin.proto";
+
+// Service for querying L-notarization certificates (finality proofs)
+service ConsensusService {
+    // Get L-notarization by block hash
+    rpc GetLNotarization(GetLNotarizationRequest) returns (LNotarizationResponse);
+    
+    // Get L-notarization by block height
+    rpc GetLNotarizationByHeight(GetLNotarizationByHeightRequest) returns (LNotarizationResponse);
+    
+    // Get the current validator set
+    rpc GetValidatorSet(Empty) returns (ValidatorSetResponse);
+}
+
+message GetLNotarizationRequest {
+    // Block hash (hex-encoded, 32 bytes)
+    string block_hash = 1;
+}
+
+message GetLNotarizationByHeightRequest {
+    // Block height
+    uint64 height = 1;
+}
+
+message LNotarizationResponse {
+    // View number when block was finalized
+    uint64 view = 1;
+    // Block hash (hex-encoded, 32 bytes)
+    string block_hash = 2;
+    // Block height
+    uint64 height = 3;
+    // Aggregated BLS signature (hex-encoded)
+    string aggregated_signature = 4;
+    // Peer IDs of validators who signed
+    repeated uint64 peer_ids = 5;
+    // Error code if not found
+    ErrorCode error = 6;
+}
+
+message ValidatorSetResponse {
+    // Current validators (reuses ValidatorInfo from admin.proto)
+    repeated ValidatorInfo validators = 1;
+    // Total number of validators (N)
+    uint32 total_validators = 2;
+    // Fault tolerance (F)
+    uint32 fault_tolerance = 3;
+}

@@ -2,12 +2,11 @@
 //!
 //! Provides the network service for authenticated peer-to-peer communication.
 
-use std::sync::{Arc, Mutex};
-
 use commonware_codec::ReadExt;
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::{Ingress, Recipients, Sender, authenticated::discovery};
+use commonware_p2p::{Ingress, Manager, Recipients, Sender, authenticated::discovery};
 use commonware_runtime::{Clock, Metrics, Network, Resolver, Spawner};
+use commonware_utils::ordered::Set;
 
 use governor::Quota;
 use rand::{CryptoRng, RngCore};
@@ -38,9 +37,6 @@ pub struct NetworkService<C: Network + Spawner + Clock + RngCore + CryptoRng + R
     /// Handle to the commonware network (for shutdown/metrics).
     /// Wrapped in Option because start() consumes the network builder.
     network_handle: Option<commonware_runtime::Handle<()>>,
-
-    /// Oracle for managing authorized peers.
-    oracle: Arc<Mutex<discovery::Oracle<ed25519::PublicKey>>>,
 
     /// Public key of this node.
     public_key: ed25519::PublicKey,
@@ -94,15 +90,54 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
             namespace,
             config.listen_addr,
             dialable,
-            bootstrappers,
+            bootstrappers.clone(),
             config.max_message_size,
         );
 
-        // 2. Initialize Network Builder
-        let (mut network, oracle) = discovery::Network::new(context.clone(), cfg);
-        let oracle = Arc::new(Mutex::new(oracle));
+        slog::info!(logger, "P2P network configuration";
+            "listen_addr" => %config.listen_addr,
+            "external_addr" => %config.external_addr,
+            "bootstrapper_count" => bootstrappers.len(),
+            "validator_configs" => config.validators.len()
+        );
 
-        // 3. Register Channels
+        // 2. Initialize Network Builder
+        let (mut network, mut oracle) = discovery::Network::new(context.clone(), cfg);
+
+        // 3. Register authorized peer set
+        // Parse all validator public keys and register them with the oracle
+        let peer_keys: Vec<ed25519::PublicKey> = config
+            .validators
+            .iter()
+            .filter_map(|v| {
+                let pk_bytes = v.parse_public_key_bytes()?;
+                ed25519::PublicKey::read(&mut pk_bytes.as_slice()).ok()
+            })
+            .chain(std::iter::once(public_key.clone())) // Include self
+            .collect();
+
+        slog::info!(logger, "Oracle peer set registration";
+            "validator_configs" => config.validators.len(),
+            "parsed_keys" => peer_keys.len(),
+            "self_key" => hex::encode(public_key.as_ref())
+        );
+
+        if !peer_keys.is_empty() {
+            // Create ordered Set from the peer keys
+            match Set::try_from(peer_keys.clone()) {
+                Ok(peer_set) => {
+                    oracle.update(0, peer_set).await;
+                    slog::info!(logger, "Registered peer set with oracle";
+                        "count" => peer_keys.len()
+                    );
+                }
+                Err(e) => {
+                    slog::error!(logger, "Failed to create peer set"; "error" => ?e);
+                }
+            }
+        }
+
+        // 4. Register Channels
         // Consensus: High priority, moderate volume
         let (consensus_sender, consensus_recv) = network.register(
             channels::CONSENSUS,
@@ -126,14 +161,13 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
             DEFAULT_SYNC_BACKLOG,
         );
 
-        // 4. Start Network
+        // 5. Start Network
         let network_handle = network.start();
 
         slog::info!(logger, "P2P Network started"; "public_key" => ?public_key);
 
         let service = Self {
             network_handle: Some(network_handle),
-            oracle,
             public_key,
             consensus_sender,
             tx_sender,
@@ -147,13 +181,6 @@ impl<C: Network + Spawner + Clock + RngCore + CryptoRng + Resolver + Metrics> Ne
         };
 
         (service, receivers)
-    }
-
-    /// Update the set of authorized validators.
-    pub fn update_validators(&self, _validators: Vec<ed25519::PublicKey>) {
-        if let Ok(_oracle) = self.oracle.lock() {
-            // TODO: Refine this based on exact Oracle API for peer sets.
-        }
     }
 
     /// Broadcast a consensus message (high priority).
@@ -288,6 +315,7 @@ mod tests {
             ed25519_public_key: pk_hex.clone(),
             address: Some("127.0.0.1:8080".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         let bytes = validator.parse_public_key_bytes();
@@ -305,6 +333,7 @@ mod tests {
             ed25519_public_key: "not_valid_hex".to_string(),
             address: None,
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         let bytes = validator.parse_public_key_bytes();
@@ -326,6 +355,7 @@ mod tests {
             ed25519_public_key: pk_hex,
             address: None, // No address!
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         // Simulating the filter_map logic from NetworkService::new
@@ -354,6 +384,7 @@ mod tests {
             ed25519_public_key: pk_hex,
             address: Some(addr),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         // Simulating the filter_map logic from NetworkService::new

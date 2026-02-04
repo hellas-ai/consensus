@@ -15,3 +15,6 @@ pub const VIEWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("views");
 pub const LEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("leaders");
 pub const STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
 pub const MEMPOOL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mempool");
+pub const L_NOTARIZATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("l_notarizations");
+pub const L_NOTARIZATIONS_BY_HEIGHT: TableDefinition<u64, &[u8; 32]> =
+    TableDefinition::new("l_notarizations_by_height");

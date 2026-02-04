@@ -210,3 +210,41 @@ bls_secret_key_path = "/etc/hellas/keys/bls.key"
 # If not provided or file doesn't exist, a new key will be generated.
 # SECURITY: This file must be kept secure and backed up.
 ed25519_secret_key_path = "/etc/hellas/keys/ed25519.key"
+
+# =============================================================================
+# RPC NODE CONFIGURATION (for read-only syncing nodes)
+# =============================================================================
+#
+# RPC nodes sync finalized blocks from validators but do NOT participate in
+# consensus. They serve read-only gRPC queries to external clients.
+#
+# To run an RPC node, use the `rpc-node` binary with `--config rpc-config.toml`
+# Create a separate config file with just the [rpc_node] section below.
+#
+# =============================================================================
+
+# Uncomment and save to a separate file (e.g., rpc-config.toml) for RPC nodes:
+
+[rpc_node]
+# gRPC server address for client queries
+grpc_addr = "0.0.0.0:50051"
+
+# P2P address for validator connections
+p2p_addr = "0.0.0.0:9000"
+
+# Data directory for block storage
+data_dir = "./rpc-data"
+
+# Cluster ID (must match validator network)
+cluster_id = "hellas-mainnet"
+
+# Path to identity file (persists Ed25519 key across restarts)
+# If not set, generates new identity each run
+identity_path = "./rpc-data/identity.key"
+
+# Validators to sync from (need BLS public key for L-notarization verification)
+[[rpc_node.validators]]
+address            = "192.168.1.100:9000"
+bls_peer_id        = 12345678901234567890
+bls_public_key     = "abcd1234..."                                                      # Required for L-notarization verification
+ed25519_public_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

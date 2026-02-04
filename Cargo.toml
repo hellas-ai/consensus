@@ -5,6 +5,7 @@ members = [
     "grpc-client",
     "node",
     "p2p",
+    "rpc",
     "sdk",
     "storage",
     "tests",
@@ -44,6 +45,7 @@ rand_core               = "0.9.3"
 rayon                   = "1.11.0"
 redb                    = "3.1.0"
 rkyv                    = "0.8.12"
+rpc                     = { path = "./rpc" }
 rtrb                    = "0.3.2"
 sdk                     = { path = "./sdk" }
 serde                   = "1.0.228"

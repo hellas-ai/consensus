@@ -1,0 +1,58 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# The database of advisories to check against
+db-path = "~/.cargo/advisory-db"
+# paste is unmaintained but not a security issue - transitive dep from prost
+ignore = [ "RUSTSEC-2024-0436" ]
+
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "warn"
+
+# Skip checking these crates for duplicate versions
+# These are transitive dependencies with version conflicts between
+# commonware-* (newer) and ark-* / other deps (older)
+skip = [
+    # Crypto primitives - different versions used by ark-* vs commonware-*
+    { name = "block-buffer" },
+    { name = "digest" },
+    { name = "getrandom" },
+    { name = "rand" },
+    { name = "rand_chacha" },
+    { name = "rand_core" },
+    { name = "sha2" },
+
+    # Hash maps - different versions across ecosystem
+    { name = "foldhash" },
+    { name = "hashbrown" },
+
+    # Itertools - ark-* vs prost
+    { name = "itertools" },
+
+    # Error handling - ed25519-consensus vs newer deps
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+
+    # TOML parsing - figment vs commonware-macros
+    { name = "serde_spanned" },
+    { name = "toml" },
+    { name = "toml_datetime" },
+    { name = "toml_edit" },
+
+    # Windows-specific (only affects Windows builds)
+    { name = "windows-core" },
+    { name = "windows-link" },
+    { name = "windows-result" },
+    { name = "windows-strings" },
+    { name = "windows-sys" },
+]
+
+[sources]
+# Allow crates from crates.io
+allow-registry = [ "https://github.com/rust-lang/crates.io-index" ]
+# Allow git sources (for commonware dependencies)
+allow-git        = [  ]
+unknown-git      = "allow"
+unknown-registry = "deny"

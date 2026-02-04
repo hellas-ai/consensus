@@ -53,6 +53,8 @@ fn create_test_config(port: u16) -> P2PConfig {
         bootstrap_timeout_ms: 5000, // 5s timeout for integration tests
         ping_interval_ms: 200,      // Ping every 200ms during bootstrap
         tx_broadcast_queue_size: 1_000,
+        rpc_mode: false,
+        max_rpc_connections: 100,
     }
 }
 
@@ -81,6 +83,7 @@ fn test_p2p_service_spawn_and_shutdown() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             logger,
         );
 
@@ -125,6 +128,7 @@ fn test_p2p_service_broadcast_notification() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity2.peer_id(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -132,6 +136,7 @@ fn test_p2p_service_broadcast_notification() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -153,6 +158,7 @@ fn test_p2p_service_broadcast_notification() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             logger.clone(),
         );
 
@@ -267,6 +273,7 @@ fn test_p2p_service_routes_consensus_messages() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         // Get the ed25519 key for node1 before consuming identity1
@@ -286,6 +293,7 @@ fn test_p2p_service_routes_consensus_messages() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             create_test_logger(),
         );
 
@@ -303,6 +311,7 @@ fn test_p2p_service_routes_consensus_messages() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         // Create network service for node1 (sender) in the test's runtime
@@ -397,6 +406,7 @@ fn test_p2p_service_routes_transaction_messages() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         // Get the ed25519 key for node1 before consuming identity1
@@ -415,6 +425,7 @@ fn test_p2p_service_routes_transaction_messages() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             create_test_logger(),
         );
 
@@ -423,6 +434,7 @@ fn test_p2p_service_routes_transaction_messages() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         let (mut network1, _receivers1) =
@@ -504,6 +516,7 @@ fn test_p2p_service_handles_shutdown_signal() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             logger,
         );
 
@@ -562,6 +575,7 @@ fn test_bootstrap_completes_with_sufficient_peers() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity2.peer_id(),
+            bls_public_key: None,
         });
 
         // Configure node2 with node1 as validator
@@ -572,6 +586,7 @@ fn test_bootstrap_completes_with_sufficient_peers() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -590,6 +605,7 @@ fn test_bootstrap_completes_with_sufficient_peers() {
             consensus_prod1,
             tx_prod1,
             broadcast_cons1,
+            None,
             logger.clone(),
         );
 
@@ -607,6 +623,7 @@ fn test_bootstrap_completes_with_sufficient_peers() {
             consensus_prod2,
             tx_prod2,
             broadcast_cons2,
+            None,
             logger,
         );
 
@@ -671,6 +688,7 @@ fn test_bootstrap_timeout_when_insufficient_peers() {
             ed25519_public_key: non_existent_pk_hex,
             address: Some(format!("127.0.0.1:{}", 19999).parse().unwrap()), // Port not listening
             bls_peer_id: non_existent_identity.peer_id(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -688,6 +706,7 @@ fn test_bootstrap_timeout_when_insufficient_peers() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             logger,
         );
 
@@ -756,6 +775,7 @@ fn test_bootstrap_skips_when_no_peers_required() {
             consensus_prod,
             tx_prod,
             broadcast_cons,
+            None,
             logger,
         );
 
@@ -817,11 +837,13 @@ fn test_bootstrap_with_three_nodes() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity2.peer_id(),
+            bls_public_key: None,
         });
         config1.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk3_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
             bls_peer_id: identity3.peer_id(),
+            bls_public_key: None,
         });
 
         // Configure node2 with nodes 1 and 3 as validators
@@ -832,11 +854,13 @@ fn test_bootstrap_with_three_nodes() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
         config2.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk3_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
             bls_peer_id: identity3.peer_id(),
+            bls_public_key: None,
         });
 
         // Configure node3 with nodes 1 and 2 as validators
@@ -847,11 +871,13 @@ fn test_bootstrap_with_three_nodes() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: identity1.peer_id(),
+            bls_public_key: None,
         });
         config3.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: identity2.peer_id(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -870,6 +896,7 @@ fn test_bootstrap_with_three_nodes() {
             consensus_prod1,
             tx_prod1,
             broadcast_cons1,
+            None,
             logger.clone(),
         );
 
@@ -886,6 +913,7 @@ fn test_bootstrap_with_three_nodes() {
             consensus_prod2,
             tx_prod2,
             broadcast_cons2,
+            None,
             logger.clone(),
         );
 
@@ -902,6 +930,7 @@ fn test_bootstrap_with_three_nodes() {
             consensus_prod3,
             tx_prod3,
             broadcast_cons3,
+            None,
             logger,
         );
 

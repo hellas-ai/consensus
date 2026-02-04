@@ -30,6 +30,8 @@ fn create_test_config(port: u16) -> P2PConfig {
         bootstrap_timeout_ms: 100, // Short timeout for tests
         ping_interval_ms: 50,
         tx_broadcast_queue_size: 1_000,
+        rpc_mode: false,
+        max_rpc_connections: 100,
     }
 }
 
@@ -168,6 +170,7 @@ fn test_bootstrapper_parsing_into_network() {
             ed25519_public_key: bootstrap_pk_hex.clone(),
             address: Some(bootstrap_addr),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         };
 
         // Assert: parsing the public key back succeeds
@@ -204,6 +207,7 @@ fn test_invalid_bootstrapper_hex_handled() {
         ed25519_public_key: "not_valid_hex_at_all".to_string(),
         address: Some("127.0.0.1:9999".parse().unwrap()),
         bls_peer_id: PeerId::default(),
+        bls_public_key: None,
     };
 
     // Assert: parsing fails gracefully (returns None, doesn't panic)
@@ -218,6 +222,7 @@ fn test_short_public_key_rejected() {
         ed25519_public_key: "0123456789abcdef0123456789abcdef".to_string(),
         address: Some("127.0.0.1:9999".parse().unwrap()),
         bls_peer_id: PeerId::default(),
+        bls_public_key: None,
     };
 
     // Assert: short key is rejected
@@ -260,6 +265,7 @@ fn test_two_nodes_on_same_runtime() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some("127.0.0.1:9101".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(9101);
@@ -267,6 +273,7 @@ fn test_two_nodes_on_same_runtime() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some("127.0.0.1:9100".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -385,6 +392,7 @@ fn test_mutual_bootstrappers() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some("127.0.0.1:9201".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         // Node 2 knows about Node 1
@@ -393,6 +401,7 @@ fn test_mutual_bootstrappers() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some("127.0.0.1:9200".parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -441,6 +450,7 @@ fn test_real_message_delivery_between_nodes() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -448,6 +458,7 @@ fn test_real_message_delivery_between_nodes() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -528,6 +539,7 @@ fn test_bidirectional_message_delivery() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -535,6 +547,7 @@ fn test_bidirectional_message_delivery() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -611,6 +624,7 @@ fn test_transaction_channel_delivery() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -618,6 +632,7 @@ fn test_transaction_channel_delivery() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -674,6 +689,7 @@ fn test_sync_channel_delivery() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -681,6 +697,7 @@ fn test_sync_channel_delivery() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();
@@ -742,11 +759,13 @@ fn test_broadcast_to_all_nodes() {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
         config1.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk3_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config2 = create_test_config(port2);
@@ -754,11 +773,13 @@ fn test_broadcast_to_all_nodes() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
         config2.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk3_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port3).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let mut config3 = create_test_config(port3);
@@ -766,11 +787,13 @@ fn test_broadcast_to_all_nodes() {
             ed25519_public_key: pk1_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port1).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
         config3.validators.push(ValidatorPeerInfo {
             ed25519_public_key: pk2_hex.clone(),
             address: Some(format!("127.0.0.1:{}", port2).parse().unwrap()),
             bls_peer_id: PeerId::default(),
+            bls_public_key: None,
         });
 
         let logger = create_test_logger();

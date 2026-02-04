@@ -145,3 +145,85 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> PartialEq
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> Eq for MNotarization<N, F, M_SIZE> {}
+
+/// [`LNotarization`] represents a (n - f)-signature quorum for a given block (also
+/// referred to as an L-notarization). An L-notarization is the finality proof for a block,
+/// meaning the block is committed and can never be reverted.
+///
+/// Light clients can use the L-notarization to verify that a block was correctly finalized
+/// by aggregating the public keys of the signing validators and verifying the BLS signature.
+///
+/// The type parameters `N` and `F` correspond to the total number of peers and the number of
+/// faulty peers, respectively. Uses a `Vec<PeerId>` to accommodate varying numbers of signers
+/// (between N-F and N).
+#[derive(Archive, Deserialize, Serialize, Clone, Debug)]
+pub struct LNotarization<const N: usize, const F: usize> {
+    /// The view number when the block was finalized
+    pub view: u64,
+    /// The hash of the finalized block
+    pub block_hash: [u8; blake3::OUT_LEN],
+    /// The aggregated BLS signature from n-f validators
+    #[rkyv(with = ArkSerdeWrapper)]
+    pub aggregated_signature: BlsSignature,
+    /// The peer IDs of the validators who signed (N-F to N signers)
+    pub peer_ids: Vec<PeerId>,
+    /// The block height for easier lookup
+    pub height: u64,
+}
+
+impl<const N: usize, const F: usize> LNotarization<N, F> {
+    pub fn new(
+        view: u64,
+        block_hash: [u8; blake3::OUT_LEN],
+        aggregated_signature: BlsSignature,
+        peer_ids: Vec<PeerId>,
+        height: u64,
+    ) -> Self {
+        Self {
+            view,
+            block_hash,
+            aggregated_signature,
+            peer_ids,
+            height,
+        }
+    }
+
+    /// Verifies the L-notarization aggregated BLS signature against the validator set.
+    ///
+    /// Returns `true` if:
+    /// 1. At least N - F validators signed
+    /// 2. The aggregated signature is valid for the block hash
+    pub fn verify(&self, peer_set: &PeerSet) -> bool {
+        // Collect public keys for all signing peers
+        let public_keys: Vec<BlsPublicKey> = self
+            .peer_ids
+            .iter()
+            .filter_map(|peer_id| peer_set.get_public_key(peer_id).ok().cloned())
+            .collect();
+
+        // Require at least n-f signatures for finality
+        if public_keys.len() < N - F {
+            return false;
+        }
+
+        BlsPublicKey::aggregate(&public_keys).verify(&self.block_hash, &self.aggregated_signature)
+    }
+}
+
+impl<const N: usize, const F: usize> Hash for LNotarization<N, F> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view.hash(state);
+        self.block_hash.hash(state);
+        self.height.hash(state);
+    }
+}
+
+impl<const N: usize, const F: usize> PartialEq for LNotarization<N, F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.block_hash == other.block_hash
+            && self.height == other.height
+    }
+}
+
+impl<const N: usize, const F: usize> Eq for LNotarization<N, F> {}

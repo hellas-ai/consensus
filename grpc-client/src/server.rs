@@ -30,12 +30,13 @@ use crate::config::RpcConfig;
 use crate::proto::account_service_server::AccountServiceServer;
 use crate::proto::admin_service_server::AdminServiceServer;
 use crate::proto::block_service_server::BlockServiceServer;
+use crate::proto::consensus_service_server::ConsensusServiceServer;
 use crate::proto::node_service_server::NodeServiceServer;
 use crate::proto::subscription_service_server::SubscriptionServiceServer;
 use crate::proto::transaction_service_server::TransactionServiceServer;
 use crate::proto::{BlockEvent, ConsensusEvent, TransactionEvent};
 use crate::services::{
-    AccountServiceImpl, AdminServiceImpl, BlockServiceImpl, NodeServiceImpl,
+    AccountServiceImpl, AdminServiceImpl, BlockServiceImpl, ConsensusServiceImpl, NodeServiceImpl,
     SubscriptionServiceImpl, TransactionServiceImpl,
 };
 
@@ -192,7 +193,8 @@ impl RpcServer {
             Arc::clone(&self.context.mempool_tx_queue),
         );
         let subscription_service = SubscriptionServiceImpl::new(tx_ctx.clone());
-        let admin_service = AdminServiceImpl::new(tx_ctx);
+        let admin_service = AdminServiceImpl::new(tx_ctx.clone());
+        let consensus_service = ConsensusServiceImpl::new(tx_ctx);
 
         let logger = self.context.read_only.logger.clone();
 
@@ -201,6 +203,7 @@ impl RpcServer {
             .add_service(AccountServiceServer::new(account_service))
             .add_service(AdminServiceServer::new(admin_service))
             .add_service(BlockServiceServer::new(block_service))
+            .add_service(ConsensusServiceServer::new(consensus_service))
             .add_service(NodeServiceServer::new(node_service))
             .add_service(TransactionServiceServer::new(transaction_service))
             .add_service(SubscriptionServiceServer::new(subscription_service))

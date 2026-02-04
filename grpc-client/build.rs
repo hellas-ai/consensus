@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/minimmit/v1/node.proto",
                 "proto/minimmit/v1/subscription.proto",
                 "proto/minimmit/v1/admin.proto",
+                "proto/minimmit/v1/consensus.proto",
             ],
             &["proto"],
         )?;

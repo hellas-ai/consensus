@@ -59,6 +59,16 @@ pub struct P2PConfig {
     /// Size of the transaction broadcast queue.
     #[serde(default = "default_tx_broadcast_queue_size")]
     pub tx_broadcast_queue_size: usize,
+
+    /// Whether this node is running in RPC-only mode.
+    /// RPC nodes don't participate in consensus but receive finalized blocks.
+    #[serde(default)]
+    pub rpc_mode: bool,
+
+    /// Maximum number of RPC node connections allowed (validators only).
+    /// Has no effect when `rpc_mode` is true.
+    #[serde(default = "default_max_rpc_connections")]
+    pub max_rpc_connections: usize,
 }
 
 fn default_max_message_size() -> u32 {
@@ -93,6 +103,10 @@ fn default_tx_broadcast_queue_size() -> usize {
     100_000
 }
 
+fn default_max_rpc_connections() -> usize {
+    100
+}
+
 impl Default for P2PConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +123,8 @@ impl Default for P2PConfig {
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             ping_interval_ms: default_ping_interval_ms(),
             tx_broadcast_queue_size: default_tx_broadcast_queue_size(),
+            rpc_mode: false,
+            max_rpc_connections: default_max_rpc_connections(),
         }
     }
 }
@@ -195,9 +211,14 @@ pub struct ValidatorPeerInfo {
     /// ED25519 public key (hex-encoded for config files).
     pub ed25519_public_key: String,
 
-    /// BLS peer ID for consensus.
+    /// BLS peer ID for consensus (derived from BLS public key).
     #[serde(with = "string_or_int")]
     pub bls_peer_id: PeerId,
+
+    /// BLS public key (hex-encoded, compressed G2 point).
+    /// Required for RPC nodes to verify L-notarization signatures.
+    #[serde(default)]
+    pub bls_public_key: Option<String>,
 
     /// Direct socket address (if known).
     pub address: Option<SocketAddr>,
@@ -213,6 +234,13 @@ impl ValidatorPeerInfo {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Some(arr)
+    }
+
+    /// Parse the BLS public key bytes from hex.
+    /// Returns None if the key is not set or cannot be parsed.
+    pub fn parse_bls_public_key_bytes(&self) -> Option<Vec<u8>> {
+        let key_hex = self.bls_public_key.as_ref()?;
+        hex::decode(key_hex).ok()
     }
 }
 
@@ -323,6 +351,7 @@ tx_rate_per_second = 100000
             ed25519_public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
             bls_peer_id: 0,
+            bls_public_key: None,
             address: None,
         };
         let pk = validator.parse_public_key_bytes().unwrap();
@@ -335,6 +364,7 @@ tx_rate_per_second = 100000
         let validator = ValidatorPeerInfo {
             ed25519_public_key: "0123456789abcdef".to_string(), // Too short
             bls_peer_id: 0,
+            bls_public_key: None,
             address: None,
         };
         assert!(validator.parse_public_key_bytes().is_none());
@@ -345,6 +375,7 @@ tx_rate_per_second = 100000
         let validator = ValidatorPeerInfo {
             ed25519_public_key: "not_valid_hex".to_string(),
             bls_peer_id: 0,
+            bls_public_key: None,
             address: None,
         };
         assert!(validator.parse_public_key_bytes().is_none());

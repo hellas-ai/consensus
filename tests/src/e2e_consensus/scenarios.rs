@@ -263,6 +263,7 @@ fn create_node_setup<const N: usize, const F: usize, const M_SIZE: usize>(
         consensus_msg_producer,
         p2p_tx_producer,
         broadcast_consumer,
+        None,
         logger.new(o!("component" => "p2p")),
     );
 
@@ -462,6 +463,7 @@ fn test_multi_node_happy_path() {
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -852,6 +854,7 @@ fn test_multi_node_continuous_load() {
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -1115,6 +1118,7 @@ fn test_multi_node_crashed_replica() {
                 let pk_hex = hex::encode(ed25519_pk.as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -1319,6 +1323,7 @@ fn create_byzantine_node_setup<const N: usize, const F: usize, const M_SIZE: usi
         consensus_msg_producer,
         p2p_tx_producer,
         broadcast_consumer,
+        None,
         logger.new(o!("component" => "p2p")),
     );
 
@@ -1403,6 +1408,7 @@ fn test_multi_node_equivocating_leader() {
                 let pk_hex = hex::encode(other_identity.ed25519_public_key().as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -1752,6 +1758,7 @@ fn test_multi_node_invalid_tx_rejection() {
                 let pk_hex = hex::encode(other_identity.ed25519_public_key().as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });
@@ -1989,6 +1996,7 @@ fn test_multi_node_invalid_block_from_leader() {
                 let pk_hex = hex::encode(other_identity.ed25519_public_key().as_ref());
                 validators.push(ValidatorPeerInfo {
                     bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
                     ed25519_public_key: pk_hex,
                     address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
                 });

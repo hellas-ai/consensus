@@ -13,8 +13,12 @@ use crate::state::account::Account;
 use crate::state::notarizations::Vote;
 use crate::state::nullify::Nullify;
 use crate::state::{
-    block::Block, leader::Leader, notarizations::MNotarization, nullify::Nullification,
-    transaction::Transaction, view::View,
+    block::Block,
+    leader::Leader,
+    notarizations::{LNotarization, MNotarization},
+    nullify::Nullification,
+    transaction::Transaction,
+    view::View,
 };
 use crate::storage::config::StorageConfig;
 use crate::storage::conversions::Storable;
@@ -23,8 +27,8 @@ use crate::storage::tables::{ACCOUNTS, NULLIFIED_BLOCKS, NULLIFIES};
 use super::{
     conversions::access_archived,
     tables::{
-        FINALIZED_BLOCKS, LEADERS, MEMPOOL, NON_FINALIZED_BLOCKS, NOTARIZATIONS, NULLIFICATIONS,
-        STATE, VIEWS, VOTES,
+        FINALIZED_BLOCKS, L_NOTARIZATIONS, L_NOTARIZATIONS_BY_HEIGHT, LEADERS, MEMPOOL,
+        NON_FINALIZED_BLOCKS, NOTARIZATIONS, NULLIFICATIONS, STATE, VIEWS, VOTES,
     },
 };
 
@@ -104,6 +108,12 @@ impl ConsensusStore {
             write_txn
                 .open_table(VOTES)
                 .context("Failed to open votes table")?;
+            write_txn
+                .open_table(L_NOTARIZATIONS)
+                .context("Failed to open l_notarizations table")?;
+            write_txn
+                .open_table(L_NOTARIZATIONS_BY_HEIGHT)
+                .context("Failed to open l_notarizations_by_height table")?;
         }
         write_txn
             .commit()
@@ -411,6 +421,61 @@ impl ConsensusStore {
         hash: &[u8; blake3::OUT_LEN],
     ) -> Result<Option<MNotarization<N, F, M_SIZE>>> {
         unsafe { self.get_blob_value::<MNotarization<N, F, M_SIZE>, _>(NOTARIZATIONS, *hash) }
+    }
+
+    /// Puts an L-notarization (finality proof) into the database.
+    ///
+    /// Stores data in primary table (by block hash) and just a hash pointer in height index.
+    pub fn put_l_notarization<const N: usize, const F: usize>(
+        &self,
+        l_notarization: &LNotarization<N, F>,
+    ) -> Result<()> {
+        // Store full data in primary table (by block hash)
+        self.put_value(L_NOTARIZATIONS, l_notarization)?;
+
+        // Store only the block_hash in height index (32-byte pointer)
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("Failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(L_NOTARIZATIONS_BY_HEIGHT)
+                .context("Failed to open l_notarizations_by_height table")?;
+            table
+                .insert(l_notarization.height, &l_notarization.block_hash)
+                .context("Failed to insert l_notarization height index")?;
+        }
+        write_txn
+            .commit()
+            .context("Failed to commit write transaction")
+    }
+
+    /// Retrieves an L-notarization from the database by block hash.
+    pub fn get_l_notarization<const N: usize, const F: usize>(
+        &self,
+        block_hash: &[u8; blake3::OUT_LEN],
+    ) -> Result<Option<LNotarization<N, F>>> {
+        unsafe { self.get_blob_value::<LNotarization<N, F>, _>(L_NOTARIZATIONS, *block_hash) }
+    }
+
+    /// Retrieves an L-notarization from the database by block height.
+    ///
+    /// Uses two-step lookup: height → block_hash → full data
+    pub fn get_l_notarization_by_height<const N: usize, const F: usize>(
+        &self,
+        height: u64,
+    ) -> Result<Option<LNotarization<N, F>>> {
+        // Step 1: Get block_hash from height index
+        let read = self.db.begin_read()?;
+        let height_table = read.open_table(L_NOTARIZATIONS_BY_HEIGHT)?;
+        let block_hash = match height_table.get(height)? {
+            Some(row) => *row.value(),
+            None => return Ok(None),
+        };
+
+        // Step 2: Get full L-notarization from primary table
+        self.get_l_notarization(&block_hash)
     }
 
     /// Puts a nullify message into the database.
