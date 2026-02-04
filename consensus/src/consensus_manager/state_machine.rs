@@ -890,6 +890,46 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             "Progressing to next view {view} with leader {leader} and notarized block hash {notarized_block_hash:?}"
         );
 
+        // Retry finalization for views that have accumulated L-notarization (n-f votes).
+        // Per Minimmit paper Section 5.2: Finalization can happen AFTER view progression.
+        // This catches cases where the normal finalization path was missed due to
+        // message ordering or concurrent view progression via M-notarization.
+        let mut last_attempted_view: Option<u64> = None;
+        while let Some((finalizable_view, block_hash)) = self.view_manager.oldest_finalizable_view()
+        {
+            // If we're seeing the same view again, finalization was deferred (e.g., missing
+            // ancestor blocks). Break to avoid infinite loop - we'll retry on next view progression.
+            if last_attempted_view == Some(finalizable_view) {
+                slog::debug!(
+                    self.logger,
+                    "Finalization for view {} was deferred, will retry later",
+                    finalizable_view
+                );
+                break;
+            }
+            last_attempted_view = Some(finalizable_view);
+
+            match self.finalize_view(finalizable_view, block_hash) {
+                Ok(()) => {
+                    slog::info!(
+                        self.logger,
+                        "Finalized pending view {} via retry on view progression",
+                        finalizable_view
+                    );
+                }
+                Err(e) => {
+                    slog::warn!(
+                        self.logger,
+                        "Pending finalization retry failed for view {}: {}, continuing",
+                        finalizable_view,
+                        e
+                    );
+                    // On error, also break to avoid infinite loop with same failing view
+                    break;
+                }
+            }
+        }
+
         // Replay any buffered messages for this view (or previous ones)
         let pending_views: Vec<u64> = self
             .pending_messages
@@ -900,7 +940,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
         for pending_view in pending_views {
             if let Some(messages) = self.pending_messages.remove(&pending_view) {
-                slog::debug!(
+                slog::warn!(
                     self.logger,
                     "Replaying {} buffered messages for view {}",
                     messages.len(),

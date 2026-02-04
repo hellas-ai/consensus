@@ -568,6 +568,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         self.view_chain.select_parent(new_view)
     }
 
+    /// Returns the oldest non-finalized view that has L-notarization (n-f votes).
+    ///
+    /// This is used to catch missed finalizations due to message ordering or
+    /// concurrent view progression. See ViewChain::oldest_finalizable_view for details.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        self.view_chain.oldest_finalizable_view()
+    }
+
     /// Main driver of the state machine replication algorithm.
     ///
     /// Processes received `ConsensusMessage` and emits appropriate `ViewProgressEvent`s

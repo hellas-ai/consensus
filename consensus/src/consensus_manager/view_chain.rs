@@ -211,6 +211,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
+    /// Returns the oldest non-finalized view that has L-notarization (n-f votes) and a block.
+    ///
+    /// Per Minimmit paper: L-notarization (n-f votes) suffices for finalization.
+    /// This function finds views that accumulated enough votes but may have missed
+    /// finalization due to message ordering or concurrent view progression.
+    ///
+    /// # Returns
+    /// * `Some((view, block_hash))` - The oldest finalizable view and its block hash
+    /// * `None` - No views are ready for finalization
+    ///
+    /// # Note
+    /// This excludes the current view since finalization requires the view to have progressed.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        let current_view = self.current_view;
+
+        // Views are created sequentially, so the range is already sorted (oldest first).
+        // We exclude the current view since finalization requires view progression.
+        let range = self.non_finalized_view_numbers_range();
+        for view in range {
+            if view >= current_view {
+                break;
+            }
+            if let Some(ctx) = self.non_finalized_views.get(&view) {
+                // Check if view has L-notarization (n-f votes) and a block
+                if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                    let block_hash = ctx
+                        .block_hash
+                        .unwrap_or_else(|| ctx.block.as_ref().unwrap().get_hash());
+                    return Some((view, block_hash));
+                }
+            }
+        }
+        None
+    }
+
     /// Stores a pre-computed [`StateDiff`] instance for a view.
     ///
     /// This method is called when block validation completes and produces a [`StateDiff`]
