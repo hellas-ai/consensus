@@ -211,6 +211,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
+    /// Returns the oldest non-finalized view that has L-notarization (n-f votes) and a block.
+    ///
+    /// Per Minimmit paper: L-notarization (n-f votes) suffices for finalization.
+    /// This function finds views that accumulated enough votes but may have missed
+    /// finalization due to message ordering or concurrent view progression.
+    ///
+    /// # Returns
+    /// * `Some((view, block_hash))` - The oldest finalizable view and its block hash
+    /// * `None` - No views are ready for finalization
+    ///
+    /// # Note
+    /// This excludes the current view since finalization requires the view to have progressed.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        let current_view = self.current_view;
+
+        // Views are created sequentially, so the range is already sorted (oldest first).
+        // We exclude the current view since finalization requires view progression.
+        let range = self.non_finalized_view_numbers_range();
+        for view in range {
+            if view >= current_view {
+                break;
+            }
+            if let Some(ctx) = self.non_finalized_views.get(&view) {
+                // Check if view has L-notarization (n-f votes) and a block
+                if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                    let block_hash = ctx
+                        .block_hash
+                        .unwrap_or_else(|| ctx.block.as_ref().unwrap().get_hash());
+                    return Some((view, block_hash));
+                }
+            }
+        }
+        None
+    }
+
     /// Stores a pre-computed [`StateDiff`] instance for a view.
     ///
     /// This method is called when block validation completes and produces a [`StateDiff`]
@@ -309,8 +344,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             Some(parent_view_number) => {
                 let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
 
-                // Check if parent was nullified
-                if parent_ctx.nullification.is_some() {
+                // Check if parent was nullified WITHOUT M-notarization.
+                // Per Minimmit paper Section 4: A view can have BOTH M-notarization AND
+                // nullification. If parent has M-notarization, we accept blocks building on it.
+                // But if parent is ONLY nullified (no M-not), we reject.
+                if parent_ctx.nullification.is_some() && parent_ctx.m_notarization.is_none() {
                     return Err(anyhow::anyhow!(
                         "Block proposal for parent view {} is nullified, but the block proposal for view {} is for a parent block hash {}",
                         parent_view_number,
@@ -334,18 +372,54 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 }
 
                 // Check parent has received at least one M-notarization
+                // If not, we should await until parent gets M-notarized
                 parent_ctx.m_notarization.is_none()
             }
+
             None => {
-                // Parent not in non-finalized views, check if finalized
-                if block.parent_block_hash() != self.previously_committed_block_hash {
-                    return Err(anyhow::anyhow!(
-                        "Block proposal for parent block hash {} is not the previously committed block hash {}",
-                        hex::encode(block.parent_block_hash()),
-                        hex::encode(self.previously_committed_block_hash)
-                    ));
+                // Parent not in non-finalized views, it must be finalized.
+                let parent_hash = block.parent_block_hash();
+
+                // Parent must be the tip of the finalized chain (previously_committed_block_hash).
+                // If parent is an older finalized block, there are finalized blocks after it,
+                // and building on it would create a fork, which is not allowed.
+                if parent_hash == self.previously_committed_block_hash {
+                    // Parent is the finalized tip - valid, no need to await
+                    false
+                } else {
+                    // Parent is NOT the finalized tip.
+                    // Check if it exists in finalized storage to provide a better error message.
+                    match self
+                        .persistence_writer
+                        .store()
+                        .get_finalized_block(&parent_hash)
+                    {
+                        Ok(Some(parent_block)) => {
+                            // Parent exists but is not the tip - this would create a fork
+                            return Err(anyhow::anyhow!(
+                                "Block proposal builds on finalized block at view {} (hash: {}), but the finalized tip is at hash {}. Building on old finalized blocks is not allowed.",
+                                parent_block.view(),
+                                hex::encode(parent_hash),
+                                hex::encode(self.previously_committed_block_hash)
+                            ));
+                        }
+                        Ok(None) => {
+                            // Parent not found in finalized storage or non-finalized views
+                            return Err(anyhow::anyhow!(
+                                "Block proposal parent hash {} not found in non-finalized views or finalized storage",
+                                hex::encode(parent_hash)
+                            ));
+                        }
+                        Err(e) => {
+                            // Storage error
+                            return Err(anyhow::anyhow!(
+                                "Failed to look up parent block {}: {}",
+                                hex::encode(parent_hash),
+                                e
+                            ));
+                        }
+                    }
                 }
-                false
             }
         };
 
@@ -365,6 +439,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                                      * parent to be notarized */
                 should_nullify: false,
             });
+        }
+
+        // Update parent_block_hash if it differs from the block's parent.
+        // This is safe because we've already validated above that the block's parent
+        // is acceptable (either from non-finalized views or finalized storage).
+        // Different replicas may have created this ViewContext with different parent
+        // expectations based on their local view of M-notarizations (select_parent),
+        // so we trust the leader's choice after validation.
+        if ctx.parent_block_hash != block.parent_block_hash() {
+            ctx.parent_block_hash = block.parent_block_hash();
         }
 
         // Add block to the view context
@@ -714,10 +798,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         finalized_view: u64,
         peers: &PeerSet,
     ) -> Result<()> {
-        // 1. Check that the view number is not the current view.
-        if finalized_view > self.current_view {
+        // 1. Check that the view number is not the current view or greater.
+        // We cannot finalize the current view because it would be removed from
+        // non_finalized_views while still being the active view.
+        if finalized_view >= self.current_view {
             return Err(anyhow::anyhow!(
-                "View number {} is not greater than the current view {}, cannot finalize views in the future",
+                "View number {} is the current view {} or greater, cannot finalize current or future views",
                 finalized_view,
                 self.current_view,
             ));
@@ -2566,15 +2652,16 @@ mod tests {
     }
 
     #[test]
-    fn test_block_proposal_awaits_parent_m_notarization() {
-        // Per Minimit: When child proposal arrives before parent M-notarization,
-        // it should be marked as pending and processed later
+    fn test_block_proposal_fails_when_parent_has_no_m_notarization() {
+        // Per Minimmit paper: To build on a parent block, that block MUST have
+        // M-notarization. If view 1 has a block but NO M-notarization and only
+        // nullification, we cannot build on that block.
         let setup = TestSetup::new(N);
         let leader_id = setup.leader_id(0);
         let replica_id = setup.replica_id(1);
         let parent_hash = [23u8; blake3::OUT_LEN];
 
-        // View 1: Block proposed with only 2 votes (not enough for M-notarization yet)
+        // View 1: Block proposed with only 1 vote (not enough for M-notarization)
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
@@ -2598,13 +2685,10 @@ mod tests {
             ctx_v1.add_vote(vote, &setup.peer_set).unwrap();
         }
 
-        // View 1 has NO M-notarization yet
+        // View 1 has NO M-notarization
         assert!(ctx_v1.m_notarization.is_none());
 
         let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
-
-        // Manually create view 2 context (simulating view progression via nullification)
-        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
 
         // Add nullification to view 1 so we can progress
         let nullifies: HashSet<Nullify> = (0..M_SIZE)
@@ -2620,16 +2704,18 @@ mod tests {
             .route_nullification(nullification, &setup.peer_set)
             .unwrap();
 
+        // Progress to view 2 via nullification
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
-        // Now try to propose a block for view 2 building on view 1
-        // This should FAIL because view 1 was nullified
+        // Try to propose block for view 2 building on view 1's block.
+        // View 1 is nullified AND has no M-notarization, so this should FAIL
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), &setup.peer_set);
 
-        // Should fail - cannot build on nullified parent
+        // Should fail because parent view 1 is nullified without M-notarization
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nullified"));
 
@@ -3016,17 +3102,19 @@ mod tests {
     }
 
     #[test]
-    fn test_block_proposal_rejects_nullified_parent() {
-        // Cannot build on a nullified parent
+    fn test_block_proposal_accepts_m_notarized_parent_with_nullification() {
+        // Per Minimmit paper Section 4: A view can have BOTH M-notarization AND
+        // nullification. We CAN build on a parent that has M-notarization,
+        // even if it also has a nullification.
         let setup = TestSetup::new(N);
         let leader_id = setup.leader_id(0);
         let replica_id = setup.replica_id(1);
         let parent_hash = [28u8; blake3::OUT_LEN];
 
-        // View 1: Nullified
         let peer_set = &setup.peer_set;
         let peer_id_to_secret_key = &setup.peer_id_to_secret_key;
 
+        // View 1: Has BOTH block with M-notarization AND nullification
         let mut ctx_v1 = ViewContext::new(1, leader_id, replica_id, parent_hash);
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v1 = create_test_block(1, leader_id, parent_hash, leader_sk.clone(), 1);
@@ -3035,30 +3123,57 @@ mod tests {
             .add_new_view_block(block_v1, Arc::new(StateDiff::new()), peer_set)
             .unwrap();
 
-        let nullifies: HashSet<Nullify> = (0..M_SIZE)
+        // Add M-notarization (enough votes) - uses peers 1, 2, 3
+        // Note: peer 0 (leader) already has implicit vote from add_new_view_block
+        for i in 1..(M_SIZE + 1) {
+            let vote = create_vote(
+                i,
+                1,
+                block_hash_v1,
+                leader_id,
+                peer_set,
+                peer_id_to_secret_key,
+            );
+            ctx_v1.add_vote(vote, peer_set).unwrap();
+        }
+
+        assert!(ctx_v1.m_notarization.is_some());
+
+        // Also add nullification (views can have both)
+        // Use DIFFERENT peers for nullification to avoid conflict with votes
+        // In a real scenario, nullification can come from any 2f+1 peers
+        let nullifies: HashSet<Nullify> = (1..(M_SIZE + 1))
             .map(|i| create_nullify(i, 1, leader_id, peer_set, peer_id_to_secret_key))
             .collect();
         for nullify in nullifies.iter() {
             ctx_v1.add_nullify(nullify.clone(), peer_set).unwrap();
         }
+
         let nullification = create_nullification(&nullifies, 1, leader_id);
         ctx_v1.add_nullification(nullification, peer_set).unwrap();
 
+        // View 1 now has BOTH M-notarization AND nullification
+        assert!(ctx_v1.m_notarization.is_some());
+        assert!(ctx_v1.nullification.is_some());
+
         let mut view_chain = ViewChain::<N, F, M_SIZE>::new(ctx_v1, setup.persistence_writer);
 
-        // Progress to view 2
-        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
+        // Progress to view 2 via nullification
+        // View 2's expected parent is the M-notarized block from view 1
+        let ctx_v2 = ViewContext::new(2, leader_id, replica_id, block_hash_v1);
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
-        // Try to propose block for view 2 building on nullified view 1
+        // Propose block for view 2 building on M-notarized block from view 1
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), peer_set);
 
-        // Should FAIL - cannot build on nullified parent
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nullified"));
+        // Should SUCCEED - can build on M-notarized parent regardless of nullification
+        assert!(result.is_ok());
+        let proposal_result = result.unwrap();
+        assert!(!proposal_result.should_await); // Parent already has M-notarization
+        assert!(proposal_result.should_vote);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3132,6 +3247,12 @@ mod tests {
         }
 
         view_chain.progress_with_nullification(ctx_v2).unwrap();
+
+        // Manually progress to view 3 so we can finalize past views
+        // (Cannot use progress_with_nullification here as it would validate view 2 has nullification)
+        let ctx_v3 = ViewContext::new(3, leader_id, replica_id, block_hash_v2);
+        view_chain.current_view = 3;
+        view_chain.non_finalized_views.insert(3, ctx_v3);
 
         // Try to finalize view 2 - should FAIL because parent (view 1) has no M-notarization
         let result = view_chain.finalize_with_l_notarization(2, peer_set);
@@ -3211,6 +3332,11 @@ mod tests {
         }
         view_chain.current_view = 3;
         view_chain.non_finalized_views.insert(3, ctx_v3);
+
+        // Progress to view 4 so we can finalize past views
+        let ctx_v4 = ViewContext::new(4, leader_id, replica_id, block_hash_v3);
+        view_chain.current_view = 4;
+        view_chain.non_finalized_views.insert(4, ctx_v4);
 
         // Try to finalize view 3 - should FAIL because view 2 is not nullified
         let result = view_chain.finalize_with_l_notarization(3, peer_set);
@@ -3524,13 +3650,16 @@ mod tests {
         view_chain.current_view = 3;
         view_chain.non_finalized_views.insert(3, ctx_v3);
 
-        // Propose blocks for view 2 and 3 - they should be pending
+        // Propose block for view 2 - should succeed with should_await
+        // because view 1 has no M-notarization yet
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result_v2 =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), peer_set);
-        // This will fail because current_view is 3, not 2
-        assert!(result_v2.is_err());
+        // Per Minimmit: should succeed with should_await=true since parent lacks M-notarization
+        assert!(result_v2.is_ok());
+        let proposal_result = result_v2.unwrap();
+        assert!(proposal_result.should_await);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3585,15 +3714,17 @@ mod tests {
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
-        // Now at view 2: Try to propose block building on view 1 (which is nullified)
-        // This should fail because parent is nullified
+        // Per Minimmit paper: Try to propose block for view 2 building on view 1's block.
+        // View 1 has block but NO M-notarization, so should await M-notarization.
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), peer_set);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nullified"));
+        // Should succeed with should_await=true (parent lacks M-notarization)
+        assert!(result.is_ok());
+        let proposal_result = result.unwrap();
+        assert!(proposal_result.should_await);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3753,13 +3884,17 @@ mod tests {
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
-        // Try to propose block for view 2 building on view 1 (nullified) - should fail
+        // Per Minimmit paper: Try to propose block for view 2 building on view 1.
+        // View 1 has block but NO M-notarization, so should await.
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), &setup.peer_set);
 
-        assert!(result.is_err());
+        // Should succeed with should_await=true (parent lacks M-notarization)
+        assert!(result.is_ok());
+        let proposal_result = result.unwrap();
+        assert!(proposal_result.should_await);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -3898,13 +4033,16 @@ mod tests {
         let ctx_v2 = ViewContext::new(2, leader_id, replica_id, parent_hash);
         view_chain.progress_with_nullification(ctx_v2).unwrap();
 
-        // Block for view 2 building on nullified view 1 should fail
+        // Per Minimmit paper: Block for view 2 building on view 1 (no M-notarization) should await
         let leader_sk = setup.peer_id_to_secret_key.get(&leader_id).unwrap();
         let block_v2 = create_test_block(2, leader_id, block_hash_v1, leader_sk.clone(), 2);
         let result =
             view_chain.add_block_proposal(2, block_v2, Arc::new(StateDiff::new()), &setup.peer_set);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nullified"));
+
+        // Should succeed with should_await=true (parent lacks M-notarization)
+        assert!(result.is_ok());
+        let proposal_result = result.unwrap();
+        assert!(proposal_result.should_await);
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -4075,7 +4213,7 @@ mod tests {
         let result = view_chain.finalize_with_l_notarization(10, &setup.peer_set);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not greater than"));
+        assert!(result.unwrap_err().to_string().contains("current view"));
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
     }
@@ -4316,7 +4454,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("not the previously committed")
+                .contains("not found in non-finalized views or finalized storage")
         );
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();

@@ -738,6 +738,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             .finalize_with_l_notarization(view, &self.peers)
     }
 
+    /// Returns the oldest non-finalized view that has L-notarization (n-f votes).
+    ///
+    /// This is used to catch missed finalizations due to message ordering or
+    /// concurrent view progression. See ViewChain::oldest_finalizable_view for details.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        self.view_chain.oldest_finalizable_view()
+    }
+
     /// Marks that the current replica has proposed a block for a view.
     pub fn mark_proposed(&mut self, view: u64) -> Result<()> {
         if view == self.view_chain.current_view_number() {
@@ -4627,15 +4635,10 @@ mod tests {
         let view_0 = manager.view_chain.find_view_context(1).unwrap();
         assert_eq!(view_0.votes.len(), 3); // Less than n-f=5
 
-        // Try to finalize - should fail
+        // Try to finalize current view - should fail with "current view" error
         let result = manager.finalize_view(1);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not received a l-notarization")
-        );
+        assert!(result.unwrap_err().to_string().contains("current view"));
 
         // View should still exist
         assert!(manager.view_chain.find_view_context(1).is_some());
@@ -4655,13 +4658,13 @@ mod tests {
         let view_0 = manager.view_chain.find_view_context(1).unwrap();
         assert!(view_0.block.is_none());
 
-        // Try to finalize - should fail
+        // Try to finalize current view - should fail with "current view" error
         let result = manager.finalize_view(1);
         assert!(result.is_err());
 
-        // Could fail due to not enough votes OR no block
+        // Now fails due to current view check (not l-notarization or block check)
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not received a l-notarization") || err_msg.contains("no block"));
+        assert!(err_msg.contains("current view"));
 
         std::fs::remove_file(path).unwrap();
     }
@@ -4678,17 +4681,7 @@ mod tests {
         // Try to finalize view 5 (doesn't exist yet)
         let result = manager.finalize_view(5);
         assert!(result.is_err());
-        assert!(
-            result
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("not greater than the current view")
-                || result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("not an non-finalized view")
-        );
+        assert!(result.unwrap_err().to_string().contains("current view"));
 
         std::fs::remove_file(path).unwrap();
     }
@@ -4784,11 +4777,19 @@ mod tests {
         let view_1 = manager.view_chain.find_view_context(1).unwrap();
         assert_eq!(view_1.votes.len(), 5); // Exactly n-f
 
-        // Finalization should succeed
-        let result = manager.finalize_view(1);
-        assert!(result.is_ok());
+        // Create M-notarization with 3 votes and progress to view 2
+        let mut votes_for_m: HashSet<Vote> = HashSet::new();
+        for i in 1..=3 {
+            votes_for_m.insert(create_test_vote(i, 1, block_hash, leader_id, &setup));
+        }
+        let m_not = create_test_m_notarization::<6, 1, 3>(&votes_for_m, 1, block_hash, leader_id);
+        manager.handle_m_notarization(m_not).unwrap();
 
-        // View should be removed
+        // handle_m_notarization automatically finalizes views with L-notarization
+        // after progressing to view 2
+        assert_eq!(manager.current_view_number(), 2);
+
+        // View 1 should be auto-finalized (removed) since it had n-f votes
         assert!(manager.view_chain.find_view_context(1).is_none());
 
         std::fs::remove_file(path).unwrap();
@@ -4821,9 +4822,19 @@ mod tests {
         let view_1 = manager.view_chain.find_view_context(1).unwrap();
         assert_eq!(view_1.votes.len(), 6);
 
-        // Finalization should succeed
-        let result = manager.finalize_view(1);
-        assert!(result.is_ok());
+        // Create M-notarization with 3 votes and progress to view 2
+        let mut votes_for_m: HashSet<Vote> = HashSet::new();
+        for i in 1..=3 {
+            votes_for_m.insert(create_test_vote(i, 1, block_hash, leader_id, &setup));
+        }
+        let m_not = create_test_m_notarization::<6, 1, 3>(&votes_for_m, 1, block_hash, leader_id);
+        manager.handle_m_notarization(m_not).unwrap();
+
+        // handle_m_notarization auto-finalizes views with L-notarization
+        assert_eq!(manager.current_view_number(), 2);
+
+        // View 1 should be auto-finalized (removed) since it had more than n-f votes
+        assert!(manager.view_chain.find_view_context(1).is_none());
 
         std::fs::remove_file(path).unwrap();
     }
