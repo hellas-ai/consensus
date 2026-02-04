@@ -175,6 +175,7 @@ async fn run_rpc_p2p_service<C, const N: usize, const F: usize, const M_SIZE: us
     C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng + Clone,
 {
     use commonware_cryptography::Signer;
+    use std::collections::HashSet;
 
     let public_key = signer.public_key();
     slog::info!(logger, "Starting RPC P2P service"; "public_key" => ?public_key);
@@ -183,7 +184,47 @@ async fn run_rpc_p2p_service<C, const N: usize, const F: usize, const M_SIZE: us
     let (mut network, mut receivers) =
         NetworkService::new(context.clone(), signer, config.clone(), logger.clone()).await;
 
-    // Mark as ready (RPC nodes don't need full bootstrap)
+    // Build expected peer set from validator config
+    let expected_peers: HashSet<ed25519::PublicKey> = config
+        .validators
+        .iter()
+        .filter_map(|v| {
+            use commonware_codec::ReadExt;
+            let pk_bytes = v.parse_public_key_bytes()?;
+            ed25519::PublicKey::read(&mut pk_bytes.as_slice()).ok()
+        })
+        .collect();
+
+    // Bootstrap phase: wait for at least one peer or timeout
+    // Use config values for timeouts
+    let bootstrap_timeout = Duration::from_millis(config.bootstrap_timeout_ms);
+    let ping_interval = Duration::from_millis(config.ping_interval_ms);
+
+    slog::info!(logger, "RPC P2P bootstrap starting";
+        "expected_peers" => expected_peers.len(),
+        "timeout_secs" => bootstrap_timeout.as_secs()
+    );
+
+    let ready_peers = run_bootstrap_phase::<C, N, F, M_SIZE>(
+        &context,
+        &mut network,
+        &mut receivers,
+        &expected_peers,
+        bootstrap_timeout,
+        ping_interval,
+        &shutdown,
+        &shutdown_notify,
+        &logger,
+    )
+    .await;
+
+    if ready_peers.is_empty() {
+        slog::warn!(logger, "RPC P2P bootstrap timeout - no peers connected");
+    } else {
+        slog::info!(logger, "RPC P2P bootstrap complete"; "ready_peers" => ready_peers.len());
+    }
+
+    // Mark as ready
     is_ready.store(true, Ordering::Release);
     ready_notify.notify_waiters();
     slog::info!(logger, "RPC P2P service ready");
@@ -277,5 +318,110 @@ fn handle_sync_message<const N: usize, const F: usize, const M_SIZE: usize>(
             slog::debug!(logger, "Ignoring non-sync message on sync channel");
             Ok(())
         }
+    }
+}
+
+/// Run the P2P bootstrap phase.
+///
+/// Sends pings to discover peers and waits for at least one peer to respond,
+/// or times out. Returns the set of ready peers discovered.
+#[allow(clippy::too_many_arguments)]
+async fn run_bootstrap_phase<C, const N: usize, const F: usize, const M_SIZE: usize>(
+    context: &C,
+    network: &mut NetworkService<C>,
+    receivers: &mut p2p::network::NetworkReceivers,
+    expected_peers: &std::collections::HashSet<ed25519::PublicKey>,
+    timeout: Duration,
+    ping_interval: Duration,
+    shutdown: &AtomicBool,
+    shutdown_notify: &Notify,
+    logger: &Logger,
+) -> std::collections::HashSet<ed25519::PublicKey>
+where
+    C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng + Clone,
+{
+    use std::collections::HashSet;
+
+    let mut ready_peers: HashSet<ed25519::PublicKey> = HashSet::new();
+    let start = std::time::Instant::now();
+    let mut last_ping = std::time::Instant::now() - ping_interval;
+
+    while start.elapsed() < timeout && ready_peers.is_empty() {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Send pings periodically
+        if last_ping.elapsed() >= ping_interval {
+            let timestamp = context
+                .current()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            if let Ok(ping_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Ping(timestamp))
+            {
+                network.send_sync(ping_bytes, vec![]).await;
+                slog::debug!(logger, "Sent RPC bootstrap ping"; "timestamp" => timestamp);
+            }
+            last_ping = std::time::Instant::now();
+        }
+
+        // Wait for responses with a short timeout
+        tokio::select! {
+            biased;
+
+            _ = shutdown_notify.notified() => break,
+
+            _ = context.sleep(Duration::from_millis(100)) => {
+                // Continue loop
+            }
+
+            res = ReceiverTrait::recv(&mut receivers.sync) => {
+                if let Ok((sender, msg)) = res && let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
+                        handle_bootstrap_message::<N, F, M_SIZE, C>(
+                            p2p_msg,
+                            sender,
+                            network,
+                            expected_peers,
+                            &mut ready_peers,
+                            logger,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    ready_peers
+}
+
+/// Handle a message during bootstrap phase.
+async fn handle_bootstrap_message<const N: usize, const F: usize, const M_SIZE: usize, C>(
+    msg: P2PMessage<N, F, M_SIZE>,
+    sender: ed25519::PublicKey,
+    network: &mut NetworkService<C>,
+    expected_peers: &std::collections::HashSet<ed25519::PublicKey>,
+    ready_peers: &mut std::collections::HashSet<ed25519::PublicKey>,
+    logger: &Logger,
+) where
+    C: Spawner + Clock + Network + Resolver + Metrics + RngCore + CryptoRng + Clone,
+{
+    match msg {
+        P2PMessage::Ping(ts) => {
+            // Respond with Pong
+            if let Ok(pong_bytes) = serialize_message(&P2PMessage::<N, F, M_SIZE>::Pong(ts)) {
+                network.send_sync(pong_bytes, vec![sender.clone()]).await;
+            }
+            if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                slog::info!(logger, "RPC peer ready (ping)"; "peer" => ?sender);
+            }
+        }
+        P2PMessage::Pong(_ts) => {
+            if expected_peers.contains(&sender) && ready_peers.insert(sender.clone()) {
+                slog::info!(logger, "RPC peer ready (pong)"; "peer" => ?sender);
+            }
+        }
+        _ => {}
     }
 }

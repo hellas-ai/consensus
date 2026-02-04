@@ -2,6 +2,7 @@
 //!
 //! RPC nodes sync finalized blocks from validators using the BLOCK_SYNC P2P channel.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -56,7 +57,7 @@ impl Default for SyncConfig {
 /// * `N` - Total number of validators (5f+1)
 /// * `F` - Maximum faulty validators
 pub struct BlockSyncer<const N: usize, const F: usize> {
-    store: ConsensusStore,
+    store: Arc<ConsensusStore>,
     state: SyncState,
     config: SyncConfig,
     validators: Vec<ed25519::PublicKey>,
@@ -67,7 +68,7 @@ pub struct BlockSyncer<const N: usize, const F: usize> {
 impl<const N: usize, const F: usize> BlockSyncer<N, F> {
     /// Create a new block syncer.
     pub fn new(
-        store: ConsensusStore,
+        store: Arc<ConsensusStore>,
         validators: Vec<ed25519::PublicKey>,
         peer_set: PeerSet,
         config: SyncConfig,
@@ -190,7 +191,9 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
                 Ok(Some(block))
             }
             BlockResponse::NotFound { view } => {
-                slog::warn!(self.logger, "Block not found"; "view" => view);
+                slog::debug!(self.logger, "Block not yet finalized, will retry"; "height" => view);
+                // Don't skip - block heights are sequential. The block at this height
+                // just isn't L-notarized yet. We'll retry on the next sync cycle.
                 Ok(None)
             }
             BlockResponse::HashMismatch { view, actual_hash } => {
@@ -269,9 +272,9 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
     pub fn next_block_requests(&self) -> Vec<BlockRequest> {
         let (start_height, end_height) = match &self.state {
             SyncState::Discovering => {
-                // Just request height 1 to start discovery
+                // Request genesis block at height 0 to start discovery
                 return vec![BlockRequest {
-                    view: 1,
+                    view: 0,
                     block_hash: None,
                 }];
             }
@@ -284,11 +287,11 @@ impl<const N: usize, const F: usize> BlockSyncer<N, F> {
                 (start, end)
             }
             SyncState::Following { height } => {
-                // In following mode, just request next block
-                return vec![BlockRequest {
-                    view: height + 1,
-                    block_hash: None,
-                }];
+                // In following mode, request a batch of blocks starting from next height.
+                // This helps catch up when some intermediate blocks aren't L-notarized yet.
+                let start = height + 1;
+                let end = start + self.config.batch_size as u64;
+                (start, end)
             }
         };
 
@@ -412,7 +415,7 @@ mod tests {
 
     fn create_test_syncer() -> (BlockSyncer<6, 1>, tempfile::TempDir) {
         let temp = tempdir().unwrap();
-        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
         let logger = test_logger();
         let syncer = BlockSyncer::<6, 1>::new(
             store,
@@ -613,7 +616,7 @@ mod tests {
     #[test]
     fn test_pick_validator_single() {
         let temp = tempdir().unwrap();
-        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
         let logger = test_logger();
 
         let key = ed25519::PrivateKey::from_seed(100);
@@ -635,7 +638,7 @@ mod tests {
     #[test]
     fn test_pick_validator_multiple() {
         let temp = tempdir().unwrap();
-        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
         let logger = test_logger();
 
         let validators: Vec<_> = (0..5)
@@ -669,7 +672,7 @@ mod tests {
         };
 
         let temp = tempdir().unwrap();
-        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
         let logger = test_logger();
         let syncer = BlockSyncer::<6, 1>::new(store, vec![], PeerSet::new(vec![]), config, logger);
 
@@ -799,7 +802,7 @@ mod tests {
 
         // Create syncer with proper PeerSet
         let temp = tempdir().unwrap();
-        let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+        let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
         let logger = test_logger();
         let mut syncer =
             BlockSyncer::<6, 1>::new(store, vec![], peer_set, SyncConfig::default(), logger);

@@ -6,6 +6,7 @@
 //! - P2P handle lifecycle
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
@@ -71,7 +72,7 @@ fn test_block_syncer_with_store_persistence() {
     let logger = test_logger();
 
     // Create syncer with store
-    let store = ConsensusStore::open(&store_path).unwrap();
+    let store = Arc::new(ConsensusStore::open(&store_path).unwrap());
     let mut syncer = BlockSyncer::<6, 1>::new(
         store,
         vec![],
@@ -93,7 +94,7 @@ fn test_block_syncer_with_store_persistence() {
 #[test]
 fn test_block_syncer_validator_round_robin() {
     let temp = tempdir().unwrap();
-    let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+    let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
     let logger = test_logger();
 
     // Create validators
@@ -138,7 +139,7 @@ fn test_sync_config_custom_values() {
     };
 
     let temp = tempdir().unwrap();
-    let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+    let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
     let logger = test_logger();
     let syncer = BlockSyncer::<6, 1>::new(store, vec![], PeerSet::new(vec![]), config, logger);
 
@@ -210,7 +211,7 @@ fn test_multiple_rpc_nodes_different_ports() {
 #[test]
 fn test_sync_state_transitions_via_target() {
     let temp = tempdir().unwrap();
-    let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+    let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
     let logger = test_logger();
 
     let mut syncer = BlockSyncer::<6, 1>::new(
@@ -238,7 +239,7 @@ fn test_sync_state_transitions_via_target() {
 
     // 3. If target is already reached, go directly to Following
     let temp2 = tempdir().unwrap();
-    let store2 = ConsensusStore::open(temp2.path().join("test.redb")).unwrap();
+    let store2 = Arc::new(ConsensusStore::open(temp2.path().join("test.redb")).unwrap());
     let mut syncer2 = BlockSyncer::<6, 1>::new(
         store2,
         vec![],
@@ -258,7 +259,7 @@ fn test_sync_state_transitions_via_target() {
 #[test]
 fn test_block_request_generation() {
     let temp = tempdir().unwrap();
-    let store = ConsensusStore::open(temp.path().join("test.redb")).unwrap();
+    let store = Arc::new(ConsensusStore::open(temp.path().join("test.redb")).unwrap());
     let logger = test_logger();
     let mut syncer = BlockSyncer::<6, 1>::new(
         store,

@@ -180,8 +180,7 @@ impl<const N: usize, const F: usize> RpcNode<N, F> {
         );
 
         let mut syncer = BlockSyncer::<N, F>::new(
-            ConsensusStore::open(self.config.data_dir.join("consensus.redb"))
-                .context("Failed to open consensus store for syncer")?,
+            Arc::clone(&self.store),
             validator_keys,
             peer_set,
             SyncConfig::default(),

@@ -584,6 +584,428 @@ fn test_rpc_node_sync_from_validators() {
     });
 }
 
+/// E2E test: gRPC client queries blocks from RPC node (not validator).
+///
+/// This test verifies the complete RPC node data path:
+/// 1. Validators finalize blocks via consensus
+/// 2. RPC node syncs blocks from validators via P2P
+/// 3. gRPC client queries blocks from RPC node's gRPC server
+///
+/// This is the key test for verifying RPC nodes serve synced data correctly.
+///
+/// # Run Instructions
+/// ```bash
+/// cargo test --package tests --lib test_rpc_node_grpc_block_queries -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn test_rpc_node_grpc_block_queries() {
+    let logger = create_test_logger();
+
+    slog::info!(
+        logger,
+        "Starting RPC node gRPC block queries E2E test";
+        "validators" => N,
+    );
+
+    // Phase 1: Generate validator identities
+    let num_transactions = 10;
+    let (transactions, genesis_accounts) = create_funded_test_transactions(num_transactions);
+
+    let mut identities = Vec::new();
+    let mut public_keys = Vec::new();
+
+    for _i in 0..N {
+        let bls_sk = BlsSecretKey::generate(&mut rand::thread_rng());
+        let identity = ValidatorIdentity::from_bls_key(bls_sk);
+        public_keys.push(identity.bls_public_key().clone());
+        identities.push(identity);
+    }
+
+    let peer_set = PeerSet::new(public_keys);
+
+    let mut peer_strs = Vec::with_capacity(peer_set.sorted_peer_ids.len());
+    for peer_id in &peer_set.sorted_peer_ids {
+        let pk = peer_set.id_to_public_key.get(peer_id).unwrap();
+        let mut buf = Vec::new();
+        pk.0.serialize_compressed(&mut buf).unwrap();
+        peer_strs.push(hex::encode(buf));
+    }
+
+    let consensus_config = ConsensusConfig {
+        n: N,
+        f: F,
+        view_timeout: DEFAULT_VIEW_TIMEOUT,
+        leader_manager:
+            consensus::consensus_manager::leader_manager::LeaderSelectionStrategy::RoundRobin,
+        network: consensus::consensus_manager::config::Network::Local,
+        peers: peer_strs,
+        genesis_accounts: genesis_accounts.clone(),
+    };
+
+    // Phase 2: Create P2P configs - use randomized port base to avoid collisions
+    let base_port = 48000u16 + (rand::random::<u16>() % 8000);
+    let port_gap = 100u16;
+    let mut p2p_configs = Vec::new();
+
+    // Pre-generate RPC node identity so we can add it to validators' peer sets
+    // This allows the commonware discovery network to authorize the RPC node
+    let rpc_identity = RpcIdentity::from_seed(99999);
+    let rpc_p2p_port = base_port + (N as u16 * port_gap) + 51;
+    let rpc_ed25519_pk = rpc_identity.public_key();
+    let rpc_peer_info = ValidatorPeerInfo {
+        bls_peer_id: 0, // RPC node doesn't have a BLS peer ID
+        bls_public_key: None,
+        ed25519_public_key: hex::encode(rpc_ed25519_pk.as_ref()),
+        address: Some(format!("127.0.0.1:{}", rpc_p2p_port).parse().unwrap()),
+    };
+
+    for (i, _identity) in identities.iter().enumerate() {
+        let port = base_port + (i as u16 * port_gap);
+        let listen_addr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let external_addr = listen_addr;
+
+        let mut validators = Vec::new();
+        for (j, other_identity) in identities.iter().enumerate() {
+            if i != j {
+                let other_port = base_port + (j as u16 * port_gap);
+                let ed25519_pk = other_identity.ed25519_public_key();
+                let pk_hex = hex::encode(ed25519_pk.as_ref());
+                validators.push(ValidatorPeerInfo {
+                    bls_peer_id: other_identity.peer_id(),
+                    bls_public_key: None,
+                    ed25519_public_key: pk_hex,
+                    address: Some(format!("127.0.0.1:{}", other_port).parse().unwrap()),
+                });
+            }
+        }
+        // Add RPC node to validators' peer set so they can communicate with it
+        validators.push(rpc_peer_info.clone());
+
+        let p2p_config = P2PConfig {
+            listen_addr,
+            external_addr,
+            validators,
+            total_number_peers: N,
+            maximum_number_faulty_peers: F,
+            bootstrap_timeout_ms: 20_000,
+            ping_interval_ms: 200,
+            cluster_id: "test-cluster".to_string(),
+            ..Default::default()
+        };
+
+        p2p_configs.push(p2p_config);
+    }
+
+    // Build RPC validator config before identities are moved
+    let rpc_validators: Vec<ValidatorPeerInfo> = identities
+        .iter()
+        .enumerate()
+        .map(|(i, identity)| {
+            let port = base_port + (i as u16 * port_gap);
+            let ed25519_pk = identity.ed25519_public_key();
+            let bls_pk = identity.bls_public_key();
+            let mut bls_bytes = Vec::new();
+            bls_pk.0.serialize_compressed(&mut bls_bytes).unwrap();
+            ValidatorPeerInfo {
+                ed25519_public_key: hex::encode(ed25519_pk.as_ref()),
+                bls_peer_id: identity.peer_id(),
+                bls_public_key: Some(hex::encode(&bls_bytes)),
+                address: Some(format!("127.0.0.1:{}", port).parse().unwrap()),
+            }
+        })
+        .collect();
+
+    // Phase 3: Spawn validator nodes
+    slog::info!(logger, "Phase 3: Spawning validator nodes");
+
+    let mut validator_nodes: Vec<ValidatorNodeSetup<N, F, M_SIZE>> = Vec::new();
+    let mut store_with_dirs: Vec<(Arc<ConsensusStore>, TempDir)> = Vec::new();
+
+    for (i, (identity, p2p_config)) in identities
+        .into_iter()
+        .zip(p2p_configs.into_iter())
+        .enumerate()
+    {
+        let node_logger = logger.new(o!("node" => i, "peer_id" => identity.peer_id()));
+        let (node, storage, temp_dir) = create_validator_node_setup(
+            identity,
+            p2p_config,
+            consensus_config.clone(),
+            node_logger,
+        );
+        validator_nodes.push(node);
+        store_with_dirs.push((storage, temp_dir));
+    }
+
+    slog::info!(logger, "All validator nodes spawned"; "count" => validator_nodes.len());
+
+    // Phase 4: Run consensus and create RPC node
+    let executor = TokioRunner::default();
+    executor.start(|ctx| async move {
+        // Wait for validators to bootstrap
+        for (i, node) in validator_nodes.iter().enumerate() {
+            slog::info!(logger, "Waiting for validator bootstrap"; "node" => i);
+            node.p2p_handle.wait_ready().await;
+        }
+        slog::info!(logger, "All validators bootstrapped");
+
+        // Submit transactions to kickstart consensus
+        for (i, tx) in transactions.iter().enumerate() {
+            let node_idx = i % N;
+            let grpc_addr = validator_nodes[node_idx].grpc_addr;
+
+            let addr = format!("http://{}", grpc_addr);
+            let mut client =
+                grpc_client::proto::transaction_service_client::TransactionServiceClient::connect(
+                    addr,
+                )
+                .await
+                .ok();
+
+            if let Some(ref mut c) = client {
+                let tx_bytes = consensus::storage::conversions::serialize_for_db(tx)
+                    .expect("serialize tx")
+                    .to_vec();
+                let request = grpc_client::proto::SubmitTransactionRequest {
+                    transaction_bytes: tx_bytes,
+                };
+                let _ = c.submit_transaction(request).await;
+            }
+        }
+
+        slog::info!(logger, "Transactions submitted, waiting for blocks");
+
+        // Wait for some blocks to be finalized
+        ctx.sleep(Duration::from_secs(15)).await;
+
+        // Verify validators have finalized blocks
+        let validator_block_count = store_with_dirs[0]
+            .0
+            .get_all_finalized_blocks()
+            .map(|b| b.len())
+            .unwrap_or(0);
+
+        slog::info!(
+            logger,
+            "Validators have finalized blocks";
+            "count" => validator_block_count,
+        );
+
+        assert!(
+            validator_block_count > 0,
+            "Validators should have finalized blocks"
+        );
+
+        // Phase 5: Create and run RPC node with a KNOWN gRPC port
+        slog::info!(logger, "Phase 5: Creating RPC node with known gRPC port");
+
+        let rpc_temp = tempfile::tempdir().expect("create rpc temp dir");
+
+        // Use a specific port for RPC node's gRPC server (offset from validator ports)
+        let rpc_grpc_port = base_port + (N as u16 * port_gap) + 50;
+        let rpc_p2p_port = base_port + (N as u16 * port_gap) + 51;
+        let rpc_grpc_addr: std::net::SocketAddr = format!("127.0.0.1:{}", rpc_grpc_port)
+            .parse()
+            .expect("parse rpc grpc addr");
+
+        slog::info!(
+            logger,
+            "RPC node addresses";
+            "grpc_addr" => %rpc_grpc_addr,
+            "p2p_port" => rpc_p2p_port,
+        );
+
+        let rpc_config = RpcConfig {
+            grpc_addr: rpc_grpc_addr,
+            p2p_addr: format!("127.0.0.1:{}", rpc_p2p_port).parse().unwrap(),
+            data_dir: rpc_temp.path().to_path_buf(),
+            cluster_id: "test-cluster".to_string(),
+            validators: rpc_validators.clone(),
+            identity_path: None,
+        };
+
+        let rpc_identity = RpcIdentity::from_seed(99999);
+        let mut rpc_node = RpcNode::<N, F>::new(
+            rpc_config.clone(),
+            rpc_identity,
+            logger.new(o!("component" => "rpc_node")),
+        )
+        .expect("create rpc node");
+
+        // Get shutdown signal before spawning
+        let rpc_shutdown = rpc_node.get_shutdown_signal();
+        let rpc_logger = logger.new(o!("component" => "rpc_node_runner"));
+
+        // Spawn RPC node run loop in background
+        tokio::spawn(async move {
+            if let Err(e) = rpc_node.run().await {
+                slog::error!(rpc_logger, "RPC node error"; "error" => %e);
+            }
+        });
+
+        // Wait for RPC node to sync - give it extra time since it needs to:
+        // 1. Start gRPC server
+        // 2. Connect to validators via P2P
+        // 3. Sync all finalized blocks
+        slog::info!(logger, "Waiting for RPC node to sync blocks");
+        ctx.sleep(Duration::from_secs(35)).await;
+
+        // Phase 6: Query blocks from RPC node's gRPC server (NOT validator!)
+        slog::info!(
+            logger,
+            "Phase 6: Querying blocks from RPC node's gRPC server"
+        );
+
+        let rpc_addr = format!("http://{}", rpc_grpc_addr);
+        slog::info!(logger, "Connecting to RPC node gRPC"; "addr" => &rpc_addr);
+
+        let mut block_client = BlockServiceClient::connect(rpc_addr.clone())
+            .await
+            .expect("connect to RPC node block service");
+
+        // Query finalized blocks from RPC node
+        let request = GetBlocksRequest {
+            from_height: 0,
+            to_height: 10,
+            limit: 10,
+        };
+
+        let response = block_client
+            .get_blocks(request)
+            .await
+            .expect("get blocks from RPC node")
+            .into_inner();
+
+        slog::info!(
+            logger,
+            "Received blocks from RPC node gRPC";
+            "count" => response.blocks.len(),
+        );
+
+        assert!(
+            !response.blocks.is_empty(),
+            "RPC node should serve synced blocks via gRPC"
+        );
+
+        // Verify RPC node has same blocks as validator
+        let validator_grpc_addr = format!("http://{}", validator_nodes[0].grpc_addr);
+        let mut validator_block_client = BlockServiceClient::connect(validator_grpc_addr)
+            .await
+            .expect("connect to validator block service");
+
+        let validator_request = GetBlocksRequest {
+            from_height: 0,
+            to_height: 10,
+            limit: 10,
+        };
+
+        let validator_response = validator_block_client
+            .get_blocks(validator_request)
+            .await
+            .expect("get blocks from validator")
+            .into_inner();
+
+        // Sort blocks by height for consistent verification
+        let mut rpc_blocks = response.blocks;
+        rpc_blocks.sort_by_key(|b| b.height);
+        let mut validator_blocks = validator_response.blocks;
+        validator_blocks.sort_by_key(|b| b.height);
+
+        slog::info!(
+            logger,
+            "Comparing RPC node and validator blocks";
+            "rpc_blocks" => rpc_blocks.len(),
+            "validator_blocks" => validator_blocks.len(),
+        );
+
+        // RPC node should have synced multiple finalized blocks from validators
+        const MIN_REQUIRED_BLOCKS: usize = 3;
+        assert!(
+            rpc_blocks.len() >= MIN_REQUIRED_BLOCKS,
+            "RPC node should have at least {} blocks, got {}",
+            MIN_REQUIRED_BLOCKS,
+            rpc_blocks.len()
+        );
+
+        // Build height -> hash map from validator for comparison
+        let validator_block_map: std::collections::HashMap<u64, String> = validator_blocks
+            .iter()
+            .map(|b| (b.height, b.hash.clone()))
+            .collect();
+
+        // Verify block hashes match between RPC node and validator (by height)
+        // Note: RPC may have blocks that validator hasn't reported yet due to timing
+        let mut verified_count = 0;
+        for rpc_block in rpc_blocks.iter() {
+            if let Some(val_hash) = validator_block_map.get(&rpc_block.height) {
+                assert_eq!(
+                    &rpc_block.hash, val_hash,
+                    "Block hash mismatch at height {}",
+                    rpc_block.height
+                );
+                verified_count += 1;
+                slog::debug!(
+                    logger,
+                    "Block hash verified";
+                    "height" => rpc_block.height,
+                    "hash" => hex::encode(&rpc_block.hash),
+                );
+            }
+            // Skip blocks not in validator - timing differences are expected
+        }
+
+        // Ensure we verified at least some blocks in common
+        assert!(
+            verified_count >= 1,
+            "At least one RPC block should match validator, verified: {}",
+            verified_count
+        );
+
+        // TODO: We need to review this.
+        // Log block height range (heights may not be consecutive due to L-notarization timing)
+        let first_height = rpc_blocks.first().map(|b| b.height).unwrap_or(0);
+        let last_height = rpc_blocks.last().map(|b| b.height).unwrap_or(0);
+        let height_list: Vec<u64> = rpc_blocks.iter().map(|b| b.height).collect();
+
+        slog::info!(
+            logger,
+            "RPC node gRPC verification passed ✓";
+            "rpc_block_count" => rpc_blocks.len(),
+            "hash_verified" => verified_count,
+            "first_height" => first_height,
+            "last_height" => last_height,
+            "heights" => format!("{:?}", height_list),
+        );
+
+        // Phase 7: Shutdown
+        slog::info!(logger, "Phase 7: Graceful shutdown");
+
+        // Signal RPC node to shutdown
+        rpc_shutdown
+            .0
+            .store(true, std::sync::atomic::Ordering::Release);
+        rpc_shutdown.1.notify_waiters();
+        ctx.sleep(Duration::from_millis(500)).await;
+
+        // Use spawn_blocking to safely drop RPC temp dir (may contain runtime handles)
+        let _ = tokio::task::spawn_blocking(move || drop(rpc_temp)).await;
+
+        shutdown_validator_nodes(validator_nodes, Duration::from_secs(10), &logger);
+
+        // Give tokio runtime time to clean up background tasks
+        ctx.sleep(Duration::from_millis(500)).await;
+
+        // Use spawn_blocking to safely drop store dirs (may contain runtime handles)
+        let _ = tokio::task::spawn_blocking(move || drop(store_with_dirs)).await;
+
+        slog::info!(
+            logger,
+            "RPC node gRPC block queries E2E test completed successfully! ✓"
+        );
+    });
+}
+
 /// E2E test: Multiple RPC nodes subscribe to block streams.
 ///
 /// This test:
