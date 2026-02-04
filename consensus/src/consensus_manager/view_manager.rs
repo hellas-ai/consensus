@@ -383,7 +383,7 @@ use crate::{
             ShouldMNotarize, ViewContext,
         },
     },
-    crypto::aggregated::{BlsPublicKey, BlsSecretKey, BlsSignature, PeerId},
+    crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId},
     state::{
         block::Block,
         notarizations::{MNotarization, Vote},
@@ -452,25 +452,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .collect(),
         );
 
-        // Create Genesis block
-        let genesis_leader = leader_manager.leader_for_view(0)?.peer_id();
+        // Genesis is pre-protocol state per Minimmit paper (Section 4)
+        // Views are numbered v = 1, 2, 3, ... (not 0)
+        // Genesis hash is used as SelectParent fallback when no M-notarization exists
         let genesis_block_hash = Block::genesis_hash();
-        let genesis_block = Block::genesis(
-            genesis_leader,
-            BlsSignature(ark_bls12_381::G1Affine::default()),
-        );
-        debug_assert_eq!(genesis_block.get_hash(), genesis_block_hash);
 
-        let genesis_m_notarization = MNotarization {
-            view: 0,
-            leader_id: genesis_leader,
-            block_hash: genesis_block_hash,
-            aggregated_signature: BlsSignature(ark_bls12_381::G1Affine::default()), // Placeholder
-            peer_ids: [PeerId::default(); M_SIZE], // Placeholder peers
-        };
-
-        persistence_writer.put_finalized_block(&genesis_block)?;
-        persistence_writer.put_m_notarization(&genesis_m_notarization)?; // TODO: do we need to store a L-notarization for the genesis block as well (n-f votes)?
+        // Initialize genesis accounts (application state, not consensus)
         persistence_writer.initialize_genesis_accounts(&config.genesis_accounts)?;
 
         slog::info!(
@@ -479,26 +466,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             "count" => config.genesis_accounts.len(),
         );
 
-        let mut genesis_context: ViewContext<N, F, M_SIZE> =
-            ViewContext::new(0, genesis_leader, replica_id, [0; blake3::OUT_LEN]);
-        genesis_context.block = Some(genesis_block.clone());
-        genesis_context.block_hash = Some(genesis_block_hash);
-        genesis_context.has_voted = true;
-        genesis_context.m_notarization = Some(genesis_m_notarization);
-
-        // 3. Initialize ViewChain starting at View 1
-        // The parent of View 1 is the Genesis Hash.
+        // Initialize ViewChain starting at View 1 (per paper: v = 1, 2, 3, ...)
+        // The parent of View 1 is the genesis hash
         let view1_leader = leader_manager.leader_for_view(1)?.peer_id();
-
-        // We create the context for View 1 directly
         let view1_context = ViewContext::new(
-            1, // Start at View 1
+            1, // Protocol starts at View 1
             view1_leader,
             replica_id,
-            genesis_block_hash, // Parent is Genesis
+            genesis_block_hash, // SelectParent fallback for view 1
         );
 
         let block_validator = BlockValidator::new(persistence_writer.reader());
+        // Sets previously_committed_block_hash = genesis_hash
         let view_chain = ViewChain::new(view1_context, persistence_writer);
 
         Ok(Self {
@@ -548,9 +527,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .collect(),
         );
 
-        let leader_id = leader_manager.leader_for_view(0)?.peer_id();
-        let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        // Protocol starts at view 1 per Minimmit paper (Section 4)
+        let genesis_block_hash = Block::genesis_hash();
+        let leader_id = leader_manager.leader_for_view(1)?.peer_id();
+        let view_context = ViewContext::new(1, leader_id, replica_id, genesis_block_hash);
 
+        // ViewChain::new() sets previously_committed_block_hash = genesis_hash
         let view_chain = ViewChain::new(view_context, persistence_writer);
 
         Ok(Self {
@@ -562,40 +544,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             peers,
             logger,
         })
-    }
-
-    /// Creates a genesis vote for this replica
-    pub fn create_genesis_vote(&mut self, secret_key: &BlsSecretKey) -> Result<Vote> {
-        let current_view = self.view_chain.current_view_mut();
-
-        if current_view.view_number != 0 {
-            return Err(anyhow::anyhow!("Can only create genesis vote at view 0"));
-        }
-
-        if current_view.has_voted {
-            return Err(anyhow::anyhow!("Already voted for genesis"));
-        }
-
-        let genesis_hash = current_view
-            .block_hash
-            .ok_or_else(|| anyhow::anyhow!("Genesis block not set"))?;
-
-        // Create the vote
-        let signature = secret_key.sign(&genesis_hash);
-
-        let vote = Vote::new(
-            0, // view 0
-            genesis_hash,
-            signature,
-            self.replica_id,
-            current_view.leader_id,
-        );
-
-        // Mark as voted and add our own vote
-        current_view.has_voted = true;
-        current_view.votes.insert(vote.clone());
-
-        Ok(vote)
     }
 
     /// Selects the parent block for a new view according to the Minimmit SelectParent function.
@@ -1786,7 +1734,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.current_view_number(), 0);
+        // Protocol starts at view 1 per Minimmit paper
+        assert_eq!(manager.current_view_number(), 1);
         assert_eq!(manager.non_finalized_count(), 1);
         assert_eq!(manager.peers.sorted_peer_ids.len(), 6);
 
