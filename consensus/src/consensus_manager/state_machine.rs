@@ -321,7 +321,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             while let Ok(message) = self.message_consumer.pop() {
                 did_work = true;
                 if let Err(e) = self.handle_consensus_message(message) {
-                    slog::error!(self.logger, "Error handling consensus message: {}", e);
+                    slog::warn!(self.logger, "Error handling consensus message: {}", e);
                 }
             }
 
@@ -836,26 +836,59 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             return Ok(());
         }
 
-        let nullify = if view_ctx.has_voted {
-            // NOTE: After voting, the current replica must have conflicting evidence,
-            // so in this case, the view is under Byzantine behavior.
-            view_ctx.create_nullify_for_byzantine(&self.secret_key)?
-        } else {
-            // NOTE: If the current replica attempts to nullify a message before voting, it could be
-            // timeout OR Byzantine. We distinguish based on the type of evidence:
-            let num_conflicting_votes = view_ctx.num_invalid_votes;
-            let num_nullify_messages = view_ctx.nullify_messages.len();
-            let combined_count = num_conflicting_votes + num_nullify_messages;
+        // MINIMMIT PAPER NULLIFICATION RULES (Section 3 & Algorithm 1 lines 13-14, 24-28):
+        //
+        // A replica can nullify in two cases:
+        // 1. TIMEOUT NULLIFICATION (lines 13-14): Timer expires BEFORE voting
+        //    - Condition: notarised = ⊥ (hasn't voted) AND timer expired
+        //    - NOT allowed after voting
+        //
+        // 2. BYZANTINE-EVIDENCE NULLIFICATION (lines 24-28): After voting, ONLY with evidence
+        //    - Condition: notarised ≠ ⊥ (has voted) AND received ≥ 2f+1 messages that are either:
+        //      (i) nullify(v) messages, OR
+        //      (ii) votes for a DIFFERENT block than what this replica voted for
+        //    - This is allowed because the conflicting evidence proves no block can be L-notarized
+        //
+        // LEMMA 5.3 SAFETY PROOF: If block b receives L-notarization (n-f votes), the voters
+        // cannot be triggered to nullify because at most 2f processors can provide conflicting
+        // evidence (nullifies or votes for different blocks).
 
-            if num_conflicting_votes > F || combined_count > 2 * F {
-                // Byzantine behavior detected:
-                // - Conflicting votes > F means equivocation (can't finalize)
-                // - Combined evidence > 2F indicates Byzantine quorum
+        let num_conflicting_votes = view_ctx.num_invalid_votes;
+        let num_nullify_messages = view_ctx.nullify_messages.len();
+        let combined_count = num_conflicting_votes + num_nullify_messages;
+        let has_byzantine_evidence = num_conflicting_votes > F || combined_count > 2 * F;
+
+        let nullify = if view_ctx.has_voted {
+            // ALREADY VOTED: Only allow nullification with Byzantine evidence (paper lines 24-28)
+            if has_byzantine_evidence {
+                slog::info!(
+                    self.logger,
+                    "View {view} already voted, but nullifying due to Byzantine evidence \
+                     (conflicting_votes={}, nullify_messages={}, combined={})",
+                    num_conflicting_votes,
+                    num_nullify_messages,
+                    combined_count
+                );
                 view_ctx.create_nullify_for_byzantine(&self.secret_key)?
             } else {
-                // Timeout (no strong evidence of Byzantine behavior)
-                view_ctx.create_nullify_for_timeout(&self.secret_key)?
+                // No Byzantine evidence - cascading nullification or timeout after voting
+                // This would violate Lemma 5.3 if we allowed it
+                slog::info!(
+                    self.logger,
+                    "View {view} already voted, cannot nullify without Byzantine evidence \
+                     (conflicting_votes={}, nullify_messages={}, need > 2F={})",
+                    num_conflicting_votes,
+                    num_nullify_messages,
+                    2 * F
+                );
+                return Ok(());
             }
+        } else if has_byzantine_evidence {
+            // NOT VOTED: Byzantine evidence detected
+            view_ctx.create_nullify_for_byzantine(&self.secret_key)?
+        } else {
+            // NOT VOTED: Timeout nullification (paper lines 13-14)
+            view_ctx.create_nullify_for_timeout(&self.secret_key)?
         };
 
         // Broadcast the nullify message to the network layer (to be received by other replicas)
@@ -890,6 +923,46 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             "Progressing to next view {view} with leader {leader} and notarized block hash {notarized_block_hash:?}"
         );
 
+        // Retry finalization for views that have accumulated L-notarization (n-f votes).
+        // Per Minimmit paper Section 5.2: Finalization can happen AFTER view progression.
+        // This catches cases where the normal finalization path was missed due to
+        // message ordering or concurrent view progression via M-notarization.
+        let mut last_attempted_view: Option<u64> = None;
+        while let Some((finalizable_view, block_hash)) = self.view_manager.oldest_finalizable_view()
+        {
+            // If we're seeing the same view again, finalization was deferred (e.g., missing
+            // ancestor blocks). Break to avoid infinite loop - we'll retry on next view progression.
+            if last_attempted_view == Some(finalizable_view) {
+                slog::debug!(
+                    self.logger,
+                    "Finalization for view {} was deferred, will retry later",
+                    finalizable_view
+                );
+                break;
+            }
+            last_attempted_view = Some(finalizable_view);
+
+            match self.finalize_view(finalizable_view, block_hash) {
+                Ok(()) => {
+                    slog::info!(
+                        self.logger,
+                        "Finalized pending view {} via retry on view progression",
+                        finalizable_view
+                    );
+                }
+                Err(e) => {
+                    slog::warn!(
+                        self.logger,
+                        "Pending finalization retry failed for view {}: {}, continuing",
+                        finalizable_view,
+                        e
+                    );
+                    // On error, also break to avoid infinite loop with same failing view
+                    break;
+                }
+            }
+        }
+
         // Replay any buffered messages for this view (or previous ones)
         let pending_views: Vec<u64> = self
             .pending_messages
@@ -900,7 +973,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
         for pending_view in pending_views {
             if let Some(messages) = self.pending_messages.remove(&pending_view) {
-                slog::debug!(
+                slog::warn!(
                     self.logger,
                     "Replaying {} buffered messages for view {}",
                     messages.len(),

@@ -211,6 +211,60 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
+    /// Returns the oldest non-finalized view that has L-notarization (n-f votes) and a block.
+    ///
+    /// Per Minimmit paper: L-notarization (n-f votes) suffices for finalization.
+    /// This function finds views that accumulated enough votes but may have missed
+    /// finalization due to message ordering or concurrent view progression.
+    ///
+    /// # Returns
+    /// * `Some((view, block_hash))` - The oldest finalizable view and its block hash
+    /// * `None` - No views are ready for finalization
+    ///
+    /// # Note
+    /// This excludes the current view since finalization requires the view to have progressed.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        let current_view = self.current_view;
+
+        // Views are created sequentially, so the range is already sorted (oldest first).
+        // We exclude the current view since finalization requires view progression.
+        let range = self.non_finalized_view_numbers_range();
+        for view in range {
+            if view >= current_view {
+                break;
+            }
+            if let Some(ctx) = self.non_finalized_views.get(&view) {
+                // Check if view has L-notarization (n-f votes) and a block
+                if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                    // LEMMA 5.3 VIOLATION CHECK: L-notarization and nullification are mutually exclusive.
+                    // If we have both, this indicates a critical bug in the protocol implementation.
+                    if ctx.nullification.is_some() {
+                        // Log detailed diagnostic info to help debug this impossible state
+                        eprintln!(
+                            "[CRITICAL BUG] Lemma 5.3 violated at view {}!\n\
+                             L-notarization votes: {} (threshold: {})\n\
+                             Nullification: present ({} nullify messages)\n\
+                             Block hash: {:?}\n\
+                             This should be IMPOSSIBLE - a view cannot have both L-notarization AND nullification.",
+                            view,
+                            ctx.votes.len(),
+                            N - F,
+                            ctx.nullify_messages.len(),
+                            ctx.block_hash
+                        );
+                        // Skip this view for now but continue - we need to understand why this happened
+                        continue;
+                    }
+                    let block_hash = ctx
+                        .block_hash
+                        .unwrap_or_else(|| ctx.block.as_ref().unwrap().get_hash());
+                    return Some((view, block_hash));
+                }
+            }
+        }
+        None
+    }
+
     /// Stores a pre-computed [`StateDiff`] instance for a view.
     ///
     /// This method is called when block validation completes and produces a [`StateDiff`]
@@ -740,6 +794,46 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
+        // 3.5. LEMMA 5.3 VIOLATION CHECK: L-notarization and nullification are mutually exclusive.
+        // If a view has reached L-notarization threshold (n-f votes) AND has a nullification (2f+1 nullifies),
+        // this indicates a CRITICAL BUG - this should be mathematically impossible with N=3F+1.
+        if finalized_ctx.nullification.is_some() {
+            // Log detailed diagnostic info
+            eprintln!(
+                "[CRITICAL BUG] Lemma 5.3 violated during finalization of view {}!\n\
+                 L-notarization votes: {} (threshold: {})\n\
+                 Nullification: present ({} nullify messages)\n\
+                 Block hash: {:?}\n\
+                 Voter peer IDs: {:?}\n\
+                 Nullifier peer IDs: {:?}\n\
+                 This should be IMPOSSIBLE - check for duplicate votes or nullification bugs.",
+                finalized_view,
+                finalized_ctx.votes.len(),
+                N - F,
+                finalized_ctx.nullify_messages.len(),
+                finalized_ctx.block_hash,
+                finalized_ctx
+                    .votes
+                    .iter()
+                    .map(|v| v.peer_id)
+                    .collect::<Vec<_>>(),
+                finalized_ctx
+                    .nullify_messages
+                    .iter()
+                    .map(|n| n.peer_id)
+                    .collect::<Vec<_>>()
+            );
+            return Err(anyhow::anyhow!(
+                "LEMMA 5.3 VIOLATION: View {} has both L-notarization ({} votes) AND nullification ({} nullifies). \
+                 This is mathematically impossible with correct BFT assumptions (N={}, F={}).",
+                finalized_view,
+                finalized_ctx.votes.len(),
+                finalized_ctx.nullify_messages.len(),
+                N,
+                F
+            ));
+        }
+
         // 4. Check if we have the block. If not, we defer finalization.
         // We cannot finalize without the block because we need the parent_block_hash for GC
         // and the transactions for persistence.
@@ -819,9 +913,40 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 self.persist_l_notarized_view(&ctx, peers)?;
             } else if let Some(parent_view_number) = parent_view {
                 if view_number == parent_view_number {
-                    // The parent view - can be M-notarized or L-notarized
-                    if ctx.votes.len() >= N - F {
-                        // Has L-notarization too
+                    // The parent view - can be M-notarized, L-notarized, or nullified
+                    // LEMMA 5.3 VIOLATION CHECK: A view with L-notarization cannot also have nullification
+                    if ctx.votes.len() >= N - F && ctx.nullification.is_some() {
+                        eprintln!(
+                            "[CRITICAL BUG] Lemma 5.3 violated for parent view {}!\n\
+                             L-notarization votes: {} (threshold: {})\n\
+                             Nullification: present ({} nullify messages)\n\
+                             Block hash: {:?}\n\
+                             Voter peer IDs: {:?}\n\
+                             Nullifier peer IDs: {:?}",
+                            view_number,
+                            ctx.votes.len(),
+                            N - F,
+                            ctx.nullify_messages.len(),
+                            ctx.block_hash,
+                            ctx.votes.iter().map(|v| v.peer_id).collect::<Vec<_>>(),
+                            ctx.nullify_messages
+                                .iter()
+                                .map(|n| n.peer_id)
+                                .collect::<Vec<_>>()
+                        );
+                        return Err(anyhow::anyhow!(
+                            "LEMMA 5.3 VIOLATION: Parent view {} has both L-notarization ({} votes) AND \
+                             nullification ({} nullifies).",
+                            view_number,
+                            ctx.votes.len(),
+                            ctx.nullify_messages.len()
+                        ));
+                    }
+
+                    if ctx.nullification.is_some() {
+                        self.persist_nullified_view(&ctx, peers)?;
+                    } else if ctx.votes.len() >= N - F {
+                        // Has L-notarization (no nullification)
                         self.previously_committed_block_hash = ctx.block_hash.unwrap();
                         self.persist_l_notarized_view(&ctx, peers)?;
                     } else {
