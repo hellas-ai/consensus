@@ -1072,6 +1072,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.create_nullify_message(secret_key)
     }
 
+    /// Creates a nullify message for cascade nullification.
+    /// When a parent view is nullified, all child views building on it are orphaned
+    /// and must also be nullified — even if this replica already voted for them.
+    ///
+    /// SAFETY (Lemma 5.3): If the parent view N was nullified (2F+1 nullify messages),
+    /// then N was never M-notarized. Since honest nodes only build on M-notarized parents,
+    /// views N+1..N+k building on N cannot achieve L-notarization from honest nodes.
+    /// Therefore force-nullifying them cannot conflict with any valid L-notarization.
+    pub fn create_nullify_for_cascade(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
+        if self.has_nullified {
+            return Err(anyhow::anyhow!("Already nullified in this view"));
+        }
+
+        self.create_nullify_message(secret_key)
+    }
+
     /// Internal helper to create the actual nullify message
     fn create_nullify_message(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
         let message =

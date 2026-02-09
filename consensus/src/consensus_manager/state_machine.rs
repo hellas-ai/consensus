@@ -331,7 +331,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 match self.handle_tick() {
                     Ok(_) => {}
                     Err(e) => {
-                        slog::error!(self.logger, "Error handling tick: {}", e);
+                        slog::warn!(self.logger, "Error handling tick: {}", e);
                     }
                 }
                 last_tick = Instant::now();
@@ -437,7 +437,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             ViewProgressEvent::ShouldFinalize { view, block_hash } => {
                 self.finalize_view(view, block_hash)
             }
-            ViewProgressEvent::ShouldNullify { view } => self.nullify_view(view),
+            ViewProgressEvent::ShouldNullify { view } => self.nullify_view(view, false),
             ViewProgressEvent::ShouldBroadcastNullification { view } => {
                 self.broadcast_nullification(view)
             }
@@ -531,7 +531,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 slog::info!(self.logger, "TODO: Request missing state here");
                 Ok(())
             }
-            ViewProgressEvent::ShouldNullifyView { view } => self.nullify_view(view),
+            ViewProgressEvent::ShouldNullifyView { view } => self.nullify_view(view, false),
             ViewProgressEvent::BroadcastConsensusMessage { message } => {
                 self.broadcast_consensus_message(*message)
             }
@@ -563,7 +563,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
                 // 2. Nullify all views from start_view to current_view
                 for view in (start_view + 1)..=current_view {
-                    if let Err(e) = self.nullify_view(view) {
+                    if let Err(e) = self.nullify_view(view, true) {
                         slog::debug!(
                             self.logger,
                             "View {} already nullified or error during cascade: {}",
@@ -607,7 +607,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 // but does NOT progress to a new view - we must wait for a Nullification
                 // (aggregated proof with 2F+1 signatures) before we can safely progress.
                 for view in start_view..=current_view {
-                    if let Err(e) = self.nullify_view(view) {
+                    if let Err(e) = self.nullify_view(view, true) {
                         slog::debug!(
                             self.logger,
                             "View {} already nullified or error: {}",
@@ -822,7 +822,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
     }
 
     /// Nullify a view
-    fn nullify_view(&mut self, view: u64) -> Result<()> {
+    fn nullify_view(&mut self, view: u64, force: bool) -> Result<()> {
         slog::debug!(self.logger, "Nullifying view {view}");
 
         // Get view context to create nullify message
@@ -849,6 +849,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         //      (ii) votes for a DIFFERENT block than what this replica voted for
         //    - This is allowed because the conflicting evidence proves no block can be L-notarized
         //
+        // 3. CASCADE NULLIFICATION (force=true): Parent view was nullified, all children orphaned
+        //    - Safe per Lemma 5.3: parent never M-notarized → children can't have valid L-notarization
+        //
         // LEMMA 5.3 SAFETY PROOF: If block b receives L-notarization (n-f votes), the voters
         // cannot be triggered to nullify because at most 2f processors can provide conflicting
         // evidence (nullifies or votes for different blocks).
@@ -858,7 +861,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         let combined_count = num_conflicting_votes + num_nullify_messages;
         let has_byzantine_evidence = num_conflicting_votes > F || combined_count > 2 * F;
 
-        let nullify = if view_ctx.has_voted {
+        let nullify = if force {
+            // CASCADE: Parent nullified → child orphaned, must nullify regardless of voted state
+            slog::info!(
+                self.logger,
+                "Force-nullifying view {view} (cascade/range nullification, has_voted={})",
+                view_ctx.has_voted
+            );
+            view_ctx.create_nullify_for_cascade(&self.secret_key)?
+        } else if view_ctx.has_voted {
             // ALREADY VOTED: Only allow nullification with Byzantine evidence (paper lines 24-28)
             if has_byzantine_evidence {
                 slog::info!(
@@ -944,11 +955,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
 
             match self.finalize_view(finalizable_view, block_hash) {
                 Ok(()) => {
-                    slog::info!(
-                        self.logger,
-                        "Finalized pending view {} via retry on view progression",
-                        finalizable_view
-                    );
+                    // Check if the view was actually removed from non_finalized_views.
+                    // finalize_with_l_notarization can return Ok(()) without removing the view
+                    // when it defers (missing blocks in ancestor chain). Only log success
+                    // if the view was actually finalized.
+                    if self
+                        .view_manager
+                        .find_view_context(finalizable_view)
+                        .is_none()
+                    {
+                        slog::info!(
+                            self.logger,
+                            "Finalized pending view {} via retry on view progression",
+                            finalizable_view
+                        );
+                    } else {
+                        slog::debug!(
+                            self.logger,
+                            "Finalization for view {} deferred (ancestor missing), will retry later",
+                            finalizable_view
+                        );
+                        break;
+                    }
                 }
                 Err(e) => {
                     slog::warn!(

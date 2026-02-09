@@ -576,6 +576,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         self.view_chain.oldest_finalizable_view()
     }
 
+    /// Returns a reference to the view context for a given view number, if it exists.
+    pub fn find_view_context(&self, view_number: u64) -> Option<&ViewContext<N, F, M_SIZE>> {
+        self.view_chain.find_view_context(view_number)
+    }
+
     /// Main driver of the state machine replication algorithm.
     ///
     /// Processes received `ConsensusMessage` and emits appropriate `ViewProgressEvent`s
@@ -611,7 +616,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         for view_number in view_range {
             // Check if this past view has timed out and should be nullified
-            let view_ctx = self.view_chain.find_view_context(view_number).unwrap();
+            let Some(view_ctx) = self.view_chain.find_view_context(view_number) else {
+                // View was removed from non_finalized_views by finalization.
+                // This is expected when finalization GC runs between range computation and iteration.
+                continue;
+            };
 
             if current_view.view_number == view_ctx.view_number {
                 // NOTE: In the case of the current view, we should prioritize handling leader block
