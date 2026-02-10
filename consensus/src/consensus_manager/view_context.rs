@@ -1037,6 +1037,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.leader_id == self.replica_id
     }
 
+    /// Returns whether this view has been nullified, either locally (via cascade/timeout)
+    /// or via a full nullification certificate (2f+1 quorum).
+    ///
+    /// This is the canonical check for nullification status. All code paths that need to
+    /// determine if a view is nullified should use this method to avoid inconsistencies
+    /// between the two nullification flags.
+    pub fn is_nullified(&self) -> bool {
+        self.has_nullified || self.nullification.is_some()
+    }
+
     /// Checks if the view should be nullified due to timeout.
     /// This method should be called periodically by the [`ViewProgressManager`] to ensure the
     /// view is not left in an invalid state.

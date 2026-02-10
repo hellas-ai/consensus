@@ -638,9 +638,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         // If this replica is the leader and hasn't proposed yet
         if current_view.is_leader() && !current_view.has_proposed {
+            // Re-compute parent hash at proposal time rather than using the cached value
+            // from view entry. The parent may have been nullified since we entered this view
+            // (e.g., via cascade nullification), which would make the cached hash stale
+            // and cause add_block_proposal to reject the proposal indefinitely.
+            let parent_block_hash = self.view_chain.select_parent(current_view.view_number);
             return Ok(ViewProgressEvent::ShouldProposeBlock {
                 view: current_view.view_number,
-                parent_block_hash: current_view.parent_block_hash,
+                parent_block_hash,
             });
         }
 

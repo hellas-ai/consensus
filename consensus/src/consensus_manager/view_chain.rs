@@ -395,7 +395,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             Some(parent_view_number) => {
                 let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
 
-                // Check if parent was nullified
+                // Check if parent was nullified (requires full nullification certificate).
+                // Note: we only check nullification.is_some() here, NOT has_nullified,
+                // because a node can timeout-nullify a view while it still succeeds
+                // with an M-notarization from other nodes.
                 if parent_ctx.nullification.is_some() {
                     return Err(anyhow::anyhow!(
                         "Block proposal for parent view {} is nullified, but the block proposal for view {} is for a parent block hash {}",
@@ -405,7 +408,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     ));
                 }
 
-                // Check all intermediate views are nullified
+                // Check all intermediate views are nullified (requires full certificate)
                 for intermediate_view in (parent_view_number + 1)..view_number {
                     if let Some(inter_ctx) = self.non_finalized_views.get(&intermediate_view)
                         && inter_ctx.nullification.is_none()
@@ -873,7 +876,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ));
             }
 
-            // All intermediate views must be nullified
+            // All intermediate views must be nullified (require full certificate for
+            // finalization safety — local nullification alone is insufficient since different
+            // nodes may disagree about which views are locally nullified)
             for intermediate_view in (parent_view_number + 1)..finalized_view {
                 if let Some(inter_ctx) = self.non_finalized_views.get(&intermediate_view)
                     && inter_ctx.nullification.is_none()
