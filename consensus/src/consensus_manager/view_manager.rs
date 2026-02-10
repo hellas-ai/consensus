@@ -618,7 +618,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             // Check if this past view has timed out and should be nullified
             let Some(view_ctx) = self.view_chain.find_view_context(view_number) else {
                 // View was removed from non_finalized_views by finalization.
-                // This is expected when finalization GC runs between range computation and iteration.
+                // This is expected when finalization GC runs between range computation and
+                // iteration.
                 continue;
             };
 
@@ -786,6 +787,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     pub fn mark_nullified(&mut self, view: u64) -> Result<()> {
         if let Some(ctx) = self.view_chain.find_view_context_mut(view) {
             ctx.has_nullified = true;
+            // Remove any pending state diff for this view to prevent divergence.
+            // Without this, nodes that M-notarized a view before nullification
+            // would keep stale diffs that nodes which missed the M-notarization
+            // never had, causing InvalidNonce errors on future block proposals.
+            self.view_chain.remove_pending_diff(view);
             Ok(())
         } else {
             Err(anyhow::anyhow!(

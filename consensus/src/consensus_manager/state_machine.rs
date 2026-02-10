@@ -845,12 +845,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         //
         // 2. BYZANTINE-EVIDENCE NULLIFICATION (lines 24-28): After voting, ONLY with evidence
         //    - Condition: notarised ≠ ⊥ (has voted) AND received ≥ 2f+1 messages that are either:
-        //      (i) nullify(v) messages, OR
-        //      (ii) votes for a DIFFERENT block than what this replica voted for
+        //      (i) nullify(v) messages, OR (ii) votes for a DIFFERENT block than what this replica
+        //      voted for
         //    - This is allowed because the conflicting evidence proves no block can be L-notarized
         //
         // 3. CASCADE NULLIFICATION (force=true): Parent view was nullified, all children orphaned
-        //    - Safe per Lemma 5.3: parent never M-notarized → children can't have valid L-notarization
+        //    - Safe per Lemma 5.3: parent never M-notarized → children can't have valid
+        //      L-notarization
         //
         // LEMMA 5.3 SAFETY PROOF: If block b receives L-notarization (n-f votes), the voters
         // cannot be triggered to nullify because at most 2f processors can provide conflicting
@@ -942,7 +943,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         while let Some((finalizable_view, block_hash)) = self.view_manager.oldest_finalizable_view()
         {
             // If we're seeing the same view again, finalization was deferred (e.g., missing
-            // ancestor blocks). Break to avoid infinite loop - we'll retry on next view progression.
+            // ancestor blocks). Break to avoid infinite loop - we'll retry on next view
+            // progression.
             if last_attempted_view == Some(finalizable_view) {
                 slog::debug!(
                     self.logger,

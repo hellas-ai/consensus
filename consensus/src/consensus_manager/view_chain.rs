@@ -274,7 +274,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                                 continue;
                             }
                         } else {
-                            // Parent view not in non_finalized_views (already finalized) — OK to finalize
+                            // Parent view not in non_finalized_views (already finalized) — OK to
+                            // finalize
                         }
                     } else {
                         // Parent not found in non_finalized_views — either it's the genesis
@@ -1075,6 +1076,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             self.persistence_writer
                 .add_m_notarized_diff(view_number, state_diff.clone());
         }
+    }
+
+    /// Removes the pending state diff for a nullified view.
+    ///
+    /// Called during nullification to ensure pending state doesn't retain
+    /// diffs from views that will never be finalized. Without this, nodes
+    /// that M-notarized a view before it was nullified would keep stale
+    /// diffs, diverging from nodes that never M-notarized it.
+    pub fn remove_pending_diff(&mut self, view: u64) {
+        self.persistence_writer.remove_nullified_view(view);
     }
 
     /// Persists an M-notarized view to storage as a non-finalized block.
