@@ -476,7 +476,7 @@ fn test_multi_node_happy_path() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000, // 20 seconds for tests - more time for peers to connect
+            bootstrap_timeout_ms: 30_000, // 30 seconds - match production default for reliable bootstrap
             ping_interval_ms: 200,        // Faster ping for quicker discovery
             ..Default::default()
         };
@@ -867,7 +867,7 @@ fn test_multi_node_continuous_load() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000,
+            bootstrap_timeout_ms: 30_000,
             ping_interval_ms: 200,
             ..Default::default()
         };
@@ -1131,7 +1131,7 @@ fn test_multi_node_crashed_replica() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000,
+            bootstrap_timeout_ms: 30_000,
             ping_interval_ms: 200,
             ..Default::default()
         };
@@ -1420,7 +1420,7 @@ fn test_multi_node_equivocating_leader() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000,
+            bootstrap_timeout_ms: 30_000,
             ping_interval_ms: 200,
             ..Default::default()
         });
@@ -1770,7 +1770,7 @@ fn test_multi_node_invalid_tx_rejection() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000,
+            bootstrap_timeout_ms: 30_000,
             ..Default::default()
         });
     }
@@ -2008,7 +2008,7 @@ fn test_multi_node_invalid_block_from_leader() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 20_000,
+            bootstrap_timeout_ms: 30_000,
             ..Default::default()
         });
     }

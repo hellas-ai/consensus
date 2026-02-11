@@ -211,6 +211,68 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Some(least_non_finalized_view..=upper_bound)
     }
 
+    /// Finds the oldest view that has enough votes for L-notarization (n-f) and a valid
+    /// parent chain. Used by the finalization retry loop in `progress_to_next_view` to
+    /// finalize views that were deferred earlier (e.g., missing block or parent M-notarization).
+    ///
+    /// # Returns
+    /// * `Some((view_number, block_hash))` - The oldest finalizable view and its block hash
+    /// * `None` - No views are ready for finalization
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        let mut candidates: Vec<u64> = self
+            .non_finalized_views
+            .iter()
+            .filter(|(_, ctx)| {
+                ctx.votes.len() >= N - F
+                    && ctx.block.is_some()
+                    && ctx.nullification.is_none()
+                    && !ctx.has_nullified
+            })
+            .map(|(v, _)| *v)
+            .collect();
+
+        candidates.sort();
+
+        for view_num in candidates {
+            // Skip the current view — cannot finalize during active processing
+            if view_num >= self.current_view {
+                continue;
+            }
+
+            let ctx = self.non_finalized_views.get(&view_num).unwrap();
+            let block = ctx.block.as_ref().unwrap();
+            let parent_hash = block.parent_block_hash();
+            let parent_view = self.find_parent_view(&parent_hash);
+
+            let parent_valid = match parent_view {
+                Some(parent_view_number) => {
+                    let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
+                    // Parent must have M-notarization and not be nullified
+                    parent_ctx.m_notarization.is_some()
+                        && parent_ctx.nullification.is_none()
+                        && !parent_ctx.has_nullified
+                        // All intermediate views must be nullified
+                        && (parent_view_number + 1..view_num).all(|inter| {
+                            self.non_finalized_views
+                                .get(&inter)
+                                .map(|c| c.nullification.is_some() || c.has_nullified)
+                                .unwrap_or(true) // Already garbage collected
+                        })
+                }
+                None => {
+                    // Parent already finalized — check it matches previously committed hash
+                    parent_hash == self.previously_committed_block_hash
+                }
+            };
+
+            if parent_valid {
+                return Some((view_num, ctx.block_hash.unwrap()));
+            }
+        }
+
+        None
+    }
+
     /// Stores a pre-computed [`StateDiff`] instance for a view.
     ///
     /// This method is called when block validation completes and produces a [`StateDiff`]
@@ -319,10 +381,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     ));
                 }
 
-                // Check all intermediate views are nullified
+                // Check all intermediate views are nullified (aggregated or locally)
                 for intermediate_view in (parent_view_number + 1)..view_number {
                     if let Some(inter_ctx) = self.non_finalized_views.get(&intermediate_view)
                         && inter_ctx.nullification.is_none()
+                        && !inter_ctx.has_nullified
                     {
                         return Err(anyhow::anyhow!(
                             "Intermediate view {} between parent {} and current {} is not nullified",
@@ -389,6 +452,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     pub fn route_vote(&mut self, vote: Vote, peers: &PeerSet) -> Result<CollectedVotesResult> {
         if let Some(ctx) = self.non_finalized_views.get_mut(&vote.view) {
             let view_number = ctx.view_number;
+
+            // Reject votes for nullified views — no point accumulating votes for views
+            // that can never be finalized (Lemma 5.3: nullification → no L-notarization)
+            if ctx.has_nullified || ctx.nullification.is_some() {
+                return Ok(CollectedVotesResult {
+                    should_await: false,
+                    is_enough_to_m_notarize: false,
+                    is_enough_to_finalize: false,
+                    should_nullify: false,
+                    should_vote: false,
+                });
+            }
 
             // NOTE: If the view number is not the current view, we check if the view has progressed
             // without a m-notarization, this is to ensure that the view chain is not
@@ -678,6 +753,47 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         Ok(())
     }
 
+    /// Progresses to the next view after a cascade nullification.
+    ///
+    /// Similar to [`progress_with_nullification`], but does NOT require an aggregated
+    /// nullification proof on the current view. During cascade (Algorithm 1, Step 8),
+    /// the current view is locally nullified (`has_nullified = true`) but may not yet
+    /// have an aggregated proof (2f+1 nullify messages).
+    ///
+    /// # Arguments
+    /// * `next_view_ctx` - The view context for the next view (must be current_view + 1)
+    pub fn progress_after_cascade(
+        &mut self,
+        next_view_ctx: ViewContext<N, F, M_SIZE>,
+    ) -> Result<()> {
+        // 1. Check that the next view context is the next view.
+        if next_view_ctx.view_number != self.current_view + 1 {
+            return Err(anyhow::anyhow!(
+                "View number {} is not the next view number {}",
+                next_view_ctx.view_number,
+                self.current_view + 1
+            ));
+        }
+
+        // 2. Check that the current view has been locally nullified.
+        // Unlike progress_with_nullification, we accept has_nullified without
+        // requiring an aggregated nullification proof.
+        let current = self.current();
+        if !current.has_nullified && current.nullification.is_none() {
+            return Err(anyhow::anyhow!(
+                "The current view {} has not been nullified (locally or via proof), but progress_after_cascade was called",
+                self.current_view
+            ));
+        }
+
+        // 3. Update the current view to the next view.
+        self.current_view = next_view_ctx.view_number;
+        self.non_finalized_views
+            .insert(next_view_ctx.view_number, next_view_ctx);
+
+        Ok(())
+    }
+
     /// Finalizes a view with L-notarization and performs garbage collection.
     ///
     /// L-notarization (n-f votes) is the ONLY mechanism that finalizes blocks and commits them
@@ -714,7 +830,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         finalized_view: u64,
         peers: &PeerSet,
     ) -> Result<()> {
-        // 1. Check that the view number is not the current view.
+        // 1. Cannot finalize views from the future.
         if finalized_view > self.current_view {
             return Err(anyhow::anyhow!(
                 "View number {} is not greater than the current view {}, cannot finalize views in the future",
@@ -736,6 +852,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         if finalized_ctx.votes.len() < N - F {
             return Err(anyhow::anyhow!(
                 "View number {} has not received a l-notarization",
+                finalized_view
+            ));
+        }
+
+        // 3b. Guard: Cannot finalize a nullified view (Lemma 5.3 — nullification
+        // and L-notarization cannot coexist for the same view)
+        if finalized_ctx.nullification.is_some() || finalized_ctx.has_nullified {
+            return Err(anyhow::anyhow!(
+                "Cannot finalize view {} — it has been nullified (Lemma 5.3: nullification and L-notarization cannot coexist)",
                 finalized_view
             ));
         }
@@ -775,10 +900,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ));
             }
 
-            // All intermediate views must be nullified
+            // All intermediate views must be nullified (aggregated or locally)
             for intermediate_view in (parent_view_number + 1)..finalized_view {
                 if let Some(inter_ctx) = self.non_finalized_views.get(&intermediate_view)
                     && inter_ctx.nullification.is_none()
+                    && !inter_ctx.has_nullified
                 {
                     return Err(anyhow::anyhow!(
                         "Intermediate view {} between parent {} and finalized {} is not nullified",
@@ -798,62 +924,88 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     finalized_view
                 ))?;
 
-        // Pre-check: Ensure all non-nullified views in the range have blocks.
-        // If any ancestor is missing its block, we must defer the entire finalization
-        // to avoid partial persistence errors.
-        for view_num in to_persist_range.clone() {
-            if let Some(ctx) = self.non_finalized_views.get(&view_num) {
-                // Nullified views don't need blocks, but M/L-notarized views do.
-                if ctx.nullification.is_none() && ctx.block.is_none() {
-                    return Ok(());
-                }
-            }
-        }
+        // Note: ancestor views may be missing blocks (the node received votes/M-notarization
+        // but never received or validated the actual block). This is normal in BFT — we persist
+        // available metadata and don't block finalization for missing ancestor blocks.
 
         for view_number in to_persist_range {
             let ctx = self.non_finalized_views.remove(&view_number).unwrap();
 
             if view_number == finalized_view {
-                // The view being finalized
+                // The view being finalized — block is guaranteed present (checked above)
                 self.previously_committed_block_hash = ctx.block_hash.unwrap();
                 self.persist_l_notarized_view(&ctx, peers)?;
             } else if let Some(parent_view_number) = parent_view {
                 if view_number == parent_view_number {
-                    // The parent view - can be M-notarized or L-notarized
-                    if ctx.votes.len() >= N - F {
-                        // Has L-notarization too
-                        self.previously_committed_block_hash = ctx.block_hash.unwrap();
+                    // The parent view — child's L-notarization implies parent is committed.
+                    if let Some(bh) = ctx.block_hash {
+                        self.previously_committed_block_hash = bh;
+                    }
+                    if ctx.votes.len() >= N - F && ctx.block.is_some() {
                         self.persist_l_notarized_view(&ctx, peers)?;
                     } else {
-                        // Only M-notarized
+                        // M-notarized (or L-notarized without block) — persist available data
                         self.persist_m_notarized_view(&ctx, peers)?;
                     }
                 } else if view_number > parent_view_number {
                     // Intermediate view - must be nullified (already validated above)
                     self.persist_nullified_view(&ctx, peers)?;
                 } else {
-                    // View before parent - could be part of an earlier chain
-                    // These should have been finalized in a previous call or be nullified
-                    if ctx.nullification.is_some() {
+                    // View before parent - could be part of an earlier chain.
+                    // M-notarized views are persisted as finalized even if also nullified,
+                    // because their blocks may be referenced as parents in the chain.
+                    // Per Lemma 5.3: M-notarization + nullification can coexist.
+                    if ctx.m_notarization.is_some() && ctx.block.is_some() {
+                        if ctx.votes.len() >= N - F {
+                            if let Some(bh) = ctx.block_hash {
+                                self.previously_committed_block_hash = bh;
+                            }
+                            self.persist_l_notarized_view(&ctx, peers)?;
+                        } else {
+                            self.persist_m_notarized_view(&ctx, peers)?;
+                        }
+                    } else if ctx.nullification.is_some() || ctx.has_nullified {
                         self.persist_nullified_view(&ctx, peers)?;
-                    } else if ctx.votes.len() >= N - F {
-                        self.previously_committed_block_hash = ctx.block_hash.unwrap();
+                    } else if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                        if let Some(bh) = ctx.block_hash {
+                            self.previously_committed_block_hash = bh;
+                        }
                         self.persist_l_notarized_view(&ctx, peers)?;
                     } else {
-                        // M-notarized view from an earlier chain
-                        self.persist_m_notarized_view(&ctx, peers)?;
+                        // M-notarized without block, or no consensus artifacts
+                        if ctx.m_notarization.is_some() {
+                            self.persist_m_notarized_view(&ctx, peers)?;
+                        } else {
+                            self.persist_nullified_view(&ctx, peers)?;
+                        }
                     }
                 }
             } else {
-                // Parent not in non-finalized views (already finalized)
-                // These are intermediate nullified views
-                if ctx.nullification.is_none() {
-                    return Err(anyhow::anyhow!(
-                        "View {} has no nullification but parent is already finalized",
-                        view_number
-                    ));
+                // Parent not in non-finalized views (already finalized).
+                // Same priority: M-notarized views with blocks are persisted as finalized.
+                if ctx.m_notarization.is_some() && ctx.block.is_some() {
+                    if ctx.votes.len() >= N - F {
+                        if let Some(bh) = ctx.block_hash {
+                            self.previously_committed_block_hash = bh;
+                        }
+                        self.persist_l_notarized_view(&ctx, peers)?;
+                    } else {
+                        self.persist_m_notarized_view(&ctx, peers)?;
+                    }
+                } else if ctx.nullification.is_some() || ctx.has_nullified {
+                    self.persist_nullified_view(&ctx, peers)?;
+                } else if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                    if let Some(bh) = ctx.block_hash {
+                        self.previously_committed_block_hash = bh;
+                    }
+                    self.persist_l_notarized_view(&ctx, peers)?;
+                } else if ctx.m_notarization.is_some() {
+                    self.persist_m_notarized_view(&ctx, peers)?;
+                } else {
+                    // View with no consensus artifacts (e.g., node never received any messages
+                    // for this view). Persist as nullified to clear it from the chain.
+                    self.persist_nullified_view(&ctx, peers)?;
                 }
-                self.persist_nullified_view(&ctx, peers)?;
             }
         }
 
@@ -1013,16 +1165,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         // when this view first achieved M-notarization. It will be applied to DB
         // when persist_l_notarized_view() calls finalize_up_to().
 
-        // Persist block as non-finalized
+        // Persist block as finalized — M-notarized views in the GC range are committed
+        // because the descendant's L-notarization transitively proves this chain.
+        // Note: the block may be absent if this node received votes/M-notarization but
+        // never received or validated the actual block. This is normal in BFT — we persist
+        // available metadata and don't block finalization.
         if let Some(ref block) = ctx.block {
             for tx in block.transactions.iter() {
                 self.persistence_writer.put_transaction(tx)?;
             }
-            self.persistence_writer.put_non_finalized_block(block)?;
-        } else {
-            return Err(anyhow::anyhow!(
-                "View number {view_number} has no block, but the view has been m-notarized"
-            ));
+            let mut finalized_block = block.clone();
+            finalized_block.is_finalized = true;
+            self.persistence_writer
+                .put_finalized_block(&finalized_block)?;
         }
 
         // Persist the M-notarization
@@ -1040,7 +1195,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_writer.put_leader(&leader)?;
 
         let leader_pk = peers.id_to_public_key.get(&leader_id).unwrap();
-        let view = View::new(view_number, leader_pk.clone(), false, false); // Not finalized, not nullified
+        let view = View::new(view_number, leader_pk.clone(), true, false); // Finalized (committed via child), not nullified
         self.persistence_writer.put_view(&view)?;
 
         // Persist the votes
@@ -1082,9 +1237,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     ) -> Result<()> {
         let view_number = ctx.view_number;
 
-        if ctx.nullification.is_none() {
+        if ctx.nullification.is_none() && !ctx.has_nullified {
             return Err(anyhow::anyhow!(
-                "View number {view_number} has no nullification, but the view has been nullified",
+                "View number {view_number} has no nullification or local nullify, but persist_nullified_view was called",
             ));
         }
 
@@ -1096,9 +1251,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             self.persistence_writer.put_nullified_block(block)?;
         }
 
-        // Persist the nullification
-        let nullification = ctx.nullification.as_ref().unwrap();
-        self.persistence_writer.put_nullification(nullification)?;
+        // Persist the aggregated nullification proof (if we have it).
+        // Views that were only locally nullified (has_nullified = true via cascade)
+        // may not have an aggregated nullification yet.
+        if let Some(ref nullification) = ctx.nullification {
+            self.persistence_writer.put_nullification(nullification)?;
+        }
 
         // Persist leader metadata
         let leader_id = ctx.leader_id;
@@ -1243,10 +1401,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let mut greatest_view_with_m_not: Option<(u64, [u8; blake3::OUT_LEN])> = None;
 
         for (view_num, ctx) in &self.non_finalized_views {
-            // Skip views that:
-            // 1. Have a full nullification quorum, OR
-            // 2. Have been locally marked for nullification (has_nullified = true)
-            if ctx.nullification.is_some() || ctx.has_nullified {
+            // Per paper: SelectParent returns the greatest v' < new_view with M-notarization.
+            // M-notarization is a permanent fact that cannot be invalidated by nullification
+            // (Lemma 5.3 only forbids L-notarization + nullification coexistence).
+            // Skip views that are nullified WITHOUT M-notarization (pure nullification).
+            // Views with both M-notarization and nullification/has_nullified remain valid
+            // parents to ensure SelectParent consistency across all nodes.
+            if (ctx.nullification.is_some() || ctx.has_nullified)
+                && ctx.m_notarization.is_none()
+            {
                 continue;
             }
 
@@ -1270,6 +1433,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         greatest_view_with_m_not
             .map(|(_, block_hash)| block_hash)
             .unwrap_or(self.previously_committed_block_hash)
+    }
+
+    /// Removes the pending state diff for a nullified view.
+    ///
+    /// Called when a view is locally nullified (e.g., during cascade) to remove its
+    /// [`StateDiff`] from pending state, preventing stale state from affecting
+    /// transaction validation (which could cause InvalidNonce errors).
+    pub fn remove_pending_diff(&mut self, view: u64) {
+        self.persistence_writer.remove_nullified_view(view);
     }
 
     /// Finds the view number for a given parent block hash in the non-finalized chain.
@@ -4636,10 +4808,10 @@ mod tests {
         // Now verify ALL data was persisted to the database
         let storage = &view_chain.persistence_writer;
 
-        // Check block was persisted (as M-notarized, not finalized)
+        // Check block was persisted as finalized (M-notarized parent committed via child's L-notarization)
         let stored_block_v1 = storage
             .store()
-            .get_non_finalized_block(&block_hash_v1)
+            .get_finalized_block(&block_hash_v1)
             .unwrap();
         assert!(stored_block_v1.is_some());
         let stored_block_v1 = stored_block_v1.unwrap();
@@ -4870,17 +5042,18 @@ mod tests {
             "Should still select view 2's block as parent"
         );
 
-        // Now nullify view 2 as well
+        // Now nullify view 2 as well (locally)
         if let Some(ctx) = view_chain.non_finalized_views.get_mut(&2) {
             ctx.has_nullified = true;
         }
 
-        // After nullifying both views: select_parent(3) should fall back to
-        // previously_committed_block_hash
+        // Per paper: M-notarization is a permanent fact. Even with has_nullified set,
+        // view 2 still has M-notarization and remains a valid parent.
+        // SelectParent should still return view 2's block hash.
         let parent_fallback = view_chain.select_parent(3);
         assert_eq!(
-            parent_fallback, view_chain.previously_committed_block_hash,
-            "Should fall back to previously committed block when all views nullified"
+            parent_fallback, block_hash_v2,
+            "M-notarized view should remain a valid parent even when locally nullified"
         );
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -4979,11 +5152,12 @@ mod tests {
             ctx.nullification = Some(nullification_v2);
         }
 
-        // After nullification on both views: should fall back to previously committed
+        // Per paper: M-notarization is a permanent fact, not invalidated by nullification.
+        // Even with aggregated nullification, view 2's M-notarization makes it a valid parent.
         let parent_fallback = view_chain.select_parent(3);
         assert_eq!(
-            parent_fallback, view_chain.previously_committed_block_hash,
-            "Should fall back to previously committed block when all views have nullification"
+            parent_fallback, block_hash_v2,
+            "M-notarized view should remain a valid parent even with aggregated nullification"
         );
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();

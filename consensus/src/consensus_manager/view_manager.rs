@@ -383,7 +383,7 @@ use crate::{
             ShouldMNotarize, ViewContext,
         },
     },
-    crypto::aggregated::{BlsPublicKey, BlsSecretKey, BlsSignature, PeerId},
+    crypto::aggregated::{BlsPublicKey, BlsSignature, PeerId},
     state::{
         block::Block,
         notarizations::{MNotarization, Vote},
@@ -452,7 +452,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .collect(),
         );
 
-        // Create Genesis block
+        // Create and persist genesis block
         let genesis_leader = leader_manager.leader_for_view(0)?.peer_id();
         let genesis_block_hash = Block::genesis_hash();
         let genesis_block = Block::genesis(
@@ -461,16 +461,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         );
         debug_assert_eq!(genesis_block.get_hash(), genesis_block_hash);
 
-        let genesis_m_notarization = MNotarization {
-            view: 0,
-            leader_id: genesis_leader,
-            block_hash: genesis_block_hash,
-            aggregated_signature: BlsSignature(ark_bls12_381::G1Affine::default()), // Placeholder
-            peer_ids: [PeerId::default(); M_SIZE], // Placeholder peers
-        };
-
         persistence_writer.put_finalized_block(&genesis_block)?;
-        persistence_writer.put_m_notarization(&genesis_m_notarization)?; // TODO: do we need to store a L-notarization for the genesis block as well (n-f votes)?
         persistence_writer.initialize_genesis_accounts(&config.genesis_accounts)?;
 
         slog::info!(
@@ -479,14 +470,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             "count" => config.genesis_accounts.len(),
         );
 
-        let mut genesis_context: ViewContext<N, F, M_SIZE> =
-            ViewContext::new(0, genesis_leader, replica_id, [0; blake3::OUT_LEN]);
-        genesis_context.block = Some(genesis_block.clone());
-        genesis_context.block_hash = Some(genesis_block_hash);
-        genesis_context.has_voted = true;
-        genesis_context.m_notarization = Some(genesis_m_notarization);
-
-        // 3. Initialize ViewChain starting at View 1
+        // Initialize ViewChain starting at View 1.
         // The parent of View 1 is the Genesis Hash.
         let view1_leader = leader_manager.leader_for_view(1)?.peer_id();
 
@@ -548,8 +532,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .collect(),
         );
 
-        let leader_id = leader_manager.leader_for_view(0)?.peer_id();
-        let view_context = ViewContext::new(0, leader_id, replica_id, [0; blake3::OUT_LEN]);
+        let leader_id = leader_manager.leader_for_view(1)?.peer_id();
+        let view_context = ViewContext::new(1, leader_id, replica_id, Block::genesis_hash());
 
         let view_chain = ViewChain::new(view_context, persistence_writer);
 
@@ -562,40 +546,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             peers,
             logger,
         })
-    }
-
-    /// Creates a genesis vote for this replica
-    pub fn create_genesis_vote(&mut self, secret_key: &BlsSecretKey) -> Result<Vote> {
-        let current_view = self.view_chain.current_view_mut();
-
-        if current_view.view_number != 0 {
-            return Err(anyhow::anyhow!("Can only create genesis vote at view 0"));
-        }
-
-        if current_view.has_voted {
-            return Err(anyhow::anyhow!("Already voted for genesis"));
-        }
-
-        let genesis_hash = current_view
-            .block_hash
-            .ok_or_else(|| anyhow::anyhow!("Genesis block not set"))?;
-
-        // Create the vote
-        let signature = secret_key.sign(&genesis_hash);
-
-        let vote = Vote::new(
-            0, // view 0
-            genesis_hash,
-            signature,
-            self.replica_id,
-            current_view.leader_id,
-        );
-
-        // Mark as voted and add our own vote
-        current_view.has_voted = true;
-        current_view.votes.insert(vote.clone());
-
-        Ok(vote)
     }
 
     /// Selects the parent block for a new view according to the Minimmit SelectParent function.
@@ -618,6 +568,17 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     /// 4. If no M-notarization found in non-finalized views, return previously_committed_block_hash
     pub fn select_parent(&self, new_view: u64) -> [u8; blake3::OUT_LEN] {
         self.view_chain.select_parent(new_view)
+    }
+
+    /// Finds the oldest view that has enough votes for L-notarization and a valid parent chain.
+    /// Used for deferred finalization during view progression.
+    pub fn oldest_finalizable_view(&self) -> Option<(u64, [u8; blake3::OUT_LEN])> {
+        self.view_chain.oldest_finalizable_view()
+    }
+
+    /// Finds a view context by view number (read-only).
+    pub fn find_view_context(&self, view_number: u64) -> Option<&ViewContext<N, F, M_SIZE>> {
+        self.view_chain.find_view_context(view_number)
     }
 
     /// Main driver of the state machine replication algorithm.
@@ -655,7 +616,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
 
         for view_number in view_range {
             // Check if this past view has timed out and should be nullified
-            let view_ctx = self.view_chain.find_view_context(view_number).unwrap();
+            let Some(view_ctx) = self.view_chain.find_view_context(view_number) else {
+                continue;
+            };
 
             if current_view.view_number == view_ctx.view_number {
                 // NOTE: In the case of the current view, we should prioritize handling leader block
@@ -817,17 +780,45 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
     }
 
-    /// Marks that the current replica has nullified a view.
+    /// Marks that the current replica has nullified a view and removes its pending state diff.
     pub fn mark_nullified(&mut self, view: u64) -> Result<()> {
         if let Some(ctx) = self.view_chain.find_view_context_mut(view) {
             ctx.has_nullified = true;
-            Ok(())
         } else {
-            Err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "Cannot mark nullified for view {} (view not found)",
                 view
-            ))
+            ));
         }
+        // Remove pending state diff for this view to prevent stale state from
+        // causing InvalidNonce errors in future transaction validation.
+        self.view_chain.remove_pending_diff(view);
+        Ok(())
+    }
+
+    /// Computes the leader for a given view using the leader manager directly.
+    ///
+    /// Unlike [`leader_for_view`], this does NOT require a view context to exist.
+    /// Used during cascade nullification when the new view hasn't been created yet.
+    pub fn compute_leader_for_view(&self, view: u64) -> Result<PeerId> {
+        Ok(self.leader_manager.leader_for_view(view)?.peer_id())
+    }
+
+    /// Progresses to the next view after a cascade nullification.
+    ///
+    /// Creates a new view context for `new_view` and advances the view chain.
+    /// This is used when cascade nullification has locally nullified the current view
+    /// but no aggregated nullification proof exists yet.
+    ///
+    /// # Returns
+    /// `(leader, parent_hash)` for the new view.
+    pub fn progress_after_cascade(&mut self, new_view: u64) -> Result<(PeerId, [u8; blake3::OUT_LEN])> {
+        let new_leader = self.leader_manager.leader_for_view(new_view)?.peer_id();
+        let parent_hash = self.view_chain.select_parent(new_view);
+        let new_view_context =
+            ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
+        self.view_chain.progress_after_cascade(new_view_context)?;
+        Ok((new_leader, parent_hash))
     }
 
     /// Processes a block that has already been validated by the validation service.
@@ -1185,12 +1176,22 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         let has_nullification = self.view_chain.route_nullify(nullify, &self.peers)?;
 
         if has_nullification {
-            // Check if this is a past view - if so, trigger should cascade nullification
+            // Check if this is a past view with M-notarization — cascade per Algorithm 1 Step 8.
+            // Cascade is only needed when the nullified past view was M-notarized, because
+            // descendant views may have blocks/StateDiffs building on its (now-invalid) block.
+            // Non-M-notarized past views have no StateDiffs and no descendants, so no cascade needed.
             if nullify_view_number < current_view_number {
-                return Ok(ViewProgressEvent::ShouldCascadeNullification {
-                    start_view: nullify_view_number,
-                    should_broadcast_nullification: true, // We just created the nullification
-                });
+                let was_m_notarized = self
+                    .view_chain
+                    .find_view_context(nullify_view_number)
+                    .is_some_and(|ctx| ctx.m_notarization.is_some());
+
+                if was_m_notarized {
+                    return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                        start_view: nullify_view_number,
+                        should_broadcast_nullification: true, // We just created the nullification
+                    });
+                }
             }
             return Ok(ViewProgressEvent::ShouldBroadcastNullification {
                 view: nullify_view_number,
@@ -1361,18 +1362,27 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             .view_chain
             .route_nullification(nullification, &self.peers)?;
 
-        // Cascade if this is a past view AND (new evidence OR had M-notarization)
+        // Cascade if this is a past M-notarized view (Algorithm 1, Step 8).
+        // Cascade is only needed when the nullified view had M-notarization, because
+        // descendant views may have blocks/StateDiffs building on its (now-invalid) block.
         if nullification_view_number < current_view_number && should_broadcast_nullification {
-            slog::warn!(
-                self.logger,
-                "Received nullification for past view {} while in view {}. Triggering cascade.",
-                nullification_view_number,
-                current_view_number
-            );
-            return Ok(ViewProgressEvent::ShouldCascadeNullification {
-                start_view: nullification_view_number,
-                should_broadcast_nullification,
-            });
+            let was_m_notarized = self
+                .view_chain
+                .find_view_context(nullification_view_number)
+                .is_some_and(|ctx| ctx.m_notarization.is_some());
+
+            if was_m_notarized {
+                slog::warn!(
+                    self.logger,
+                    "Received nullification for past M-notarized view {} while in view {}. Triggering cascade.",
+                    nullification_view_number,
+                    current_view_number
+                );
+                return Ok(ViewProgressEvent::ShouldCascadeNullification {
+                    start_view: nullification_view_number,
+                    should_broadcast_nullification,
+                });
+            }
         }
 
         // Progress to next view with nullification
@@ -1786,7 +1796,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.current_view_number(), 0);
+        assert_eq!(manager.current_view_number(), 1);
         assert_eq!(manager.non_finalized_count(), 1);
         assert_eq!(manager.peers.sorted_peer_ids.len(), 6);
 
@@ -6690,12 +6700,12 @@ mod tests {
         // Mark view 1 as nullified (simulating cascade)
         manager.mark_nullified(1).unwrap();
 
-        // select_parent should now skip view 1 and return the genesis/previously committed hash
+        // Per paper: M-notarization is a permanent fact, not invalidated by local nullification.
+        // View 1 still has M-notarization, so select_parent should still return its block hash.
         let parent_after = manager.select_parent(3);
-        let expected_parent = manager.view_chain.previously_committed_block_hash;
         assert_eq!(
-            parent_after, expected_parent,
-            "After nullifying view 1, select_parent should return previously committed block"
+            parent_after, block_hash_v1,
+            "M-notarized view should remain a valid parent even after mark_nullified"
         );
 
         std::fs::remove_file(path).unwrap();

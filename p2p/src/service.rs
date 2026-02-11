@@ -507,10 +507,9 @@ where
                 return false;
             }
 
-            _ = context.sleep(recv_timeout) => {
-                // Continue loop
-            }
-
+            // Prioritize message reception over sleep to avoid delaying peer discovery.
+            // When both a message and the sleep timer are ready simultaneously,
+            // biased select picks the first matching branch.
             res = receivers.sync.recv() => {
                 if let Ok((sender, msg)) = res && let Ok(p2p_msg) = deserialize_message::<N, F, M_SIZE>(&msg) {
                     match p2p_msg {
@@ -533,6 +532,10 @@ where
                         _ => {}
                     }
                 }
+            }
+
+            _ = context.sleep(recv_timeout) => {
+                // No messages received within timeout, continue loop
             }
 
             // NOTE: We intentionally do NOT listen on consensus or tx channels during bootstrap.

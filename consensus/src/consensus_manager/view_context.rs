@@ -1072,6 +1072,28 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewContext<N, F, M_SI
         self.create_nullify_message(secret_key)
     }
 
+    /// Creates a nullify message for cascading nullification.
+    ///
+    /// Called when a past view is nullified and we need to cascade the nullification
+    /// to current and intermediate views for pending state consistency.
+    ///
+    /// Unlike timeout nullification, this CAN be called after voting.
+    /// Unlike Byzantine nullification, this doesn't require evidence of conflicting
+    /// messages — the cascade is triggered by the parent view's nullification.
+    ///
+    /// Safety (Lemma 5.3 contrapositive): If a view receives a nullification, it cannot
+    /// receive an L-notarization. The cascade ensures pending state diffs from views that
+    /// can no longer be finalized are removed, preventing InvalidNonce errors across nodes.
+    /// Note: M-notarization and nullification CAN coexist (both require only 2f+1 out of
+    /// n >= 5f+1), but L-notarization (n-f) and nullification (2f+1) cannot.
+    pub fn create_nullify_for_cascade(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
+        if self.has_nullified {
+            return Err(anyhow::anyhow!("Already nullified in this view"));
+        }
+
+        self.create_nullify_message(secret_key)
+    }
+
     /// Internal helper to create the actual nullify message
     fn create_nullify_message(&mut self, secret_key: &BlsSecretKey) -> Result<Nullify> {
         let message =
