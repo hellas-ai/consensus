@@ -206,4 +206,12 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         /// The expected block hash (from the M-notarization).
         block_hash: [u8; blake3::OUT_LEN],
     },
+
+    /// If the current replica should request multiple missing blocks from peers.
+    /// This is the batch version of `ShouldRequestBlock`, used when multiple views
+    /// need block recovery simultaneously (e.g., after a node joins late).
+    ShouldRequestBlocks {
+        /// The list of (view, block_hash) pairs for which blocks are missing.
+        requests: Vec<(u64, [u8; blake3::OUT_LEN])>,
+    },
 }

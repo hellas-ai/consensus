@@ -718,7 +718,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         }
 
         // Check for views that need block recovery: M-notarized but missing block
+        // Collect up to MAX_BATCH_RECOVERY views to request in parallel
+        const MAX_BATCH_RECOVERY: usize = 5;
+        let mut recovery_requests = Vec::new();
         for view_number in self.view_chain.non_finalized_view_numbers_range() {
+            if recovery_requests.len() >= MAX_BATCH_RECOVERY {
+                break;
+            }
+
             let Some(view_ctx) = self.view_chain.find_view_context(view_number) else {
                 continue;
             };
@@ -746,12 +753,18 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 if should_request {
                     self.block_recovery_cooldowns
                         .insert(view_number, Instant::now());
-                    return Ok(ViewProgressEvent::ShouldRequestBlock {
-                        view: view_number,
-                        block_hash,
-                    });
+                    recovery_requests.push((view_number, block_hash));
                 }
             }
+        }
+
+        if recovery_requests.len() == 1 {
+            let (view, block_hash) = recovery_requests[0];
+            return Ok(ViewProgressEvent::ShouldRequestBlock { view, block_hash });
+        } else if recovery_requests.len() > 1 {
+            return Ok(ViewProgressEvent::ShouldRequestBlocks {
+                requests: recovery_requests,
+            });
         }
 
         // If no block available yet, await
@@ -1540,17 +1553,14 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 Ok(ViewProgressEvent::NoOp)
             }
             Err(e) => {
-                // View was likely GC'd before the recovery response arrived.
-                // Persist the block directly to storage as a fallback — the view
-                // metadata was already persisted during GC.
-                slog::info!(
+                // View was GC'd — its chain position is already determined.
+                // Don't persist the block to finalized store as it bypasses chain validation.
+                slog::debug!(
                     self.logger,
-                    "Block recovery: view not in chain, persisting to storage";
+                    "Block recovery: view GC'd, dropping recovered block";
                     "view" => view,
                     "reason" => %e,
                 );
-                self.view_chain
-                    .persist_recovered_block_to_storage(view, block)?;
                 self.block_recovery_cooldowns.remove(&view);
                 Ok(ViewProgressEvent::NoOp)
             }

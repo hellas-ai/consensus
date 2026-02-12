@@ -247,8 +247,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             let parent_valid = match parent_view {
                 Some(parent_view_number) => {
                     let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
-                    // Parent must have M-notarization and not be nullified
+                    // Parent must have M-notarization, block, and not be nullified
                     parent_ctx.m_notarization.is_some()
+                        && parent_ctx.block.is_some()
                         && parent_ctx.nullification.is_none()
                         && !parent_ctx.has_nullified
                         // All intermediate views must be nullified
@@ -338,32 +339,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             .get_finalized_block_by_height(view)
             .ok()
             .flatten()
-    }
-
-    /// Persists a recovered block directly to finalized storage.
-    ///
-    /// This is a fallback for the case where a view was already GC'd from `non_finalized_views`
-    /// before block recovery delivered the block. The view metadata (M-notarization, leader, votes)
-    /// was already persisted during GC — this method fills in the missing block data.
-    pub fn persist_recovered_block_to_storage(&self, view: u64, block: Block) -> Result<()> {
-        // Don't overwrite if we already have block data for this view
-        if self
-            .persistence_writer
-            .store()
-            .get_finalized_block_by_height(view)?
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        for tx in block.transactions.iter() {
-            self.persistence_writer.put_transaction(tx)?;
-        }
-        let mut finalized_block = block;
-        finalized_block.is_finalized = true;
-        self.persistence_writer
-            .put_finalized_block(&finalized_block)?;
-        Ok(())
     }
 
     /// Stores a pre-computed [`StateDiff`] instance for a view.
@@ -992,6 +967,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ));
             }
 
+            // Defer: parent block not yet recovered. Block recovery will deliver it,
+            // and deferred finalization will retry on the next view progression.
+            if parent_ctx.block.is_none() {
+                return Ok(());
+            }
+
             if parent_ctx.view_number >= finalized_view {
                 return Err(anyhow::anyhow!(
                     "Parent view {} is more recent than the finalized view {}, cannot finalize view {}",
@@ -1015,9 +996,39 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     ));
                 }
             }
+        } else {
+            // Parent already finalized/GC'd — must match the chain tip
+            if parent_hash != self.previously_committed_block_hash {
+                // Block claims a parent from a non-canonical branch that's been GC'd.
+                // Defer — cannot finalize.
+                return Ok(());
+            }
         }
 
-        // 6. Persist all views from oldest to finalized
+        // 6. Build the canonical chain: trace parent hashes backwards from finalized view
+        // to identify which views are in the canonical chain (and should be persisted as
+        // finalized) vs non-canonical forks (which should be persisted as nullified).
+        let mut canonical_views = std::collections::HashSet::new();
+        canonical_views.insert(finalized_view);
+        {
+            let mut trace_hash = parent_hash;
+            while let Some(view_num) = self.find_parent_view(&trace_hash) {
+                canonical_views.insert(view_num);
+                if let Some(ctx) = self.non_finalized_views.get(&view_num) {
+                    if let Some(ref block) = ctx.block {
+                        trace_hash = block.parent_block_hash();
+                    } else {
+                        // Canonical ancestor missing its block — defer finalization.
+                        // Block recovery will deliver it, and finalization will retry.
+                        return Ok(());
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 7. Persist all views from oldest to finalized
         let to_persist_range =
             self.non_finalized_views_until(finalized_view)
                 .ok_or(anyhow::anyhow!(
@@ -1026,15 +1037,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 ))?;
 
         for view_number in to_persist_range {
-            // Retain views that are M-notarized but missing their block — block recovery
+            // Retain canonical views that are missing their block — block recovery
             // may still deliver the block data. Don't GC them yet.
+            // Also retain non-nullified M-notarized views missing blocks.
             if view_number != finalized_view
                 && let Some(ctx) = self.non_finalized_views.get(&view_number)
                 && ctx.m_notarization.is_some()
                 && ctx.block_hash.is_some()
                 && ctx.block.is_none()
-                && ctx.nullification.is_none()
-                && !ctx.has_nullified
+                && (canonical_views.contains(&view_number)
+                    || (ctx.nullification.is_none() && !ctx.has_nullified))
             {
                 continue;
             }
@@ -1049,77 +1061,20 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                 // The view being finalized — block is guaranteed present (checked above)
                 self.previously_committed_block_hash = ctx.block_hash.unwrap();
                 self.persist_l_notarized_view(&ctx, peers)?;
-            } else if let Some(parent_view_number) = parent_view {
-                if view_number == parent_view_number {
-                    // The parent view — child's L-notarization implies parent is committed.
-                    if let Some(bh) = ctx.block_hash {
-                        self.previously_committed_block_hash = bh;
-                    }
-                    if ctx.votes.len() >= N - F && ctx.block.is_some() {
-                        self.persist_l_notarized_view(&ctx, peers)?;
-                    } else {
-                        // M-notarized (or L-notarized without block) — persist available data
-                        self.persist_m_notarized_view(&ctx, peers)?;
-                    }
-                } else if view_number > parent_view_number {
-                    // Intermediate view - must be nullified (already validated above)
-                    self.persist_nullified_view(&ctx, peers)?;
+            } else if canonical_views.contains(&view_number) {
+                // Canonical chain view — persist as finalized
+                if let Some(bh) = ctx.block_hash {
+                    self.previously_committed_block_hash = bh;
+                }
+                if ctx.votes.len() >= N - F && ctx.block.is_some() {
+                    self.persist_l_notarized_view(&ctx, peers)?;
                 } else {
-                    // View before parent - could be part of an earlier chain.
-                    // M-notarized views are persisted as finalized even if also nullified,
-                    // because their blocks may be referenced as parents in the chain.
-                    // Per Lemma 5.3: M-notarization + nullification can coexist.
-                    if ctx.m_notarization.is_some() && ctx.block.is_some() {
-                        if ctx.votes.len() >= N - F {
-                            if let Some(bh) = ctx.block_hash {
-                                self.previously_committed_block_hash = bh;
-                            }
-                            self.persist_l_notarized_view(&ctx, peers)?;
-                        } else {
-                            self.persist_m_notarized_view(&ctx, peers)?;
-                        }
-                    } else if ctx.nullification.is_some() || ctx.has_nullified {
-                        self.persist_nullified_view(&ctx, peers)?;
-                    } else if ctx.votes.len() >= N - F && ctx.block.is_some() {
-                        if let Some(bh) = ctx.block_hash {
-                            self.previously_committed_block_hash = bh;
-                        }
-                        self.persist_l_notarized_view(&ctx, peers)?;
-                    } else {
-                        // M-notarized without block, or no consensus artifacts
-                        if ctx.m_notarization.is_some() {
-                            self.persist_m_notarized_view(&ctx, peers)?;
-                        } else {
-                            self.persist_nullified_view(&ctx, peers)?;
-                        }
-                    }
+                    self.persist_m_notarized_view(&ctx, peers)?;
                 }
             } else {
-                // Parent not in non-finalized views (already finalized).
-                // Same priority: M-notarized views with blocks are persisted as finalized.
-                if ctx.m_notarization.is_some() && ctx.block.is_some() {
-                    if ctx.votes.len() >= N - F {
-                        if let Some(bh) = ctx.block_hash {
-                            self.previously_committed_block_hash = bh;
-                        }
-                        self.persist_l_notarized_view(&ctx, peers)?;
-                    } else {
-                        self.persist_m_notarized_view(&ctx, peers)?;
-                    }
-                } else if ctx.nullification.is_some() || ctx.has_nullified {
-                    self.persist_nullified_view(&ctx, peers)?;
-                } else if ctx.votes.len() >= N - F && ctx.block.is_some() {
-                    if let Some(bh) = ctx.block_hash {
-                        self.previously_committed_block_hash = bh;
-                    }
-                    self.persist_l_notarized_view(&ctx, peers)?;
-                } else if ctx.m_notarization.is_some() {
-                    self.persist_m_notarized_view(&ctx, peers)?;
-                } else {
-                    // View with no consensus artifacts (e.g., node never received any messages
-                    // for this view). Persist as nullified to clear it from the chain.
-                    self.persist_nullified_view(&ctx, peers)?;
-                }
+                // Non-canonical view (dead fork or intermediate nullified view).
+                // Persist metadata but NOT as a finalized block.
+                self.persist_nullified_view_or_metadata(&ctx, peers)?;
             }
         }
 
@@ -1315,6 +1270,46 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_writer.put_view(&view)?;
 
         // Persist the votes
+        for vote in ctx.votes.iter() {
+            self.persistence_writer.put_vote(vote)?;
+        }
+
+        Ok(())
+    }
+
+    /// Persists a non-canonical view's metadata without writing to `FINALIZED_BLOCKS`.
+    ///
+    /// This handles views from dead forks during GC. If the view has nullification artifacts,
+    /// delegates to `persist_nullified_view`. Otherwise, persists available metadata (block as
+    /// nullified, M-notarization, leader, votes) without marking anything as finalized.
+    fn persist_nullified_view_or_metadata(
+        &mut self,
+        ctx: &ViewContext<N, F, M_SIZE>,
+        peers: &PeerSet,
+    ) -> Result<()> {
+        // If the view has nullification artifacts, use the standard path
+        if ctx.nullification.is_some() || ctx.has_nullified {
+            return self.persist_nullified_view(ctx, peers);
+        }
+
+        // Non-canonical view without nullification — persist metadata only
+        let view_number = ctx.view_number;
+        self.persistence_writer.remove_nullified_view(view_number);
+
+        if let Some(ref block) = ctx.block {
+            self.persistence_writer.put_nullified_block(block)?;
+        }
+        if let Some(ref m_notarization) = ctx.m_notarization {
+            self.persistence_writer.put_m_notarization(m_notarization)?;
+        }
+
+        let leader = Leader::new(ctx.leader_id, view_number);
+        self.persistence_writer.put_leader(&leader)?;
+
+        let leader_pk = peers.id_to_public_key.get(&ctx.leader_id).unwrap();
+        let view = View::new(view_number, leader_pk.clone(), false, true);
+        self.persistence_writer.put_view(&view)?;
+
         for vote in ctx.votes.iter() {
             self.persistence_writer.put_vote(vote)?;
         }
@@ -2366,7 +2361,7 @@ mod tests {
         let setup = TestSetup::new(N);
         let leader_id = setup.leader_id(0);
         let replica_id = setup.replica_id(1);
-        let parent_hash = [15u8; blake3::OUT_LEN];
+        let parent_hash = Block::genesis_hash();
 
         // Create view 1 with M-notarization
         let mut ctx_v1 = create_view_context_with_votes(
@@ -2753,7 +2748,7 @@ mod tests {
         let setup = TestSetup::new(N);
         let leader_id = setup.leader_id(0);
         let replica_id = setup.replica_id(1);
-        let parent_hash = [21u8; blake3::OUT_LEN];
+        let parent_hash = Block::genesis_hash();
 
         let mut ctx_v1 = create_view_context_with_votes(
             1,

@@ -640,6 +640,26 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     ConsensusMessage::BlockRecoveryRequest { view, block_hash },
                 )
             }
+            ViewProgressEvent::ShouldRequestBlocks { requests } => {
+                slog::info!(
+                    self.logger,
+                    "Requesting {} missing blocks from peers",
+                    requests.len(),
+                );
+                for (view, block_hash) in requests {
+                    if let Err(e) = self.broadcast_consensus_message(
+                        ConsensusMessage::BlockRecoveryRequest { view, block_hash },
+                    ) {
+                        slog::warn!(
+                            self.logger,
+                            "Failed to request block for view {}: {}",
+                            view,
+                            e
+                        );
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
