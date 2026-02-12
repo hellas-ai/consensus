@@ -178,14 +178,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// Returns the range of view numbers for the non-finalized views.
     ///
     /// The range spans from the oldest non-finalized view to the current view.
-    /// All views in this range should exist in `non_finalized_views`.
+    /// Note: not all views in this range may exist in `non_finalized_views` — gaps can
+    /// occur when views are retained for block recovery while later views are finalized.
     pub fn non_finalized_view_numbers_range(&self) -> std::ops::RangeInclusive<u64> {
-        let current_view = self.current_view;
         let least_non_finalized_view = self
-            .current_view
-            .saturating_sub(self.non_finalized_count() as u64)
-            + 1;
-        least_non_finalized_view..=current_view
+            .non_finalized_views
+            .keys()
+            .min()
+            .copied()
+            .unwrap_or(self.current_view);
+        least_non_finalized_view..=self.current_view
     }
 
     /// Returns the range of view numbers for the non-finalized views up to the given view number.
@@ -201,10 +203,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         &self,
         view_number: u64,
     ) -> Option<std::ops::RangeInclusive<u64>> {
-        let current_view = self.current_view;
-        let upper_bound = view_number.min(current_view);
-        let least_non_finalized_view =
-            (self.current_view + 1).saturating_sub(self.non_finalized_count() as u64);
+        let upper_bound = view_number.min(self.current_view);
+        let least_non_finalized_view = self.non_finalized_views.keys().min().copied()?;
         if least_non_finalized_view > upper_bound {
             return None;
         }
@@ -271,6 +271,99 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         }
 
         None
+    }
+
+    /// Adds a recovered block to a view that has M-notarization but is missing the block.
+    ///
+    /// This is called when a peer responds to a `BlockRecoveryRequest` with the actual block.
+    /// The block is validated by hash comparison against the M-notarization's block_hash
+    /// (full block validation is skipped since 2f+1 honest validators already validated it).
+    ///
+    /// # Returns
+    /// * `true` if the view also has L-notarization (n-f votes), indicating it's ready to finalize
+    /// * `false` if the block was added but finalization is not yet possible
+    pub fn add_recovered_block(&mut self, view: u64, block: Block) -> Result<bool> {
+        let ctx = self
+            .non_finalized_views
+            .get_mut(&view)
+            .ok_or_else(|| anyhow::anyhow!("View {} not in non-finalized views", view))?;
+
+        // Already have a block — no-op
+        if ctx.block.is_some() {
+            return Ok(false);
+        }
+
+        // Skip nullified views — Lemma 5.3 guarantees no L-notarization is possible
+        if ctx.nullification.is_some() || ctx.has_nullified {
+            return Ok(false);
+        }
+
+        // Verify the block hash matches what M-notarization committed to
+        let expected_hash = ctx.block_hash.ok_or_else(|| {
+            anyhow::anyhow!("View {} has no block_hash from M-notarization", view)
+        })?;
+
+        let actual_hash = block.get_hash();
+        if actual_hash != expected_hash {
+            return Err(anyhow::anyhow!(
+                "Recovered block hash mismatch for view {}: expected {:?}, got {:?}",
+                view,
+                expected_hash,
+                actual_hash
+            ));
+        }
+
+        // Store the block
+        ctx.block = Some(block);
+
+        // Check if L-notarization exists (ready for finalization)
+        let has_l_notarization = ctx.votes.len() >= N - F;
+
+        Ok(has_l_notarization)
+    }
+
+    /// Looks up a block by view number, checking both the non-finalized view chain
+    /// and finalized storage. Returns `None` if the block is not found in either location.
+    pub fn get_block_for_view(&self, view: u64) -> Option<Block> {
+        // Check non-finalized view chain first
+        if let Some(ctx) = self.non_finalized_views.get(&view)
+            && let Some(ref block) = ctx.block
+        {
+            return Some(block.clone());
+        }
+
+        // Fall back to finalized storage (block may have been GC'd from memory)
+        self.persistence_writer
+            .store()
+            .get_finalized_block_by_height(view)
+            .ok()
+            .flatten()
+    }
+
+    /// Persists a recovered block directly to finalized storage.
+    ///
+    /// This is a fallback for the case where a view was already GC'd from `non_finalized_views`
+    /// before block recovery delivered the block. The view metadata (M-notarization, leader, votes)
+    /// was already persisted during GC — this method fills in the missing block data.
+    pub fn persist_recovered_block_to_storage(&self, view: u64, block: Block) -> Result<()> {
+        // Don't overwrite if we already have block data for this view
+        if self
+            .persistence_writer
+            .store()
+            .get_finalized_block_by_height(view)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        for tx in block.transactions.iter() {
+            self.persistence_writer.put_transaction(tx)?;
+        }
+        let mut finalized_block = block;
+        finalized_block.is_finalized = true;
+        self.persistence_writer
+            .put_finalized_block(&finalized_block)?;
+        Ok(())
     }
 
     /// Stores a pre-computed [`StateDiff`] instance for a view.
@@ -431,7 +524,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         }
 
         // Add block to the view context
-        ctx.add_new_view_block(block, state_diff, peers)
+        let result = ctx.add_new_view_block(block, state_diff, peers);
+
+        // If this view already has M-notarization (block arrived after votes crossed
+        // the threshold via network messages), retroactively publish the StateDiff
+        // to pending state. Without this, leaders that validated this view's block late
+        // would propose with stale nonces (InvalidNonce every leader rotation).
+        self.on_m_notarization(view_number);
+
+        result
     }
 
     /// Routes a vote to the appropriate non-finalized view context.
@@ -924,12 +1025,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     finalized_view
                 ))?;
 
-        // Note: ancestor views may be missing blocks (the node received votes/M-notarization
-        // but never received or validated the actual block). This is normal in BFT — we persist
-        // available metadata and don't block finalization for missing ancestor blocks.
-
         for view_number in to_persist_range {
-            let ctx = self.non_finalized_views.remove(&view_number).unwrap();
+            // Retain views that are M-notarized but missing their block — block recovery
+            // may still deliver the block data. Don't GC them yet.
+            if view_number != finalized_view
+                && let Some(ctx) = self.non_finalized_views.get(&view_number)
+                && ctx.m_notarization.is_some()
+                && ctx.block_hash.is_some()
+                && ctx.block.is_none()
+                && ctx.nullification.is_none()
+                && !ctx.has_nullified
+            {
+                continue;
+            }
+
+            // View may not exist (gap from previous GC cycle that retained some views,
+            // or view was already processed).
+            let Some(ctx) = self.non_finalized_views.remove(&view_number) else {
+                continue;
+            };
 
             if view_number == finalized_view {
                 // The view being finalized — block is guaranteed present (checked above)
@@ -1112,9 +1226,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// and [`store_state_diff`](Self::store_state_diff) (for late-arriving diffs).
     ///
     /// # Behavior
-    /// - If the view exists and has a [`StateDiff`], it's added to pending state via
-    ///   [`PendingStateWriter::add_m_notarized_diff`].
-    /// - If the view doesn't exist or has no [`StateDiff`], this is a no-op.
+    /// - If the view exists, has M-notarization, and has a [`StateDiff`], it's added to pending
+    ///   state via [`PendingStateWriter::add_m_notarized_diff`].
+    /// - If the view doesn't exist, lacks M-notarization, or has no [`StateDiff`], this is a
+    ///   no-op.
     /// - Consensus artifacts (block, votes, M-notarization) remain in [`ViewContext`] until
     ///   L-notarization triggers persistence.
     ///
@@ -1122,6 +1237,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// * `view_number` - The view that achieved M-notarization
     pub fn on_m_notarization(&mut self, view_number: u64) {
         if let Some(ctx) = self.non_finalized_views.get(&view_number)
+            && ctx.m_notarization.is_some()
             && let Some(ref state_diff) = ctx.state_diff
         {
             self.persistence_writer
@@ -1401,15 +1517,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         let mut greatest_view_with_m_not: Option<(u64, [u8; blake3::OUT_LEN])> = None;
 
         for (view_num, ctx) in &self.non_finalized_views {
-            // Per paper: SelectParent returns the greatest v' < new_view with M-notarization.
-            // M-notarization is a permanent fact that cannot be invalidated by nullification
-            // (Lemma 5.3 only forbids L-notarization + nullification coexistence).
-            // Skip views that are nullified WITHOUT M-notarization (pure nullification).
-            // Views with both M-notarization and nullification/has_nullified remain valid
-            // parents to ensure SelectParent consistency across all nodes.
-            if (ctx.nullification.is_some() || ctx.has_nullified)
-                && ctx.m_notarization.is_none()
-            {
+            // Per paper Algorithm 1: SelectParent returns the greatest M-notarized
+            // NON-NULLIFIED view v' < new_view. A nullified view — even if M-notarized —
+            // must be skipped, because its block will never be finalized (Lemma 5.3).
+            // The pending state diff for nullified views is also removed, so using them
+            // as parents would create a mismatch between the parent chain and pending state.
+            if ctx.nullification.is_some() || ctx.has_nullified {
                 continue;
             }
 
@@ -1444,6 +1557,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_writer.remove_nullified_view(view);
     }
 
+    /// Removes pending state diffs for all views in the range `[start_view, end_view]` (inclusive).
+    ///
+    /// During cascade nullification, the triggering view and all intermediate views may have
+    /// stale [`StateDiff`] entries in the [`PendingStateWriter`]. These must be removed to
     /// Finds the view number for a given parent block hash in the non-finalized chain.
     ///
     /// Searches through all non-finalized views to locate which view contains a block
@@ -5047,13 +5164,14 @@ mod tests {
             ctx.has_nullified = true;
         }
 
-        // Per paper: M-notarization is a permanent fact. Even with has_nullified set,
-        // view 2 still has M-notarization and remains a valid parent.
-        // SelectParent should still return view 2's block hash.
+        // Per paper: SelectParent returns the greatest M-notarized NON-NULLIFIED view.
+        // View 2 is now nullified (has_nullified = true), so it should be skipped.
+        // View 1 is also nullified, so SelectParent should fall back to genesis.
         let parent_fallback = view_chain.select_parent(3);
         assert_eq!(
-            parent_fallback, block_hash_v2,
-            "M-notarized view should remain a valid parent even when locally nullified"
+            parent_fallback,
+            Block::genesis_hash(),
+            "Should fall back to genesis hash when all views are nullified"
         );
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();
@@ -5152,12 +5270,14 @@ mod tests {
             ctx.nullification = Some(nullification_v2);
         }
 
-        // Per paper: M-notarization is a permanent fact, not invalidated by nullification.
-        // Even with aggregated nullification, view 2's M-notarization makes it a valid parent.
+        // Per paper: SelectParent returns the greatest M-notarized NON-NULLIFIED view.
+        // View 2 now has aggregated nullification, so it should be skipped.
+        // View 1 also has nullification, so fall back to genesis hash.
         let parent_fallback = view_chain.select_parent(3);
         assert_eq!(
-            parent_fallback, block_hash_v2,
-            "M-notarized view should remain a valid parent even with aggregated nullification"
+            parent_fallback,
+            Block::genesis_hash(),
+            "Should fall back to genesis hash when all views are nullified"
         );
 
         std::fs::remove_dir_all(setup.temp_dir.path()).unwrap();

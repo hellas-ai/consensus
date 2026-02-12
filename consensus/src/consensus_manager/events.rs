@@ -196,4 +196,14 @@ pub enum ViewProgressEvent<const N: usize, const F: usize, const M_SIZE: usize> 
         /// The starting view that triggered the nullification (where conflict was detected)
         start_view: u64,
     },
+
+    /// If the current replica should request a missing block from peers.
+    /// This happens when a view has received M-notarization (block_hash is known)
+    /// but the actual block proposal was never received from the leader.
+    ShouldRequestBlock {
+        /// The view number for which the block is missing.
+        view: u64,
+        /// The expected block hash (from the M-notarization).
+        block_hash: [u8; blake3::OUT_LEN],
+    },
 }

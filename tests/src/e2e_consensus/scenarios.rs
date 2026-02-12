@@ -476,7 +476,7 @@ fn test_multi_node_happy_path() {
             validators,
             total_number_peers: N,
             maximum_number_faulty_peers: F,
-            bootstrap_timeout_ms: 30_000, // 30 seconds - match production default for reliable bootstrap
+            bootstrap_timeout_ms: 30_000,
             ping_interval_ms: 200,        // Faster ping for quicker discovery
             ..Default::default()
         };

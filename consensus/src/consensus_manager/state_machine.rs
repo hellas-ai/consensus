@@ -568,10 +568,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 //    Marking them as nullified would corrupt their state and cause
                 //    SelectParent to return inconsistent results across nodes, breaking
                 //    chain integrity. Only the current view should be nullified.
+                //    NOTE: We also do NOT remove pending diffs for intermediate views here.
+                //    Those diffs are consistently present across all nodes and removing them
+                //    would create state divergence (this node removes diffs that other nodes
+                //    still have, causing InvalidNonce when this node proposes).
 
                 // 3. Send a single Nullify for the current view (per paper Algorithm 1,
                 //    Step 8). This broadcasts our vote AND marks it locally as nullified.
-                //    nullify_view also calls mark_nullified which removes the pending diff.
                 if let Err(e) = self.nullify_view(current_view, true) {
                     slog::debug!(
                         self.logger,
@@ -626,6 +629,16 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 }
 
                 Ok(())
+            }
+            ViewProgressEvent::ShouldRequestBlock { view, block_hash } => {
+                slog::info!(
+                    self.logger,
+                    "Requesting missing block from peers";
+                    "view" => view,
+                );
+                self.broadcast_consensus_message(
+                    ConsensusMessage::BlockRecoveryRequest { view, block_hash },
+                )
             }
         }
     }

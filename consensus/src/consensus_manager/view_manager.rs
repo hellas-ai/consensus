@@ -366,7 +366,7 @@
 //! - Validated block processing and StateDiff storage
 //! - Pending state timing (StateDiff not in pending until M-notarization)
 
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use tracing::instrument;
@@ -432,6 +432,10 @@ pub struct ViewProgressManager<const N: usize, const F: usize, const M_SIZE: usi
     /// The set of peers in the consensus protocol.
     peers: PeerSet,
 
+    /// Cooldown tracking for block recovery requests (view -> last request time).
+    /// Prevents flooding the network with repeated requests for the same missing block.
+    block_recovery_cooldowns: HashMap<u64, Instant>,
+
     /// Logger for logging events
     logger: slog::Logger,
 }
@@ -492,6 +496,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             view_chain,
             replica_id,
             peers,
+            block_recovery_cooldowns: HashMap::new(),
             logger,
         })
     }
@@ -544,6 +549,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             view_chain,
             replica_id,
             peers,
+            block_recovery_cooldowns: HashMap::new(),
             logger,
         })
     }
@@ -598,6 +604,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             }
             ConsensusMessage::Nullification(nullification) => {
                 self.handle_nullification(nullification)
+            }
+            ConsensusMessage::BlockRecoveryRequest { view, block_hash } => {
+                self.handle_block_recovery_request(view, block_hash)
+            }
+            ConsensusMessage::BlockRecoveryResponse { view, block } => {
+                self.handle_block_recovery_response(view, block)
             }
         }
     }
@@ -703,6 +715,43 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 view: current_view.view_number,
                 block_hash,
             });
+        }
+
+        // Check for views that need block recovery: M-notarized but missing block
+        for view_number in self.view_chain.non_finalized_view_numbers_range() {
+            let Some(view_ctx) = self.view_chain.find_view_context(view_number) else {
+                continue;
+            };
+
+            // Skip the current view — it's still actively processing
+            if view_number >= current_view.view_number {
+                continue;
+            }
+
+            // Candidate: has M-notarization and block_hash but no block data
+            if view_ctx.m_notarization.is_some()
+                && view_ctx.block.is_none()
+                && view_ctx.pending_block.is_none()
+                && !view_ctx.has_nullified
+                && view_ctx.nullification.is_none()
+                && let Some(block_hash) = view_ctx.block_hash
+            {
+                // Check cooldown: don't re-request within 500ms
+                let should_request = self
+                    .block_recovery_cooldowns
+                    .get(&view_number)
+                    .map(|last| last.elapsed() >= std::time::Duration::from_millis(500))
+                    .unwrap_or(true);
+
+                if should_request {
+                    self.block_recovery_cooldowns
+                        .insert(view_number, Instant::now());
+                    return Ok(ViewProgressEvent::ShouldRequestBlock {
+                        view: view_number,
+                        block_hash,
+                    });
+                }
+            }
         }
 
         // If no block available yet, await
@@ -1414,6 +1463,98 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         Ok(ViewProgressEvent::ShouldNullify {
             view: nullification_view_number,
         })
+    }
+
+    /// Handles a block recovery request from a peer.
+    ///
+    /// Only the **leader** of the requested view responds, since the leader proposed the
+    /// block and is guaranteed to have it. This avoids a broadcast storm where all peers
+    /// would respond simultaneously.
+    fn handle_block_recovery_request(
+        &mut self,
+        view: u64,
+        _block_hash: [u8; 32],
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
+        // Only the leader for this view should respond to avoid broadcast amplification
+        let leader = self.leader_manager.leader_for_view(view)?.peer_id();
+        if leader != self.replica_id {
+            return Ok(ViewProgressEvent::NoOp);
+        }
+
+        // Check both non-finalized view chain and finalized storage
+        if let Some(block) = self.view_chain.get_block_for_view(view) {
+            slog::info!(
+                self.logger,
+                "Responding to block recovery request (as leader)";
+                "view" => view,
+            );
+            return Ok(ViewProgressEvent::BroadcastConsensusMessage {
+                message: Box::new(ConsensusMessage::BlockRecoveryResponse {
+                    view,
+                    block,
+                }),
+            });
+        }
+
+        Ok(ViewProgressEvent::NoOp)
+    }
+
+    /// Handles a block recovery response containing a recovered block from a peer.
+    ///
+    /// Validates the block hash against the M-notarization, adds it to the view chain,
+    /// and triggers finalization if L-notarization (n-f votes) is available.
+    fn handle_block_recovery_response(
+        &mut self,
+        view: u64,
+        block: Block,
+    ) -> Result<ViewProgressEvent<N, F, M_SIZE>> {
+        match self.view_chain.add_recovered_block(view, block.clone()) {
+            Ok(has_l_notarization) => {
+                // Clear cooldown tracking for this view
+                self.block_recovery_cooldowns.remove(&view);
+
+                if has_l_notarization {
+                    let block_hash = self
+                        .view_chain
+                        .find_view_context(view)
+                        .and_then(|ctx| ctx.block_hash)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Block hash missing after recovery")
+                        })?;
+
+                    slog::info!(
+                        self.logger,
+                        "Recovered block triggers finalization";
+                        "view" => view,
+                    );
+
+                    return Ok(ViewProgressEvent::ShouldFinalize { view, block_hash });
+                }
+
+                slog::info!(
+                    self.logger,
+                    "Block recovered, awaiting L-notarization";
+                    "view" => view,
+                );
+
+                Ok(ViewProgressEvent::NoOp)
+            }
+            Err(e) => {
+                // View was likely GC'd before the recovery response arrived.
+                // Persist the block directly to storage as a fallback — the view
+                // metadata was already persisted during GC.
+                slog::info!(
+                    self.logger,
+                    "Block recovery: view not in chain, persisting to storage";
+                    "view" => view,
+                    "reason" => %e,
+                );
+                self.view_chain
+                    .persist_recovered_block_to_storage(view, block)?;
+                self.block_recovery_cooldowns.remove(&view);
+                Ok(ViewProgressEvent::NoOp)
+            }
+        }
     }
 
     /// Process pending child blocks recursively until no more can be processed.
@@ -6700,12 +6841,14 @@ mod tests {
         // Mark view 1 as nullified (simulating cascade)
         manager.mark_nullified(1).unwrap();
 
-        // Per paper: M-notarization is a permanent fact, not invalidated by local nullification.
-        // View 1 still has M-notarization, so select_parent should still return its block hash.
+        // Per paper: SelectParent returns the greatest M-notarized NON-NULLIFIED view.
+        // View 1 is now nullified via mark_nullified, so it should be skipped.
+        // Should fall back to genesis hash.
         let parent_after = manager.select_parent(3);
         assert_eq!(
-            parent_after, block_hash_v1,
-            "M-notarized view should remain a valid parent even after mark_nullified"
+            parent_after,
+            Block::genesis_hash(),
+            "Nullified view should not be used as parent, should fall back to genesis"
         );
 
         std::fs::remove_file(path).unwrap();

@@ -15,6 +15,7 @@ use crate::state::{
 /// - A M-notarization for a block, for the current view (it can be proposed by any replica)
 /// - A L-notarization for a block, for the current view (it can be proposed by any replica)
 /// - A nullification for a view, for the current view (it can be proposed by any replica)
+/// - A block recovery request/response for fetching missing blocks from peers
 #[derive(Clone, Debug, Archive, Deserialize, Serialize)]
 pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize> {
     BlockProposal(Block),
@@ -22,4 +23,10 @@ pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize> {
     Nullify(Nullify),
     MNotarization(MNotarization<N, F, M_SIZE>),
     Nullification(Nullification<N, F, M_SIZE>),
+    /// Request a missing block by view and expected hash. Sent when a replica has M-notarization
+    /// for a view but never received the actual block proposal from the leader.
+    BlockRecoveryRequest { view: u64, block_hash: [u8; 32] },
+    /// Response containing the requested block. Sent by a peer that has the block in its
+    /// non-finalized view chain or finalized storage.
+    BlockRecoveryResponse { view: u64, block: Block },
 }
