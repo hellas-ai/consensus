@@ -96,6 +96,11 @@ pub struct ViewChain<const N: usize, const F: usize, const M_SIZE: usize> {
     /// The most recent finalized block hash in the current replica's state machine
     // TODO: Move this to [`ViewProgressManager`]
     pub(crate) previously_committed_block_hash: [u8; blake3::OUT_LEN],
+
+    /// Views in the canonical chain (ancestor of an L-notarized block) that are missing
+    /// block data. Populated by `finalize_with_l_notarization` when deferring due to
+    /// missing ancestor blocks. Drained by `tick()` to trigger proactive recovery.
+    pub(crate) pending_canonical_recovery: Vec<(u64, [u8; blake3::OUT_LEN])>,
 }
 
 impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE> {
@@ -121,6 +126,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             non_finalized_views,
             persistence_writer,
             previously_committed_block_hash: Block::genesis_hash(),
+            pending_canonical_recovery: Vec::new(),
         }
     }
 
@@ -247,11 +253,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             let parent_valid = match parent_view {
                 Some(parent_view_number) => {
                     let parent_ctx = self.non_finalized_views.get(&parent_view_number).unwrap();
-                    // Parent must have M-notarization, block, and not be nullified
+                    // Parent must have M-notarization and block. Parent CAN be nullified —
+                    // M-notarization + nullification coexist (n >= 5f+1). This matches
+                    // finalize_with_l_notarization which does not check parent nullification.
                     parent_ctx.m_notarization.is_some()
                         && parent_ctx.block.is_some()
-                        && parent_ctx.nullification.is_none()
-                        && !parent_ctx.has_nullified
                         // All intermediate views must be nullified
                         && (parent_view_number + 1..view_num).all(|inter| {
                             self.non_finalized_views
@@ -294,11 +300,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             return Ok(false);
         }
 
-        // Skip nullified views — Lemma 5.3 guarantees no L-notarization is possible
-        if ctx.nullification.is_some() || ctx.has_nullified {
-            return Ok(false);
-        }
-
         // Verify the block hash matches what M-notarization committed to
         let expected_hash = ctx.block_hash.ok_or_else(|| {
             anyhow::anyhow!("View {} has no block_hash from M-notarization", view)
@@ -314,11 +315,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             ));
         }
 
-        // Store the block
+        // Store the block — even for nullified views, the block may be needed
+        // as a canonical ancestor when an L-notarized descendant finalizes.
         ctx.block = Some(block);
 
-        // Check if L-notarization exists (ready for finalization)
-        let has_l_notarization = ctx.votes.len() >= N - F;
+        // Per Lemma 5.3, nullified views cannot achieve L-notarization.
+        // Don't trigger direct finalization — the block will be used during
+        // ancestor GC when an L-notarized descendant finalizes.
+        let has_l_notarization =
+            ctx.votes.len() >= N - F && ctx.nullification.is_none() && !ctx.has_nullified;
 
         Ok(has_l_notarization)
     }
@@ -339,6 +344,41 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
             .get_finalized_block_by_height(view)
             .ok()
             .flatten()
+    }
+
+    /// Looks up a block for recovery, searching all storage locations.
+    ///
+    /// Unlike [`get_block_for_view`](Self::get_block_for_view) which only checks the
+    /// non-finalized chain and finalized storage, this also searches nullified and
+    /// non-finalized block tables using the block hash. This is needed because blocks
+    /// for views that were GC'd as non-canonical are stored in `NULLIFIED_BLOCKS`,
+    /// not `FINALIZED_BLOCKS`.
+    pub fn get_block_for_recovery(
+        &self,
+        view: u64,
+        block_hash: &[u8; blake3::OUT_LEN],
+    ) -> Option<Block> {
+        // Check non-finalized view chain first
+        if let Some(ctx) = self.non_finalized_views.get(&view)
+            && let Some(ref block) = ctx.block
+        {
+            return Some(block.clone());
+        }
+
+        let store = self.persistence_writer.store();
+
+        // Check finalized storage
+        if let Some(block) = store.get_finalized_block_by_height(view).ok().flatten() {
+            return Some(block);
+        }
+
+        // Check nullified storage (block may have been GC'd as non-canonical)
+        if let Some(block) = store.get_nullified_block(block_hash).ok().flatten() {
+            return Some(block);
+        }
+
+        // Check non-finalized storage
+        store.get_non_finalized_block(block_hash).ok().flatten()
     }
 
     /// Stores a pre-computed [`StateDiff`] instance for a view.
@@ -1010,6 +1050,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         // finalized) vs non-canonical forks (which should be persisted as nullified).
         let mut canonical_views = std::collections::HashSet::new();
         canonical_views.insert(finalized_view);
+        self.pending_canonical_recovery.clear();
         {
             let mut trace_hash = parent_hash;
             while let Some(view_num) = self.find_parent_view(&trace_hash) {
@@ -1018,14 +1059,25 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
                     if let Some(ref block) = ctx.block {
                         trace_hash = block.parent_block_hash();
                     } else {
-                        // Canonical ancestor missing its block — defer finalization.
-                        // Block recovery will deliver it, and finalization will retry.
-                        return Ok(());
+                        // Canonical ancestor missing its block — record for
+                        // proactive recovery and defer finalization.
+                        if let Some(block_hash) = ctx.block_hash {
+                            self.pending_canonical_recovery.push((view_num, block_hash));
+                        }
+                        // Can't trace further without block's parent_block_hash
+                        break;
                     }
                 } else {
                     break;
                 }
             }
+        }
+
+        // If any canonical ancestors are missing blocks, defer finalization.
+        // The pending_canonical_recovery list will be drained by tick() to
+        // trigger proactive block recovery requests.
+        if !self.pending_canonical_recovery.is_empty() {
+            return Ok(());
         }
 
         // 7. Persist all views from oldest to finalized
@@ -1552,10 +1604,21 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
         self.persistence_writer.remove_nullified_view(view);
     }
 
-    /// Removes pending state diffs for all views in the range `[start_view, end_view]` (inclusive).
+    /// Removes pending state diffs for views in `[start_view, end_view]` (inclusive).
     ///
-    /// During cascade nullification, the triggering view and all intermediate views may have
-    /// stale [`StateDiff`] entries in the [`PendingStateWriter`]. These must be removed to
+    /// During cascade nullification, the triggering view and all intermediate views have
+    /// stale [`StateDiff`] entries whose nonce increments no longer reflect the canonical
+    /// chain. Removing them prevents [`InvalidNonce`] block validation errors.
+    ///
+    /// Only removes diffs within the cascade range — views after `end_view` are unaffected.
+    /// All correct nodes will eventually receive the same nullification (2f+1 guarantee)
+    /// and cascade from the same `start_view`, so this converges to consistent pending state.
+    pub fn rollback_pending_diffs_in_range(&mut self, start_view: u64, end_view: u64) {
+        for view in start_view..=end_view {
+            self.persistence_writer.remove_nullified_view(view);
+        }
+    }
+
     /// Finds the view number for a given parent block hash in the non-finalized chain.
     ///
     /// Searches through all non-finalized views to locate which view contains a block
@@ -1568,7 +1631,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// # Returns
     /// * `Some(view_number)` - The view that contains the block with this hash
     /// * `None` - No non-finalized view has a block with this hash
-    fn find_parent_view(&self, parent_hash: &[u8; blake3::OUT_LEN]) -> Option<u64> {
+    pub(crate) fn find_parent_view(&self, parent_hash: &[u8; blake3::OUT_LEN]) -> Option<u64> {
         for (view_num, ctx) in &self.non_finalized_views {
             if let Some(hash) = ctx.block_hash
                 && hash == *parent_hash

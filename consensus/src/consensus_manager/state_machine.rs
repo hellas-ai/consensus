@@ -323,6 +323,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 if let Err(e) = self.handle_consensus_message(message) {
                     slog::warn!(self.logger, "Error handling consensus message: {}", e);
                 }
+                // Check shutdown between messages to allow timely exit
+                if self.shutdown_signal.load(Ordering::Relaxed) {
+                    break;
+                }
             }
 
             // Periodic tick
@@ -568,10 +572,6 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                 //    Marking them as nullified would corrupt their state and cause
                 //    SelectParent to return inconsistent results across nodes, breaking
                 //    chain integrity. Only the current view should be nullified.
-                //    NOTE: We also do NOT remove pending diffs for intermediate views here.
-                //    Those diffs are consistently present across all nodes and removing them
-                //    would create state divergence (this node removes diffs that other nodes
-                //    still have, causing InvalidNonce when this node proposes).
 
                 // 3. Send a single Nullify for the current view (per paper Algorithm 1,
                 //    Step 8). This broadcasts our vote AND marks it locally as nullified.
@@ -584,7 +584,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     );
                 }
 
-                // 4. Create a new view context and progress to it.
+                // 4. Remove stale pending state diffs from start_view onward.
+                //    Intermediate M-notarized views may have StateDiffs with nonce
+                //    increments that are no longer valid after the cascade. All correct
+                //    nodes will eventually cascade from the same start_view (2f+1
+                //    guarantee), so this converges to consistent pending state.
+                self.view_manager
+                    .rollback_pending_diffs_in_range(start_view, current_view);
+
+                // 5. Create a new view context and progress to it.
                 //    Unlike normal nullification flow (which requires aggregated proof),
                 //    cascade progression only requires local nullification of current view.
                 let new_view = current_view + 1;
@@ -598,7 +606,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     parent_hash
                 );
 
-                // 5. Replay buffered messages and propose if leader
+                // 6. Replay buffered messages and propose if leader
                 self.progress_to_next_view(new_view, leader, parent_hash)?;
 
                 Ok(())
@@ -627,6 +635,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                         e
                     );
                 }
+
+                // Remove stale pending state diffs from start_view onward
+                // (same rationale as ShouldCascadeNullification above).
+                self.view_manager
+                    .rollback_pending_diffs_in_range(start_view, current_view);
 
                 Ok(())
             }
@@ -961,9 +974,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // Try to finalize any pending views that now have enough votes.
         // This handles the case where votes accumulated during previous views
         // but finalization was deferred (e.g., missing block, missing parent M-notarization).
+        //
+        // Limit per pass to avoid blocking the main event loop for too long — each
+        // finalization involves storage writes and can take ~30ms. Processing hundreds
+        // of views here would starve message processing (block recovery requests/responses),
+        // causing other nodes to wait. Remaining views are finalized on the next call.
+        const MAX_FINALIZATIONS_PER_PASS: usize = 5;
+        let mut finalization_count = 0;
         while let Some((finalizable_view, block_hash)) =
             self.view_manager.oldest_finalizable_view()
         {
+            if finalization_count >= MAX_FINALIZATIONS_PER_PASS {
+                break;
+            }
             slog::info!(
                 self.logger,
                 "Attempting deferred finalization for view {} (block: {:?})",
@@ -985,6 +1008,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             if self.view_manager.find_view_context(finalizable_view).is_some() {
                 break;
             }
+            finalization_count += 1;
         }
 
         // Replay any buffered messages for this view (or previous ones)
