@@ -552,9 +552,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     current_view
                 );
 
-                // 1. Broadcast the aggregated nullification for the view that triggered
-                //    the cascade (if needed). This lets other nodes learn about the
-                //    nullification and independently handle their own cascades.
+                // 1. Broadcast the aggregated nullification for the view that triggered the cascade
+                //    (if needed). This lets other nodes learn about the nullification and
+                //    independently handle their own cascades.
                 if should_broadcast_nullification
                     && let Err(e) = self.broadcast_nullification(start_view)
                 {
@@ -566,15 +566,15 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     );
                 }
 
-                // 2. Per paper Algorithm 1 Step 8: do NOT nullify intermediate views.
-                //    Intermediate views between start_view and current_view were already
-                //    processed through normal consensus flow (M-notarized or nullified).
-                //    Marking them as nullified would corrupt their state and cause
-                //    SelectParent to return inconsistent results across nodes, breaking
-                //    chain integrity. Only the current view should be nullified.
+                // 2. Per paper Algorithm 1 Step 8: do NOT nullify intermediate views. Intermediate
+                //    views between start_view and current_view were already processed through
+                //    normal consensus flow (M-notarized or nullified). Marking them as nullified
+                //    would corrupt their state and cause SelectParent to return inconsistent
+                //    results across nodes, breaking chain integrity. Only the current view should
+                //    be nullified.
 
-                // 3. Send a single Nullify for the current view (per paper Algorithm 1,
-                //    Step 8). This broadcasts our vote AND marks it locally as nullified.
+                // 3. Send a single Nullify for the current view (per paper Algorithm 1, Step 8).
+                //    This broadcasts our vote AND marks it locally as nullified.
                 if let Err(e) = self.nullify_view(current_view, true) {
                     slog::debug!(
                         self.logger,
@@ -584,20 +584,19 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     );
                 }
 
-                // 4. Remove stale pending state diffs from start_view onward.
-                //    Intermediate M-notarized views may have StateDiffs with nonce
-                //    increments that are no longer valid after the cascade. All correct
-                //    nodes will eventually cascade from the same start_view (2f+1
-                //    guarantee), so this converges to consistent pending state.
+                // 4. Remove stale pending state diffs from start_view onward. Intermediate
+                //    M-notarized views may have StateDiffs with nonce increments that are no longer
+                //    valid after the cascade. All correct nodes will eventually cascade from the
+                //    same start_view (2f+1 guarantee), so this converges to consistent pending
+                //    state.
                 self.view_manager
                     .rollback_pending_diffs_in_range(start_view, current_view);
 
-                // 5. Create a new view context and progress to it.
-                //    Unlike normal nullification flow (which requires aggregated proof),
-                //    cascade progression only requires local nullification of current view.
+                // 5. Create a new view context and progress to it. Unlike normal nullification flow
+                //    (which requires aggregated proof), cascade progression only requires local
+                //    nullification of current view.
                 let new_view = current_view + 1;
-                let (leader, parent_hash) =
-                    self.view_manager.progress_after_cascade(new_view)?;
+                let (leader, parent_hash) = self.view_manager.progress_after_cascade(new_view)?;
 
                 slog::info!(
                     self.logger,
@@ -649,9 +648,10 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     "Requesting missing block from peers";
                     "view" => view,
                 );
-                self.broadcast_consensus_message(
-                    ConsensusMessage::BlockRecoveryRequest { view, block_hash },
-                )
+                self.broadcast_consensus_message(ConsensusMessage::BlockRecoveryRequest {
+                    view,
+                    block_hash,
+                })
             }
             ViewProgressEvent::ShouldRequestBlocks { requests } => {
                 slog::info!(
@@ -660,9 +660,12 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
                     requests.len(),
                 );
                 for (view, block_hash) in requests {
-                    if let Err(e) = self.broadcast_consensus_message(
-                        ConsensusMessage::BlockRecoveryRequest { view, block_hash },
-                    ) {
+                    if let Err(e) =
+                        self.broadcast_consensus_message(ConsensusMessage::BlockRecoveryRequest {
+                            view,
+                            block_hash,
+                        })
+                    {
                         slog::warn!(
                             self.logger,
                             "Failed to request block for view {}: {}",
@@ -887,9 +890,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
     ///
     /// # Arguments
     /// * `view` - The view number to nullify
-    /// * `force` - If true, use cascade nullification (bypasses has_voted/evidence checks).
-    ///   Used for ShouldCascadeNullification and ShouldNullifyRange events.
-    ///   If false, use normal nullification logic (timeout or Byzantine based on evidence).
+    /// * `force` - If true, use cascade nullification (bypasses has_voted/evidence checks). Used
+    ///   for ShouldCascadeNullification and ShouldNullifyRange events. If false, use normal
+    ///   nullification logic (timeout or Byzantine based on evidence).
     fn nullify_view(&mut self, view: u64, force: bool) -> Result<()> {
         slog::debug!(self.logger, "Nullifying view {view} (force: {force})");
 
@@ -981,8 +984,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
         // causing other nodes to wait. Remaining views are finalized on the next call.
         const MAX_FINALIZATIONS_PER_PASS: usize = 5;
         let mut finalization_count = 0;
-        while let Some((finalizable_view, block_hash)) =
-            self.view_manager.oldest_finalizable_view()
+        while let Some((finalizable_view, block_hash)) = self.view_manager.oldest_finalizable_view()
         {
             if finalization_count >= MAX_FINALIZATIONS_PER_PASS {
                 break;
@@ -1005,7 +1007,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ConsensusStateMachine<
             // If the view is still present after finalize_view returned Ok(()),
             // it means finalization was deferred (e.g., ancestor missing block).
             // Break to avoid an infinite loop — we'll retry on the next view progression.
-            if self.view_manager.find_view_context(finalizable_view).is_some() {
+            if self
+                .view_manager
+                .find_view_context(finalizable_view)
+                .is_some()
+            {
                 break;
             }
             finalization_count += 1;

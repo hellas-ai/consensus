@@ -1235,8 +1235,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewChain<N, F, M_SIZE
     /// # Behavior
     /// - If the view exists, has M-notarization, and has a [`StateDiff`], it's added to pending
     ///   state via [`PendingStateWriter::add_m_notarized_diff`].
-    /// - If the view doesn't exist, lacks M-notarization, or has no [`StateDiff`], this is a
-    ///   no-op.
+    /// - If the view doesn't exist, lacks M-notarization, or has no [`StateDiff`], this is a no-op.
     /// - Consensus artifacts (block, votes, M-notarization) remain in [`ViewContext`] until
     ///   L-notarization triggers persistence.
     ///
@@ -4983,11 +4982,9 @@ mod tests {
         // Now verify ALL data was persisted to the database
         let storage = &view_chain.persistence_writer;
 
-        // Check block was persisted as finalized (M-notarized parent committed via child's L-notarization)
-        let stored_block_v1 = storage
-            .store()
-            .get_finalized_block(&block_hash_v1)
-            .unwrap();
+        // Check block was persisted as finalized (M-notarized parent committed via child's
+        // L-notarization)
+        let stored_block_v1 = storage.store().get_finalized_block(&block_hash_v1).unwrap();
         assert!(stored_block_v1.is_some());
         let stored_block_v1 = stored_block_v1.unwrap();
         assert_eq!(stored_block_v1.get_hash(), block_hash_v1);

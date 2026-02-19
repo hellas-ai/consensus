@@ -665,9 +665,9 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             // intermediate views nullified before proposing. This ensures
             // other replicas have received the nullifications by the time
             // the proposal arrives, reducing missed blocks.
-            let parent_view =
-                self.view_chain
-                    .find_parent_view(&current_view.parent_block_hash);
+            let parent_view = self
+                .view_chain
+                .find_parent_view(&current_view.parent_block_hash);
 
             let can_propose = if let Some(pv) = parent_view {
                 self.view_chain
@@ -681,8 +681,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                     })
             } else {
                 // Parent already finalized — OK to propose
-                current_view.parent_block_hash
-                    == self.view_chain.previously_committed_block_hash
+                current_view.parent_block_hash == self.view_chain.previously_committed_block_hash
             };
 
             if can_propose {
@@ -814,8 +813,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 .map(|last| last.elapsed() >= std::time::Duration::from_millis(500))
                 .unwrap_or(true);
             if should_request {
-                self.block_recovery_cooldowns
-                    .insert(view, Instant::now());
+                self.block_recovery_cooldowns.insert(view, Instant::now());
                 recovery_requests.push((view, block_hash));
             }
         }
@@ -881,7 +879,11 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
         // canonical ancestors are missing blocks. We move them here so they persist
         // across ticks until the blocks actually arrive.
         for entry in self.view_chain.pending_canonical_recovery.drain(..) {
-            if !self.canonical_recovery_pending.iter().any(|(v, _)| *v == entry.0) {
+            if !self
+                .canonical_recovery_pending
+                .iter()
+                .any(|(v, _)| *v == entry.0)
+            {
                 self.canonical_recovery_pending.push(entry);
             }
         }
@@ -957,11 +959,13 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
     ///
     /// # Returns
     /// `(leader, parent_hash)` for the new view.
-    pub fn progress_after_cascade(&mut self, new_view: u64) -> Result<(PeerId, [u8; blake3::OUT_LEN])> {
+    pub fn progress_after_cascade(
+        &mut self,
+        new_view: u64,
+    ) -> Result<(PeerId, [u8; blake3::OUT_LEN])> {
         let new_leader = self.leader_manager.leader_for_view(new_view)?.peer_id();
         let parent_hash = self.view_chain.select_parent(new_view);
-        let new_view_context =
-            ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
+        let new_view_context = ViewContext::new(new_view, new_leader, self.replica_id, parent_hash);
         self.view_chain.progress_after_cascade(new_view_context)?;
         Ok((new_leader, parent_hash))
     }
@@ -1324,7 +1328,8 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
             // Check if this is a past view with M-notarization — cascade per Algorithm 1 Step 8.
             // Cascade is only needed when the nullified past view was M-notarized, because
             // descendant views may have blocks/StateDiffs building on its (now-invalid) block.
-            // Non-M-notarized past views have no StateDiffs and no descendants, so no cascade needed.
+            // Non-M-notarized past views have no StateDiffs and no descendants, so no cascade
+            // needed.
             if nullify_view_number < current_view_number {
                 let was_m_notarized = self
                     .view_chain
@@ -1596,10 +1601,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                 "view" => view,
             );
             return Ok(ViewProgressEvent::BroadcastConsensusMessage {
-                message: Box::new(ConsensusMessage::BlockRecoveryResponse {
-                    view,
-                    block,
-                }),
+                message: Box::new(ConsensusMessage::BlockRecoveryResponse { view, block }),
             });
         }
 
@@ -1625,9 +1627,7 @@ impl<const N: usize, const F: usize, const M_SIZE: usize> ViewProgressManager<N,
                         .view_chain
                         .find_view_context(view)
                         .and_then(|ctx| ctx.block_hash)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Block hash missing after recovery")
-                        })?;
+                        .ok_or_else(|| anyhow::anyhow!("Block hash missing after recovery"))?;
 
                     slog::info!(
                         self.logger,

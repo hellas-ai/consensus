@@ -25,8 +25,14 @@ pub enum ConsensusMessage<const N: usize, const F: usize, const M_SIZE: usize> {
     Nullification(Nullification<N, F, M_SIZE>),
     /// Request a missing block by view and expected hash. Sent when a replica has M-notarization
     /// for a view but never received the actual block proposal from the leader.
-    BlockRecoveryRequest { view: u64, block_hash: [u8; 32] },
+    BlockRecoveryRequest {
+        view: u64,
+        block_hash: [u8; 32],
+    },
     /// Response containing the requested block. Sent by a peer that has the block in its
     /// non-finalized view chain or finalized storage.
-    BlockRecoveryResponse { view: u64, block: Block },
+    BlockRecoveryResponse {
+        view: u64,
+        block: Block,
+    },
 }
